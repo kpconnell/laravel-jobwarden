@@ -31,10 +31,12 @@ jobs:
           MARIADB_PASSWORD: secret
           MARIADB_ROOT_PASSWORD: rootsecret
         ports: ['3306:3306']
+        # Note: READ COMMITTED + MYSQL_ATTR_FOUND_ROWS are forced per-connection by
+        # the service provider (alignMysqlRowSemantics), so no server flag is needed
+        # here — and GitHub service containers can't override the container command.
         options: >-
           --health-cmd="healthcheck.sh --connect --innodb_initialized"
           --health-interval=5s --health-timeout=5s --health-retries=20
-          --transaction-isolation=READ-COMMITTED
       postgres:
         image: postgres:18
         env:

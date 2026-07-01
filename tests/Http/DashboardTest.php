@@ -11,7 +11,10 @@ use JobWarden\Http\Livewire\Jobs;
 use JobWarden\Http\Livewire\Overview;
 use JobWarden\Http\Livewire\Schedules;
 use JobWarden\Models\Job;
+use JobWarden\Models\JobAttempt;
+use JobWarden\Models\JobLog;
 use JobWarden\Models\Schedule;
+use JobWarden\States\AttemptState;
 use JobWarden\States\JobState;
 use JobWarden\Tests\Concerns\RefreshesJobWardenSchema;
 use JobWarden\Tests\TestCase;
@@ -65,6 +68,23 @@ final class DashboardTest extends TestCase
             ->assertSee('cancel requested');
 
         $this->assertSame(JobState::Canceled, $job->refresh()->state);
+    }
+
+    public function test_job_detail_view_all_logs_dialog(): void
+    {
+        $job = Job::create(['job_class' => 'X', 'state' => JobState::Failed]);
+        $attempt = JobAttempt::create(['job_id' => $job->id, 'attempt_number' => 1, 'state' => AttemptState::Failed, 'fencing_token' => 1]);
+        JobLog::create(['job_id' => $job->id, 'attempt_id' => $attempt->id, 'seq' => 1, 'ts' => now(), 'level' => 'error', 'body_sink' => 'database', 'body_ref' => 'boom in the dialog']);
+
+        // The dialog is closed on load and opens on demand.
+        Livewire::test(JobShow::class, ['job' => $job->id])
+            ->assertOk()
+            ->assertSet('showAllLogs', false)
+            ->call('openLogs')
+            ->assertSet('showAllLogs', true)
+            ->assertSee('boom in the dialog')
+            ->call('closeLogs')
+            ->assertSet('showAllLogs', false);
     }
 
     public function test_create_a_command_schedule_from_the_dashboard(): void

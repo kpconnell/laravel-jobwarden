@@ -33,7 +33,7 @@ final class JobExporter
             yield $this->record('event', $event->toArray());
         }
 
-        foreach ($job->logs()->orderBy('seq')->cursor() as $log) {
+        foreach ($job->logs()->orderBy('ts')->orderBy('id')->cursor() as $log) {
             $data = $log->toArray();
             $data['body'] = $this->sink->resolve((string) $log->body_ref);
             yield $this->record('log', $data);

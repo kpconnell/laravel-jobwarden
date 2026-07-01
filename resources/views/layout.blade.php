@@ -74,6 +74,16 @@
         .err-msg { margin-top:4px; }
         .err-file { font-size:12px; margin-top:6px; }
         pre.json.trace { margin:10px 0 0; line-height:1.7; max-height:360px; }
+        .sec-head { display:flex; align-items:center; justify-content:space-between; margin:24px 0 10px; }
+        .sec-head h2 { margin:0; }
+        .modal-overlay { position:fixed; inset:0; z-index:20; background:rgba(0,0,0,.6);
+            display:flex; align-items:center; justify-content:center; padding:24px; }
+        .modal { background:var(--panel); border:1px solid var(--line); border-radius:12px;
+            width:min(1040px,100%); max-height:85vh; display:flex; flex-direction:column; padding:16px 18px; }
+        .modal-head { display:flex; align-items:center; justify-content:space-between; margin-bottom:12px; }
+        .modal-head h2 { margin:0; }
+        .modal-note { font-size:12px; margin-bottom:10px; }
+        .modal-logs { max-height:none; flex:1; }
     </style>
 </head>
 <body>

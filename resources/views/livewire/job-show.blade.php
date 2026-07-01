@@ -70,7 +70,12 @@
         </tbody>
     </table>
 
-    <h2>Logs</h2>
+    <div class="sec-head">
+        <h2>Logs</h2>
+        @if ($logs->isNotEmpty())
+            <button class="btn" wire:click="openLogs">View all</button>
+        @endif
+    </div>
     <div class="logs">
         @forelse ($logs as $l)
             <div class="ln lvl-{{ $l->level }}"><span class="muted">{{ optional($l->ts)->format('H:i:s') }}</span> {{ $l->step ? '['.$l->step.'] ' : '' }}{{ $l->body }}</div>
@@ -94,4 +99,25 @@
             @endforeach
         </tbody>
     </table>
+
+    @if ($showAllLogs)
+        <div class="modal-overlay" wire:click.self="closeLogs" wire:keydown.escape.window="closeLogs">
+            <div class="modal">
+                <div class="modal-head">
+                    <h2>Logs — {{ class_basename($job->job_class) }}</h2>
+                    <button class="btn" wire:click="closeLogs">Close</button>
+                </div>
+                @if ($allLogsTruncated)
+                    <div class="muted modal-note">Showing the first {{ number_format($dialogLogCap) }} lines. Run <code>jobwarden:logs {{ \Illuminate\Support\Str::substr($job->id, 0, 8) }} --export</code> for the complete bundle.</div>
+                @endif
+                <div class="logs modal-logs">
+                    @forelse ($allLogs as $l)
+                        <div class="ln lvl-{{ $l->level }}"><span class="muted">{{ optional($l->ts)->format('H:i:s') }}</span> {{ $l->step ? '['.$l->step.'] ' : '' }}{{ $l->body }}</div>
+                    @empty
+                        <div class="muted">no logs</div>
+                    @endforelse
+                </div>
+            </div>
+        </div>
+    @endif
 </div>

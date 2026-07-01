@@ -6,6 +6,32 @@ All notable changes to `laravel-jobwarden` are documented here. The format follo
 
 ## [Unreleased]
 
+### Fixed
+- **Aggregate atomicity: a terminal attempt can no longer strand its job in `running`.**
+  A worker completing/failing an attempt, and a reaper orphaning one, now move the
+  attempt **and** the job (plus the recovery decision) in a **single transaction**, so
+  a process dying in the microsecond window between the two former transitions can no
+  longer leave `attempt=succeeded|failed|orphaned, job=running`. (Fencing already
+  prevented double-execution; this closes the liveness/stranding gap.)
+- **`proc_open()` spawn failure is resolved synchronously.** If a job child fails to
+  launch, the already-claimed attempt is transitioned `dispatched → failed` and handed
+  to recovery immediately, instead of being left as a childless `running` job for a
+  reaper to (maybe) find. The phase-2 stamp write is now fault-tolerant.
+- **`StateMachine::transition()` returns the true `from` state** for raw/partially-hydrated
+  entities (previously it could report `from == to` when `state` wasn't already an enum).
+- **Operator retry/restart is atomic** — the eligibility resets (`available_at`,
+  cancellation withdrawal) and the audited `→ queued` transition now commit together.
+
+### Added
+- **Reconciliation backstop (Tier-3, leader-only).** The global reaper now heals any
+  job stranded in `running` with a settled current attempt, regardless of how it arose —
+  gated by a grace window (`JOBWARDEN_RECONCILE_GRACE`, default 30s) so it never races a
+  healthy worker mid-completion.
+- **`JobWarden\Health\JobWardenHealth`** — an invariant tripwire (`invariantViolations()`
+  / `isConsistent()`) covering *no running job with a settled current attempt*, *no
+  dangling `current_attempt_id`*, and *`attempt_count ≥ max(attempt_number)`*. Assert it
+  is empty at the end of chaos tests.
+
 ### Changed
 - **`jobwarden:work` bundles its own Tier-2 local reaper.** The worker now spawns a
   co-resident `jobwarden:reap:local` as a separate child process, so a worker can never

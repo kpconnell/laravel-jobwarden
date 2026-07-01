@@ -33,8 +33,11 @@ final class JobTransitions implements TransitionTable
             new Transition(S::Queued, S::Running, [A::Worker, A::Supervisor]),
             new Transition(S::Queued, S::Canceled, [A::Operator, A::System], [new NotYetRunningGuard]),
 
-            // running outcomes
-            new Transition(S::Running, S::Succeeded, [A::Worker, A::Supervisor]),
+            // running outcomes. System is permitted on `succeeded` for the
+            // reconciliation sweep: an attempt that already succeeded but whose
+            // job was left `running` (a process died in the window between the two
+            // transitions) is completed by the leader reaper acting as System.
+            new Transition(S::Running, S::Succeeded, [A::Worker, A::Supervisor, A::System]),
             new Transition(S::Running, S::Failed, [A::Worker, A::Supervisor, A::Reaper, A::System]),
             new Transition(S::Running, S::Retrying, [A::Worker, A::Supervisor, A::Reaper, A::System], [new IdempotentGuard, new AttemptBudgetGuard]),
             new Transition(S::Running, S::Orphaned, [A::Reaper, A::System]),

@@ -76,19 +76,24 @@ final class OperatorActions
 
     private function requeue(Job $job, string $reason, ?string $actorId): void
     {
-        $this->connection()->table($this->tbl('jobs'))->where('id', $job->id)->update([
-            'available_at' => Carbon::now(),
-            'cancel_requested' => false,
-            'cancel_mode' => null,
-            'updated_at' => Carbon::now(),
-        ]);
-        $job->refresh();
+        // One transaction: the eligibility resets (available_at, cancellation
+        // withdrawal) and the audited state move commit together, so a failed
+        // transition never leaves the flags mutated without the re-queue.
+        $this->connection()->transaction(function () use ($job, $reason, $actorId): void {
+            $this->connection()->table($this->tbl('jobs'))->where('id', $job->id)->update([
+                'available_at' => Carbon::now(),
+                'cancel_requested' => false,
+                'cancel_mode' => null,
+                'updated_at' => Carbon::now(),
+            ]);
+            $job->refresh();
 
-        $this->stateMachine->applyJobTransition(
-            $job,
-            JobState::Queued,
-            TransitionContext::for(ActorType::Operator, $actorId, $reason)
-        );
+            $this->stateMachine->applyJobTransition(
+                $job,
+                JobState::Queued,
+                TransitionContext::for(ActorType::Operator, $actorId, $reason)
+            );
+        });
     }
 
     private function setCancelFlags(Job $job, string $mode, string $reason): void

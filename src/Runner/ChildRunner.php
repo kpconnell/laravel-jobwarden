@@ -20,6 +20,7 @@ use JobWarden\States\ActorType;
 use JobWarden\States\AttemptState;
 use JobWarden\States\JobState;
 use Illuminate\Support\Carbon;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 
 /**
@@ -124,16 +125,21 @@ final class ChildRunner
     private function succeed(JobAttempt $attempt, $job, int $token): int
     {
         try {
-            $this->stateMachine->applyAttemptTransition(
-                $attempt,
-                AttemptState::Succeeded,
-                TransitionContext::for(ActorType::Worker, null, 'completed')->expectingToken($token)
-            );
-            $this->stateMachine->applyJobTransition(
-                $job,
-                JobState::Succeeded,
-                TransitionContext::for(ActorType::Worker, null, 'completed')
-            );
+            // ONE transaction: the attempt AND the job move together, so a crash
+            // can never leave `attempt=succeeded, job=running` (the reconciliation
+            // sweep is the backstop if the process dies before this even runs).
+            $this->connection()->transaction(function () use ($attempt, $job, $token): void {
+                $this->stateMachine->applyAttemptTransition(
+                    $attempt,
+                    AttemptState::Succeeded,
+                    TransitionContext::for(ActorType::Worker, null, 'completed')->expectingToken($token)
+                );
+                $this->stateMachine->applyJobTransition(
+                    $job,
+                    JobState::Succeeded,
+                    TransitionContext::for(ActorType::Worker, null, 'completed')
+                );
+            });
         } catch (StaleFencingTokenException) {
             // Fenced out (reaped while finishing). Leave authoritative state alone.
         }
@@ -148,14 +154,18 @@ final class ChildRunner
         $this->recordError($attempt, $job, $e);
 
         try {
-            $this->stateMachine->applyAttemptTransition(
-                $attempt,
-                AttemptState::Failed,
-                TransitionContext::for(ActorType::Worker, null, 'handler threw')
-                    ->expectingToken($token)
-                    ->withContext(['error' => $e->getMessage()])
-            );
-            $this->recovery->afterAttemptFailure($job, ActorType::Worker, 'attempt failed: '.$e->getMessage());
+            // ONE transaction: the attempt failing and the job's recovery decision
+            // (retry / fail) commit together — no `attempt=failed, job=running`.
+            $this->connection()->transaction(function () use ($attempt, $job, $token, $e): void {
+                $this->stateMachine->applyAttemptTransition(
+                    $attempt,
+                    AttemptState::Failed,
+                    TransitionContext::for(ActorType::Worker, null, 'handler threw')
+                        ->expectingToken($token)
+                        ->withContext(['error' => $e->getMessage()])
+                );
+                $this->recovery->afterAttemptFailure($job, ActorType::Worker, 'attempt failed: '.$e->getMessage());
+            });
         } catch (StaleFencingTokenException) {
             // Fenced out — a reaper already took over.
         }
@@ -163,6 +173,11 @@ final class ChildRunner
         $this->pidfile->delete((string) $attempt->id);
 
         return ExitCode::FAILURE;
+    }
+
+    private function connection(): \Illuminate\Database\Connection
+    {
+        return DB::connection(config('jobwarden.connection'));
     }
 
     /**

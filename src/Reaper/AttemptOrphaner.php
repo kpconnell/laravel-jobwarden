@@ -36,32 +36,39 @@ final class AttemptOrphaner
             ->withProcessSnapshot(['host_id' => $hostId, 'tier' => $tier]);
 
         try {
-            $this->stateMachine->applyAttemptTransition($attempt, AttemptState::Orphaned, $context);
-        } catch (IllegalTransitionException|StaleFencingTokenException) {
-            return false; // already terminal / handled by another tier
-        }
+            // ONE transaction: fence the attempt, log the action, move the job, and
+            // run recovery together. A reaper dying mid-orphan can no longer strand
+            // `attempt=orphaned, job=running` — either the whole aggregate moves or
+            // none of it does (and the next scan retries cleanly).
+            $this->connection()->transaction(function () use ($attempt, $context, $reaperId, $hostId, $tier, $reason): void {
+                $this->stateMachine->applyAttemptTransition($attempt, AttemptState::Orphaned, $context);
 
-        $this->jobLogger->write(
-            (string) $attempt->job_id,
-            (string) $attempt->id,
-            'warning',
-            "{$tier} reaper: {$reason}; attempt orphaned and fenced",
-            ['actor' => "{$tier}_reaper", 'reaper_id' => $reaperId, 'host_id' => $hostId, 'tier' => $tier],
-            'reaped',
-        );
+                $this->jobLogger->write(
+                    (string) $attempt->job_id,
+                    (string) $attempt->id,
+                    'warning',
+                    "{$tier} reaper: {$reason}; attempt orphaned and fenced",
+                    ['actor' => "{$tier}_reaper", 'reaper_id' => $reaperId, 'host_id' => $hostId, 'tier' => $tier],
+                    'reaped',
+                );
 
-        $job = $attempt->job;
-        if ($job !== null) {
-            try {
-                if ($job->state === JobState::Running) {
-                    $this->stateMachine->applyJobTransition($job, JobState::Orphaned, TransitionContext::for(ActorType::Reaper, $reaperId, $reason));
+                $job = $attempt->job;
+                if ($job !== null) {
+                    if ($job->state === JobState::Running) {
+                        $this->stateMachine->applyJobTransition($job, JobState::Orphaned, TransitionContext::for(ActorType::Reaper, $reaperId, $reason));
+                    }
+                    $this->recovery->resolveOrphan($job->refresh(), ActorType::Reaper, $reason);
                 }
-                $this->recovery->resolveOrphan($job->refresh(), ActorType::Reaper, $reason);
-            } catch (IllegalTransitionException|StaleFencingTokenException) {
-                // raced with another transition — fine.
-            }
+            });
+        } catch (IllegalTransitionException|StaleFencingTokenException) {
+            return false; // already terminal / handled by another tier — retried next scan
         }
 
         return true;
+    }
+
+    private function connection(): \Illuminate\Database\Connection
+    {
+        return \Illuminate\Support\Facades\DB::connection(config('jobwarden.connection'));
     }
 }

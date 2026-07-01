@@ -4,8 +4,16 @@ declare(strict_types=1);
 
 namespace JobWarden\Reaper;
 
+use JobWarden\Models\Job;
 use JobWarden\Models\JobAttempt;
+use JobWarden\Recovery\RecoveryService;
+use JobWarden\StateMachine\Exceptions\IllegalTransitionException;
+use JobWarden\StateMachine\Exceptions\StaleFencingTokenException;
+use JobWarden\StateMachine\StateMachine;
+use JobWarden\StateMachine\TransitionContext;
+use JobWarden\States\ActorType;
 use JobWarden\States\AttemptState;
+use JobWarden\States\JobState;
 use JobWarden\Support\SqlTime;
 use Illuminate\Database\Connection;
 use Illuminate\Support\Facades\DB;
@@ -32,6 +40,8 @@ final class GlobalReaper
     public function __construct(
         private readonly LeaderLease $lease,
         private readonly AttemptOrphaner $orphaner,
+        private readonly StateMachine $stateMachine,
+        private readonly RecoveryService $recovery,
     ) {
     }
 
@@ -47,7 +57,95 @@ final class GlobalReaper
             $this->reapWorker((string) $worker->id, (string) $worker->host_id, $reaperId);
         }
 
+        $this->reconcileStrandedJobs($reaperId);
+
         return true;
+    }
+
+    /**
+     * The aggregate-invariant backstop. A job in `running` whose current attempt
+     * has already settled (succeeded / failed / orphaned / stopped) is the residue
+     * of a process that died in the window between the attempt transition and the
+     * job transition. Fencing already guarantees the presumed-dead worker cannot
+     * double-run; this only heals the STRANDED job state. Leader-only, and gated
+     * by a grace window so it never races a healthy worker's own completion.
+     */
+    private function reconcileStrandedJobs(string $reaperId): void
+    {
+        foreach ($this->strandedJobIds() as $jobId) {
+            try {
+                $this->connection()->transaction(function () use ($jobId, $reaperId): void {
+                    /** @var Job|null $job */
+                    $job = Job::query()->find($jobId);
+                    if ($job === null || $job->state !== JobState::Running) {
+                        return; // resolved out from under us
+                    }
+
+                    $attempt = $job->current_attempt_id !== null
+                        ? JobAttempt::query()->find($job->current_attempt_id)
+                        : null;
+                    if ($attempt === null || $attempt->state->isInFlight()) {
+                        return; // nothing settled to reconcile against
+                    }
+
+                    $this->resolveStranded($job, $attempt, $reaperId);
+                });
+            } catch (IllegalTransitionException|StaleFencingTokenException) {
+                // Raced a live worker's own completion — it won; nothing to do.
+            }
+        }
+    }
+
+    private function resolveStranded(Job $job, JobAttempt $attempt, string $reaperId): void
+    {
+        $reason = 'reconcile: attempt '.$attempt->state->value.' but job left running';
+
+        match ($attempt->state) {
+            AttemptState::Succeeded => $this->stateMachine->applyJobTransition(
+                $job, JobState::Succeeded, TransitionContext::for(ActorType::System, $reaperId, $reason)),
+            AttemptState::Failed => $this->recovery->afterAttemptFailure($job, ActorType::System, $reason),
+            AttemptState::Stopped, AttemptState::Canceled => $this->stateMachine->applyJobTransition(
+                $job, JobState::Stopped, TransitionContext::for(ActorType::System, $reaperId, $reason)),
+            AttemptState::Orphaned => $this->reconcileOrphan($job, $reaperId, $reason),
+            default => null, // in-flight — guarded against above
+        };
+
+        Log::warning('global reaper: reconciled a stranded job', [
+            'role' => 'global_reaper',
+            'reaper_id' => $reaperId,
+            'job_id' => (string) $job->id,
+            'attempt_state' => $attempt->state->value,
+        ]);
+    }
+
+    private function reconcileOrphan(Job $job, string $reaperId, string $reason): void
+    {
+        $this->stateMachine->applyJobTransition($job, JobState::Orphaned, TransitionContext::for(ActorType::System, $reaperId, $reason));
+        $this->recovery->resolveOrphan($job->refresh(), ActorType::System, $reason);
+    }
+
+    /**
+     * Candidate jobs: `running` with a settled current attempt whose settlement is
+     * older than the grace window. finished_at covers succeeded/failed/stopped;
+     * orphaned bumps updated_at only, so COALESCE falls back to that.
+     *
+     * @return string[]
+     */
+    private function strandedJobIds(): array
+    {
+        $conn = $this->connection();
+        $grace = (int) config('jobwarden.reaper.reconcile_grace_sec', 30);
+
+        return $conn->table($this->tbl('jobs').' as j')
+            ->join($this->tbl('job_attempts').' as a', 'a.id', '=', 'j.current_attempt_id')
+            ->where('j.state', JobState::Running->value)
+            ->whereNotIn('a.state', [AttemptState::Dispatched->value, AttemptState::Running->value])
+            ->whereRaw('COALESCE(a.finished_at, a.updated_at) < '.SqlTime::nowMinus($conn, $grace))
+            ->orderBy('j.id')
+            ->limit(500)
+            ->pluck('j.id')
+            ->map(static fn ($id): string => (string) $id)
+            ->all();
     }
 
     public function budgetSeconds(): int

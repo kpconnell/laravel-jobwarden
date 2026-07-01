@@ -232,6 +232,10 @@ final class Supervisor
         $process = proc_open($command, $descriptors, $pipes, $this->runCwd(), null);
         if (! is_resource($process)) {
             @fclose($log);
+            // A synchronous, KNOWN failure — the job was already claimed (a
+            // dispatched attempt on a `running` job). Resolve it now instead of
+            // stranding it for a reaper: fail the attempt and let recovery decide.
+            $this->failToSpawn($attemptId, $jobId, $token, 'proc_open failed to launch the job child');
 
             return;
         }
@@ -239,9 +243,18 @@ final class Supervisor
         $status = proc_get_status($process);
         $pid = (int) $status['pid'];
 
-        // PHASE-2 stamp: child pid/start-time/nonce, fencing-guarded.
+        // PHASE-2 stamp: child pid/start-time/nonce, fencing-guarded. The child is
+        // already alive; a failed stamp only blinds a reaper to it, not Tier-1
+        // (we still register it below and waitpid-reap it), and the child reports
+        // its own outcome regardless — so log and continue rather than abort.
         $childStart = $this->probe->startTime($pid);
-        $this->stampWriter->phase2($attemptId, $token, $pid, (string) $childStart, $nonce);
+        try {
+            $this->stampWriter->phase2($attemptId, $token, $pid, (string) $childStart, $nonce);
+        } catch (\Throwable $e) {
+            Log::warning('phase-2 stamp failed; child running unstamped (Tier-1 still tracks it)', [
+                'job' => $jobId, 'attempt' => $attemptId, 'pid' => $pid, 'error' => $e->getMessage(),
+            ]);
+        }
 
         $this->children->add(new ChildHandle(
             process: $process,
@@ -333,6 +346,40 @@ final class Supervisor
         } catch (\JobWarden\StateMachine\Exceptions\StaleFencingTokenException) {
             // A reaper already took over this epoch — leave its decision intact.
         }
+    }
+
+    /**
+     * proc_open returned false (fork/exec failure: ENOMEM, RLIMIT_NPROC, a broken
+     * run_command). The claim already committed `queued → running` + a dispatched
+     * attempt, so fail that attempt and hand the job to recovery — the same path a
+     * boot-crashed child would take, just decided synchronously.
+     */
+    private function failToSpawn(string $attemptId, string $jobId, int $token, string $reason): void
+    {
+        $attempt = JobAttempt::query()->find($attemptId);
+        if ($attempt === null) {
+            return;
+        }
+        $job = $attempt->job;
+
+        try {
+            $this->connection()->transaction(function () use ($attempt, $job, $token, $reason): void {
+                $this->stateMachine->applyAttemptTransition(
+                    $attempt,
+                    AttemptState::Failed,
+                    TransitionContext::for(ActorType::Supervisor, null, $reason)->expectingToken($token)
+                );
+                if ($job !== null) {
+                    $this->recovery->afterAttemptFailure($job, ActorType::Supervisor, $reason);
+                }
+            });
+        } catch (\JobWarden\StateMachine\Exceptions\StaleFencingTokenException|\JobWarden\StateMachine\Exceptions\IllegalTransitionException) {
+            // A reaper already took over this epoch — leave its decision intact.
+        }
+
+        Log::error('failed to spawn job child; attempt failed and recovery run', [
+            'job' => $jobId, 'attempt' => $attemptId, 'reason' => $reason,
+        ]);
     }
 
     private function recordExit(ChildHandle $handle): void

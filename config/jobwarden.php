@@ -68,6 +68,12 @@ return [
         // Tier 3 leader-lease TTL (seconds).
         'global_lease_ttl' => (int) env('JOBWARDEN_GLOBAL_LEASE_TTL', 15),
         'global_scan_interval' => (int) env('JOBWARDEN_GLOBAL_SCAN_INTERVAL', 5),
+        // Reconciliation backstop (leader-only): heal a job stuck in `running`
+        // whose current attempt already settled — the residue of a process dying
+        // between the attempt and job transitions. Only jobs whose attempt has
+        // been settled this many seconds are touched, so a healthy worker
+        // mid-completion is never raced. Fencing already prevents any double-run.
+        'reconcile_grace_sec' => (int) env('JOBWARDEN_RECONCILE_GRACE', 30),
     ],
 
     /*

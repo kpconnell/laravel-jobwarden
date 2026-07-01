@@ -144,7 +144,14 @@ class StateMachine
             throw $e;
         }
 
-        return new TransitionResult($current instanceof \BackedEnum ? $current : $to, $to, $eventId, $newToken);
+        // Reconstruct the true `from` enum. In practice `$current` is already an
+        // enum (models cast `state`), but a raw/partially-hydrated entity yields a
+        // string — rebuild from the level's enum rather than mislabelling it `$to`.
+        $fromEnum = $current instanceof \BackedEnum
+            ? $current
+            : ($isAttempt ? \JobWarden\States\AttemptState::from($fromValue) : JobState::from($fromValue));
+
+        return new TransitionResult($fromEnum, $to, $eventId, $newToken);
     }
 
     /** @return array<string, mixed> */

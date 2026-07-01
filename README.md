@@ -120,6 +120,9 @@ templates are in [`packaging/systemd/`](packaging/systemd), and a container imag
 via a `JOBWARDEN_ROLES` env var is in [`docker/`](docker) (see [`docker-compose.yml`](docker-compose.yml) for a
 full local stack).
 
+**→ See [docs/HOSTING.md](docs/HOSTING.md)** for deployment topologies: serving the UI from your existing app
+host, running everything on a single worker box, and how to scale out to a fleet.
+
 ### How recovery works (the short version)
 
 Every claim is stamped with the claiming worker's globally-unique id and a fencing token. A worker heartbeats a

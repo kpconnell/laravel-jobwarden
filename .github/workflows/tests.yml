@@ -58,11 +58,17 @@ jobs:
           extensions: pcntl, posix, pdo_sqlite, pdo_mysql, pdo_pgsql, sockets
           coverage: none
 
+      # The compat matrix tests against Laravel 11, whose framework releases are
+      # flagged by advisories that were only fixed in 12.x; don't let Composer's
+      # advisory policy exclude them from the solver during CI resolution.
+      - name: Allow advisory-flagged versions (CI compatibility)
+        run: composer config --no-plugins policy.advisories.block false
+
       - name: Constrain Laravel + Testbench
         run: composer require "illuminate/support:${{ matrix.laravel }}" "orchestra/testbench:${{ matrix.testbench }}" --no-update --no-interaction
 
       - name: Install dependencies
-        run: composer update --prefer-dist --no-interaction --no-progress
+        run: composer update --prefer-dist --no-interaction --no-progress --no-audit
 
       - name: Run tests (${{ matrix.db }})
         env:

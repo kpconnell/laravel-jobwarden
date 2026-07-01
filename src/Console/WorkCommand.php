@@ -13,13 +13,17 @@ use JobWarden\Recovery\Admitter;
 use JobWarden\Recovery\RecoveryService;
 use JobWarden\StateMachine\StateMachine;
 use JobWarden\Stamp\ProcessStampWriter;
+use JobWarden\Supervisor\CoReaper;
 use JobWarden\Supervisor\Supervisor;
 use JobWarden\Worker\WorkerRegistry;
 use Illuminate\Console\Command;
 
 /**
  * Per-host supervisor (spec §10.2): claims jobs, spawns + waitpids children
- * (Tier 1).
+ * (Tier 1). It also brings its own Tier-2 local reaper as a co-resident child
+ * process (see CoReaper), so running `jobwarden:work` is all a host needs — you
+ * can't forget the reaper. Disable with `jobwarden.supervisor.bundle_reaper` only
+ * for advanced split topologies.
  */
 final class WorkCommand extends Command
 {
@@ -65,9 +69,50 @@ final class WorkCommand extends Command
             return self::SUCCESS;
         }
 
-        $supervisor->run();
+        // Bring a co-resident local reaper as a SEPARATE child so Tier-2 recovery
+        // is never accidentally left off. It outlives a crash of this process; on a
+        // clean drain we stop it below.
+        $coReaper = $this->startCoReaper();
+
+        $supervisor->run($coReaper !== null ? fn () => $coReaper->ensureAlive() : null);
+
+        $coReaper?->stop((int) config('jobwarden.supervisor.graceful_timeout', 10));
         $this->info('supervisor drained and stopped.');
 
         return self::SUCCESS;
+    }
+
+    private function startCoReaper(): ?CoReaper
+    {
+        if (! config('jobwarden.supervisor.bundle_reaper', true)) {
+            return null; // advanced split: operator runs jobwarden:reap:local itself
+        }
+
+        $coReaper = new CoReaper($this->reaperCommand(), $this->reaperCwd());
+        $coReaper->start();
+        $this->info('bundled a co-resident local reaper (Tier-2) — no separate jobwarden:reap:local needed.');
+
+        return $coReaper;
+    }
+
+    /**
+     * The command to spawn the bundled reaper — reuses whatever runs the job
+     * children (jobwarden.supervisor.run_command) with the subcommand swapped.
+     *
+     * @return string[]
+     */
+    private function reaperCommand(): array
+    {
+        $run = config('jobwarden.supervisor.run_command');
+        if (is_array($run) && $run !== []) {
+            return array_merge(array_slice($run, 0, -1), ['jobwarden:reap:local']);
+        }
+
+        return [PHP_BINARY, base_path('artisan'), 'jobwarden:reap:local'];
+    }
+
+    private function reaperCwd(): string
+    {
+        return (string) (config('jobwarden.supervisor.run_cwd') ?: base_path());
     }
 }

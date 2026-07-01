@@ -68,6 +68,12 @@
             border-radius:8px; margin-bottom:14px; }
         pre.json { background:#0a0c10; border:1px solid var(--line); border-radius:8px; padding:10px;
             font-size:12px; overflow:auto; color:#aab4c4; }
+        .err { background:var(--panel); border:1px solid var(--line); border-left:3px solid #ff6b6b;
+            border-radius:8px; padding:12px 14px; }
+        .err-class { font-family:ui-monospace,Menlo,monospace; font-weight:700; color:#ff9ca0; }
+        .err-msg { margin-top:4px; }
+        .err-file { font-size:12px; margin-top:6px; }
+        pre.json.trace { margin:10px 0 0; line-height:1.7; max-height:360px; }
     </style>
 </head>
 <body>

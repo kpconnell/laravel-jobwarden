@@ -59,6 +59,10 @@ return [
     'reaper' => [
         // Tier 2 stamp-verification cadence (seconds).
         'local_scan_interval' => (int) env('JOBWARDEN_LOCAL_SCAN_INTERVAL', 5),
+        // Exactly ONE local reaper scans per host; any others (e.g. a host running
+        // both jobwarden:work and jobwarden:scheduled-worker, each bundling one)
+        // idle as hot spares. This is the per-host lease TTL (seconds) electing it.
+        'local_lease_ttl' => (int) env('JOBWARDEN_LOCAL_LEASE_TTL', 15),
         // When a local reaper kills its own children on lost connectivity (seconds).
         'self_fence_ttl' => (int) env('JOBWARDEN_SELF_FENCE_TTL', 25),
         // Tier 3 leader-lease TTL (seconds).
@@ -73,6 +77,11 @@ return [
     */
     'supervisor' => [
         'capacity' => (int) env('JOBWARDEN_CAPACITY', 5),
+        // jobwarden:work bundles a co-resident local reaper (as a separate child
+        // process) by default, so a worker can never run without Tier-2 recovery.
+        // Set false only for advanced split topologies where you run
+        // jobwarden:reap:local as its own supervised process.
+        'bundle_reaper' => filter_var(env('JOBWARDEN_BUNDLE_REAPER', true), FILTER_VALIDATE_BOOLEAN),
         // child (default, real PID/exit/signal, isolation) | in_process (deferred).
         'execution_mode' => env('JOBWARDEN_EXECUTION_MODE', 'child'),
         'graceful_timeout' => (int) env('JOBWARDEN_GRACEFUL_TIMEOUT', 10),

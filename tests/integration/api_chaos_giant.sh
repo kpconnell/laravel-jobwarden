@@ -35,7 +35,13 @@ RUN_ID="${JOBWARDEN_API_CHAOS_RUN_ID:-giant-$(date +%s)-$$}"
 # ---- curl behaviour -------------------------------------------------------
 # High client concurrency keeps the (single) API server's queue full; retries
 # ride out the window where the API/db are mid-restart.
-CURL_CONCURRENCY="${JOBWARDEN_API_CHAOS_CURL_CONCURRENCY:-128}"
+# A single-threaded `php artisan serve` serializes requests, so HIGH client
+# concurrency just overflows its accept backlog → connection-reset storms →
+# retry stalls (dispatch crawls AND the dashboard UI starves). Lower concurrency
+# keeps one request in flight with a small backlog and is measurably FASTER here
+# (benchmarked ~500 req/s at 16 vs ~250 at 32). Raise only behind a concurrent
+# server (fpm/frankenphp/multiple replicas).
+CURL_CONCURRENCY="${JOBWARDEN_API_CHAOS_CURL_CONCURRENCY:-16}"
 CURL_CONNECT_TIMEOUT="${JOBWARDEN_API_CHAOS_CURL_CONNECT_TIMEOUT:-5}"
 CURL_MAX_TIME="${JOBWARDEN_API_CHAOS_CURL_MAX_TIME:-30}"
 CURL_RETRIES="${JOBWARDEN_API_CHAOS_CURL_RETRIES:-40}"
@@ -72,6 +78,12 @@ CRASH_JOBS="${JOBWARDEN_GIANT_CRASH_JOBS:-$(scale 4000 0)}"
 # deterministically exhaust to `failed`.
 SUCCEED_MAX_ATTEMPTS="${JOBWARDEN_GIANT_SUCCEED_MAX_ATTEMPTS:-5}"
 FAIL_MAX_ATTEMPTS="${JOBWARDEN_GIANT_FAIL_MAX_ATTEMPTS:-3}"
+
+# Give the bulk `success` cohort a real runtime so worker slots stay occupied and
+# the fleet is visibly busy (not instant no-ops that drain the moment they land).
+# It also means the mid-flight restart catches thousands of genuinely-running
+# jobs. 0 = instant.
+SUCCESS_SLEEP_MS="${JOBWARDEN_GIANT_SUCCESS_SLEEP_MS:-2500}"
 
 TARGET_JOBS=$((SUCCESS_JOBS + LOGSTORM_JOBS + ARTIFACT_JOBS + STDERR_JOBS + THROW_JOBS + CRASH_JOBS))
 EXPECTED_SUCCEEDED=$((SUCCESS_JOBS + LOGSTORM_JOBS + ARTIFACT_JOBS + STDERR_JOBS))
@@ -141,6 +153,61 @@ dispatch_many() {
     done
     for pid in $pids; do wait "$pid" || DISPATCH_FAILURES=$((DISPATCH_FAILURES+1)); done
     printf "  dispatched %-9s %7s/%-7s\n" "$mode" "$total" "$count"
+}
+
+# INTERLEAVED dispatch: every cohort is woven together so the fleet shows a live
+# MIX from the first second — successes (with a real runtime), log storms,
+# artifacts, stderr, throws and crashes all in flight at once — instead of a long
+# block of one type. A tiny PHP fair-share pass emits the most-"behind" mode at
+# each step to build the interleaved plan; bash then fires it in the same
+# concurrency batches as dispatch_many, tracking per-type counts for the live line.
+dispatch_mixed() {
+    local plan; plan="$(mktemp)"
+    local spec="{\"success\":{\"n\":$SUCCESS_JOBS,\"att\":$SUCCEED_MAX_ATTEMPTS,\"pri\":50},\"logstorm\":{\"n\":$LOGSTORM_JOBS,\"att\":$SUCCEED_MAX_ATTEMPTS,\"pri\":40},\"artifact\":{\"n\":$ARTIFACT_JOBS,\"att\":$SUCCEED_MAX_ATTEMPTS,\"pri\":40},\"stderr\":{\"n\":$STDERR_JOBS,\"att\":$SUCCEED_MAX_ATTEMPTS,\"pri\":30},\"throw\":{\"n\":$THROW_JOBS,\"att\":$FAIL_MAX_ATTEMPTS,\"pri\":30},\"crash\":{\"n\":$CRASH_JOBS,\"att\":$FAIL_MAX_ATTEMPTS,\"pri\":20}}"
+    php -r '
+        $spec = json_decode($argv[1], true);
+        $done = []; $t = 0;
+        foreach ($spec as $m => $s) { $done[$m] = 0; $t += (int) $s["n"]; }
+        $f = fopen($argv[2], "w");
+        for ($i = 0; $i < $t; $i++) {
+            $best = null; $bs = 2.0;
+            foreach ($spec as $m => $s) {
+                if ((int) $s["n"] <= 0 || $done[$m] >= (int) $s["n"]) continue;
+                $r = $done[$m] / (int) $s["n"];
+                if ($r < $bs) { $bs = $r; $best = $m; }
+            }
+            $s = $spec[$best];
+            fwrite($f, $best."\t".$s["att"]."\t".$s["pri"]."\n");
+            $done[$best]++;
+        }
+        fclose($f);
+    ' "$spec" "$plan"
+
+    local total=0 launched=0 pids="" pid mode att pri tail
+    local d_s=0 d_l=0 d_a=0 d_e=0 d_t=0 d_c=0
+    while IFS="$(printf '\t')" read -r mode att pri; do
+        [ -z "$mode" ] && continue
+        case "$mode" in
+            success)  tail=", \"sleep_ms\":$SUCCESS_SLEEP_MS"; d_s=$((d_s+1)) ;;
+            logstorm) tail=', "lines":10';                     d_l=$((d_l+1)) ;;
+            artifact) tail=', "payload_bytes":256';            d_a=$((d_a+1)) ;;
+            stderr)   tail=', "lines":6';                      d_e=$((d_e+1)) ;;
+            throw)    tail='';                                 d_t=$((d_t+1)) ;;
+            crash)    tail='';                                 d_c=$((d_c+1)) ;;
+        esac
+        ( dispatch_one "$mode" "$att" "$pri" true "$tail" || exit 1 ) &
+        pids="$pids $!"; launched=$((launched+1)); total=$((total+1))
+        if [ "$launched" -ge "$CURL_CONCURRENCY" ]; then
+            for pid in $pids; do wait "$pid" || DISPATCH_FAILURES=$((DISPATCH_FAILURES+1)); done
+            pids=""; launched=0
+            printf "  mixed %6s/%-6s  succ=%s log=%s art=%s err=%s throw=%s crash=%s\r" \
+                "$total" "$TARGET_JOBS" "$d_s" "$d_l" "$d_a" "$d_e" "$d_t" "$d_c"
+        fi
+    done < "$plan"
+    for pid in $pids; do wait "$pid" || DISPATCH_FAILURES=$((DISPATCH_FAILURES+1)); done
+    rm -f "$plan"
+    printf "  mixed %6s/%-6s  succ=%s log=%s art=%s err=%s throw=%s crash=%s\n" \
+        "$total" "$TARGET_JOBS" "$d_s" "$d_l" "$d_a" "$d_e" "$d_t" "$d_c"
 }
 
 trigger_restart() {
@@ -227,15 +294,11 @@ supervisors="$(api GET '/stats' | php -r '$j=json_decode(stream_get_contents(STD
 echo "  active supervisor workers=$supervisors"
 [ "${supervisors:-0}" -ge 8 ] && ok "a real multi-host supervisor fleet is active ($supervisors)" || bad "only $supervisors supervisor worker(s) active"
 
-hdr "DISPATCH $TARGET_JOBS JOBS (all idempotent, one curl each)"
+hdr "DISPATCH $TARGET_JOBS JOBS — INTERLEAVED MIX (all idempotent, one curl each)"
+echo "  types woven together: success(${SUCCESS_SLEEP_MS}ms) + logstorm + artifact + stderr + throw + crash"
 existing="$(job_total)"
 if [ "$existing" = "0" ]; then
-    dispatch_many success  "$SUCCESS_JOBS"  "$SUCCEED_MAX_ATTEMPTS" 50 true ', "sleep_ms":0'
-    dispatch_many logstorm "$LOGSTORM_JOBS" "$SUCCEED_MAX_ATTEMPTS" 40 true ', "lines":10'
-    dispatch_many artifact "$ARTIFACT_JOBS" "$SUCCEED_MAX_ATTEMPTS" 40 true ', "payload_bytes":256'
-    dispatch_many stderr   "$STDERR_JOBS"   "$SUCCEED_MAX_ATTEMPTS" 30 true ', "lines":6'
-    dispatch_many throw    "$THROW_JOBS"    "$FAIL_MAX_ATTEMPTS"    30 true
-    dispatch_many crash    "$CRASH_JOBS"    "$FAIL_MAX_ATTEMPTS"    20 true
+    dispatch_mixed
 elif [ "$existing" = "$TARGET_JOBS" ]; then
     echo "  found existing run with $existing jobs; resuming drain/inspection"
 else

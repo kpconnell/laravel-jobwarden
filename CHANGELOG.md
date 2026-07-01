@@ -6,6 +6,16 @@ All notable changes to `laravel-jobwarden` are documented here. The format follo
 
 ## [Unreleased]
 
+### Changed
+- **`jobwarden:work` bundles its own Tier-2 local reaper.** The worker now spawns a
+  co-resident `jobwarden:reap:local` as a separate child process, so a worker can never
+  run without recovery and you never start the reaper yourself. It stays a distinct
+  process (outliving a supervisor crash), and a **per-host lease** elects exactly one
+  active local reaper even when several workers share a host. Standalone
+  `jobwarden:reap:local` remains for advanced splits; disable bundling with
+  `jobwarden.supervisor.bundle_reaper=false`. The container/systemd defaults no longer
+  run a separate `local-reaper` role.
+
 ## [1.0.0-beta] - 2026-07-01
 
 First public beta. The distributed-correctness core and the mechanical breadth are

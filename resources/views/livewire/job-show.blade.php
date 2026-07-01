@@ -37,7 +37,17 @@
     @endif
     @if ($job->last_error)
         <h2>Last error</h2>
-        <pre class="json">{{ json_encode($job->last_error, JSON_PRETTY_PRINT|JSON_UNESCAPED_SLASHES) }}</pre>
+        @php($err = $job->last_error)
+        @if (is_array($err) && isset($err['class']))
+            <div class="err">
+                <div class="err-class">{{ $err['class'] }}</div>
+                @if (!empty($err['message']))<div class="err-msg">{{ $err['message'] }}</div>@endif
+                @if (!empty($err['file']))<div class="err-file muted">at <code>{{ $err['file'] }}</code></div>@endif
+                @if (!empty($err['trace']))<pre class="json trace">{{ $err['trace'] }}</pre>@endif
+            </div>
+        @else
+            <pre class="json">{{ json_encode($err, JSON_PRETTY_PRINT|JSON_UNESCAPED_SLASHES) }}</pre>
+        @endif
     @endif
 
     <h2>Attempts</h2>

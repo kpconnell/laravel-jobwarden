@@ -90,7 +90,7 @@ services:
     <<: *host
     environment:
       <<: *env
-      JOBWARDEN_ROLES: "supervisor,scheduled-worker,local-reaper,scheduler,global-reaper"
+      JOBWARDEN_ROLES: "supervisor,scheduled-worker,scheduler,global-reaper"
     depends_on:
       db:
         condition: service_healthy

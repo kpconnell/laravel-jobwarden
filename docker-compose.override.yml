@@ -1,0 +1,33 @@
+# Stress-test CPU tuning (auto-merged by `docker compose`).
+#
+# "Every role on every host" (the base compose) is correct and safe, but on a
+# laptop Docker VM it means 10 hosts x 5 busy poll-loops (~50 loops + a 2nd
+# supervisor per host for the scheduled lane) all competing for ~10 shared
+# vCPUs — which starves the single-threaded dashboard `serve` of CPU time slices
+# under load (runnable but never scheduled -> multi-second request latency).
+#
+# For the 100k restart-fidelity run we only need: the supervisors (the work), a
+# per-host local reaper (host-lease refresh + Tier-2), and exactly ONE global
+# reaper (Tier-3 — the piece that actually recovers work after the restart).
+# Scheduler + scheduled-worker do nothing here (no schedules, no scheduled lane),
+# and 9 extra global reapers just idle behind the leader lease.
+#
+# Result: ~21 constant loops instead of ~60, and 10 supervisors polling the DB
+# instead of 20 — same 60 default-lane job slots. Delete this file to restore the
+# full every-role-everywhere topology.
+services:
+  host:
+    environment:
+      # `supervisor` now bundles its own Tier-2 local reaper as a co-resident
+      # child (jobwarden.supervisor.bundle_reaper, default on), so we DON'T list
+      # `local-reaper` separately. We also drop scheduler + scheduled-worker
+      # (no schedules / no scheduled lane in this test) to keep CPU headroom.
+      JOBWARDEN_ROLES: "supervisor"
+
+  dashboard:
+    environment:
+      JOBWARDEN_ROLES: "dashboard,global-reaper"
+      # `php artisan serve` wraps PHP's built-in server, which forks this many
+      # request workers (Linux only) instead of handling one request at a time.
+      # Lifts the dispatch ceiling from ~3/s (single-threaded) to feed the fleet.
+      PHP_CLI_SERVER_WORKERS: "8"

@@ -20,10 +20,12 @@ Two consequences that shape every topology below:
   safe to run on *every* host — the DB elects who is actually active (a leader lease
   for the global reaper; `SKIP LOCKED` + a unique-occurrence constraint for the
   scheduler). You never have to designate "the scheduler box."
-- **The worker and its local reaper must be co-resident.** The local reaper
-  (`jobwarden:reap:local`) verifies a worker's child processes via `/proc` on the
-  *same* host, so wherever a `supervisor` or `scheduled-worker` runs, a `local-reaper`
-  must run beside it (same box / same PID namespace).
+- **A worker brings its own local reaper.** `jobwarden:work` (and
+  `jobwarden:scheduled-worker`) automatically spawn a co-resident Tier-2 local reaper
+  as a *separate* child process, so you can never run a worker without recovery and
+  never have to remember to start the reaper. It's a distinct process on purpose — it
+  outlives a supervisor crash to clean up its children — and a per-host lease keeps
+  exactly one active even when several workers share a box.
 
 ## The roles
 
@@ -31,7 +33,7 @@ Two consequences that shape every topology below:
 |---|---|---|---|
 | `supervisor` | `jobwarden:work` | Claims + runs jobs on the **default** lane (one child process per job). | Any number of hosts. |
 | `scheduled-worker` | `jobwarden:scheduled-worker` | Same, for the isolated **scheduled** lane. | Any number of hosts. |
-| `local-reaper` | `jobwarden:reap:local` | Tier-2 recovery: `/proc`-verifies this host's children, fast. | **Co-resident with the workers on its host.** |
+| `local-reaper` | `jobwarden:reap:local` | Tier-2 recovery: `/proc`-verifies this host's children, fast. | **Bundled into each worker** (one active per host, leased). Run standalone only for advanced splits. |
 | `scheduler` | `jobwarden:schedule` | Materializes due schedule runs. | Run 1+; concurrent-safe. |
 | `global-reaper` | `jobwarden:reap:global` | Tier-3 recovery: detects dead workers fleet-wide by stale lease. | Run 1+; only the lease holder is active. |
 | `dashboard` | (HTTP) the operator API + Livewire UI | Stateless read/write over the DB. | Anywhere with DB access. |
@@ -39,8 +41,11 @@ Two consequences that shape every topology below:
 With the container image, a host's roles are chosen by one env var:
 
 ```bash
-JOBWARDEN_ROLES="supervisor,scheduled-worker,local-reaper,scheduler,global-reaper"
+JOBWARDEN_ROLES="supervisor,scheduled-worker,scheduler,global-reaper"
 ```
+
+(No `local-reaper` in the set — each worker bundles one. Add it only for an advanced
+split topology where you run the reaper as its own process.)
 
 On bare metal / a VM, each role is a systemd unit instead (see
 [`packaging/systemd/`](../packaging/systemd)). Either way: **every daemon must be
@@ -82,8 +87,8 @@ holds all the state.
 │  Existing API/web host  │        │  Worker box (1 VM or 1 container)     │
 │  (your Laravel app)     │        │  JOBWARDEN_ROLES=                     │
 │   + JobWarden UI/API     │       │    supervisor, scheduled-worker,      │
-│     (auto-mounted)       │       │    local-reaper, scheduler,           │
-└───────────┬────────────┘         │    global-reaper                      │
+│     (auto-mounted)       │       │    scheduler, global-reaper           │
+└───────────┬────────────┘         │    (workers bundle their reaper)      │
             │                      └───────────────────┬──────────────────┘
             │      both talk only to the DB            │
             └───────────────┬─────────────────────────┘
@@ -111,7 +116,7 @@ claim distributes jobs across whoever is asking, and recovery is fleet-wide.
    ┌─────────────┐   ┌─────────────┐   ┌─────────────┐      API host (UI)
    │ Worker box 1 │  │ Worker box 2 │  │ Worker box 3 │           │
    │ supervisor   │  │ supervisor   │  │ supervisor   │           │
-   │ local-reaper │  │ local-reaper │  │ local-reaper │           │
+   │ (+ reaper)   │  │ (+ reaper)   │  │ (+ reaper)   │           │
    │ (scheduler)  │  │ (scheduler)  │  │ (scheduler)  │           │
    │ (global-reap)│  │ (global-reap)│  │ (global-reap)│           │
    └──────┬───────┘  └──────┬───────┘  └──────┬───────┘           │
@@ -127,9 +132,9 @@ Two equally valid ways to place the singletons:
 - **Everywhere (simplest):** give every worker box the full role set including
   `scheduler` and `global-reaper`. The DB keeps exactly one of each active; the rest
   idle at near-zero cost. Add/remove boxes freely with no special "control" node.
-- **Pinned (tidier at scale):** run `supervisor,local-reaper` on the worker fleet, and
-  `scheduler,global-reaper` (plus a spare for HA) on one or two small "control" hosts.
-  Fewer idle daemons, one place to look for scheduling/reaping logs.
+- **Pinned (tidier at scale):** run `supervisor` on the worker fleet (each bundles its
+  reaper), and `scheduler,global-reaper` (plus a spare for HA) on one or two small
+  "control" hosts. Fewer idle daemons, one place to look for scheduling logs.
 
 ### Scaling levers
 
@@ -169,11 +174,11 @@ so the same artifact runs everywhere. Only the wrapper differs. JobWarden's runt
 - **ECS / ACI.** One task/container group per host role-set, image + `JOBWARDEN_ROLES`,
   desired-count to scale. The baked-in init means you don't rely on any
   runtime-specific "init process" flag.
-- **Kubernetes.** A `Deployment` (replicas = worker boxes) running
-  `supervisor,local-reaper`; a small `Deployment` for `scheduler,global-reaper`; the UI
-  lives in your app's existing Deployment. If you split the supervisor and local reaper
-  into separate containers, they must share a PID namespace
-  (`shareProcessNamespace: true`).
+- **Kubernetes.** A `Deployment` (replicas = worker boxes) running `supervisor` (each
+  pod's worker bundles its Tier-2 reaper as a child in the same container); a small
+  `Deployment` for `scheduler,global-reaper`; the UI lives in your app's existing
+  Deployment. (Only if you take the advanced split — reaper in its *own* container —
+  do the two need a shared PID namespace, `shareProcessNamespace: true`.)
 
 ## Tuning knobs
 
@@ -188,6 +193,8 @@ All are env vars (defaults shown); recovery is governed by the host-lease budget
 | `JOBWARDEN_POLL_INTERVAL_MS` | 500 | How often a supervisor polls for claimable work. |
 | `JOBWARDEN_GLOBAL_LEASE_TTL` | 15 | Global-reaper leader lease TTL (failover time). |
 | `JOBWARDEN_LOCAL_SCAN_INTERVAL` | 5 | Tier-2 local reaper scan cadence. |
+| `JOBWARDEN_LOCAL_LEASE_TTL` | 15 | Per-host lease TTL electing the single active local reaper. |
+| `JOBWARDEN_BUNDLE_REAPER` | true | Whether `jobwarden:work` bundles its own reaper (`false` for advanced splits). |
 | `JOBWARDEN_MAX_RUNTIME_SEC` | — | Kill/flag a job child that runs past this budget. |
 
 **Recovery latency ≈ `HEARTBEAT_INTERVAL × MISSED_BEATS`** (default ~30s) — the window

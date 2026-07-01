@@ -106,14 +106,18 @@ $jw->scheduleOnce('one-off', now()->addHour(), SendDigest::class);        // fir
 
 ## Running the engine
 
-JobWarden runs as **long-running processes**. The minimum is a supervisor and the two reapers:
+JobWarden runs as **long-running processes**. `jobwarden:work` already brings its own Tier-2 local
+reaper (a co-resident child process), so the minimum is a worker, the global reaper, and the scheduler:
 
 ```bash
-php artisan jobwarden:work          # claim + run jobs (a supervisor)
-php artisan jobwarden:reap:local    # Tier-2: detect dead children on this host (/proc-verified)
+php artisan jobwarden:work          # claim + run jobs — and bundle a co-resident Tier-2 reaper
 php artisan jobwarden:reap:global   # Tier-3: detect dead workers fleet-wide (leader-leased)
 php artisan jobwarden:schedule      # evaluate schedules
 ```
+
+You never have to remember `jobwarden:reap:local` — the worker spawns it, and a per-host lease keeps
+exactly one active even when several workers share a box. (It remains a standalone command for
+advanced split topologies.)
 
 Each daemon should be supervised by the OS (systemd `Restart=always`, or a container restart policy). Unit
 templates are in [`packaging/systemd/`](packaging/systemd), and a container image that runs any set of roles

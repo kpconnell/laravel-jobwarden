@@ -40,12 +40,15 @@ final class LocalReaper
 
     private bool $fenced = false;
 
+    private bool $holdsLease = false;
+
     public function __construct(
         private readonly StampVerifier $verifier,
         private readonly ProcessProbe $probe,
         private readonly AttemptOrphaner $orphaner,
         private readonly WorkerRegistry $registry,
         private readonly HostIdentity $host,
+        private readonly LeaderLease $lease,
     ) {
     }
 
@@ -88,7 +91,23 @@ final class LocalReaper
         }
         $now ??= microtime(true);
 
+        // Keep our own worker row fresh regardless of lease state — a standby is a
+        // hot spare, ready to take over the instant the active reaper dies.
         $this->refreshLease($now);
+
+        // Exactly ONE local reaper scans per host: the per-host lease holder.
+        // Co-located reapers (a host running both jobwarden:work and
+        // jobwarden:scheduled-worker each bundle one) idle here until it dies —
+        // so there is never redundant /proc scanning or double-orphaning.
+        if (! $this->acquireHostLease()) {
+            $this->holdsLease = false;
+
+            return true;
+        }
+        if (! $this->holdsLease) {
+            $this->holdsLease = true;
+            $this->lastLeaseOk = $now; // just became active — reset the self-fence clock
+        }
 
         if (($now - $this->lastLeaseOk) > (float) config('jobwarden.reaper.self_fence_ttl', 25)) {
             $this->selfFence();
@@ -99,6 +118,28 @@ final class LocalReaper
         $this->scan();
 
         return true;
+    }
+
+    public function holdsLease(): bool
+    {
+        return $this->holdsLease;
+    }
+
+    /** Elect the single active local reaper for this host (per-host lease). */
+    private function acquireHostLease(): bool
+    {
+        try {
+            return $this->lease->acquire(
+                'local_reaper:'.$this->hostId,
+                $this->reaperId,
+                (int) config('jobwarden.reaper.local_lease_ttl', 15),
+            );
+        } catch (\Throwable) {
+            // DB unreachable: can't confirm the election. A current holder stays
+            // holder so its self-fence (a stale lease clock) can still fire and
+            // kill this host's children; a standby stays a standby.
+            return $this->holdsLease;
+        }
     }
 
     public function scan(): void

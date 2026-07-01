@@ -67,7 +67,10 @@ drain() {
 trap drain TERM INT
 
 # ---- resolve requested roles ---------------------------------------------
-IFS=',' read -ra REQUESTED <<< "${JOBWARDEN_ROLES:-supervisor,scheduled-worker,local-reaper,scheduler,global-reaper,dashboard}"
+# Default roles: workers bundle their own Tier-2 local reaper (a per-host lease
+# dedupes them), so `local-reaper` is not a default role — add it only for an
+# advanced split topology where you run the reaper as its own process.
+IFS=',' read -ra REQUESTED <<< "${JOBWARDEN_ROLES:-supervisor,scheduled-worker,scheduler,global-reaper,dashboard}"
 for raw in "${REQUESTED[@]}"; do
   role="$(echo "$raw" | tr -d '[:space:]')"
   [ -z "$role" ] && continue

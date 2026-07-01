@@ -98,7 +98,8 @@ final class Supervisor
         return $this->worker;
     }
 
-    public function run(): void
+    /** @param callable|null $onTick invoked each loop iteration (e.g. to supervise a bundled reaper). */
+    public function run(?callable $onTick = null): void
     {
         $this->boot();
 
@@ -108,6 +109,10 @@ final class Supervisor
             }
 
             $this->tick();
+
+            if ($onTick !== null) {
+                $onTick();
+            }
 
             if ($this->signals->isDraining()) {
                 if ($this->children->isEmpty()) {

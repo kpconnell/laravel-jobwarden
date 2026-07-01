@@ -112,6 +112,30 @@ final class LocalReaperTest extends TestCase
         $this->assertFalse($this->probe->pidAlive(200));
     }
 
+    public function test_only_the_per_host_lease_holder_scans(): void
+    {
+        // Two reapers on the SAME host (e.g. jobwarden:work + jobwarden:scheduled-worker
+        // each bundling one). Exactly one may scan; the other idles as a hot spare.
+        $a = $this->reaper();
+        $b = $this->reaper(); // same host, distinct worker_id
+
+        // A ticks first and wins the per-host lease.
+        $this->assertTrue($a->tick());
+        $this->assertTrue($a->holdsLease());
+
+        // A running attempt that a scan WOULD orphan (supervisor + child both gone).
+        [, $attempt] = $this->seedRunning(idempotent: true, supPid: 100, childPid: 200, childStart: 5000);
+
+        // B can't hold the lease, so it must NOT scan — the attempt is untouched.
+        $this->assertTrue($b->tick());
+        $this->assertFalse($b->holdsLease(), 'the second reaper is a standby');
+        $this->assertSame(AttemptState::Running, JobAttempt::find($attempt->id)->state, 'a standby never scans');
+
+        // The holder does scan and orphan it.
+        $a->tick();
+        $this->assertSame(AttemptState::Orphaned, JobAttempt::find($attempt->id)->state);
+    }
+
     /** @return array{0: Job, 1: JobAttempt} */
     private function seedRunning(bool $idempotent, int $supPid, int $childPid, int $childStart): array
     {

@@ -1,0 +1,4 @@
+providers:
+  - Livewire\LivewireServiceProvider
+  - JobWarden\JobWardenServiceProvider
+  - Workbench\App\Providers\WorkbenchServiceProvider

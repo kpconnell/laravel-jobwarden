@@ -1,0 +1,22 @@
+# Dedicated runner for the scheduled tier (P14) — claims ONLY the `scheduled`
+# lane. Deploy it as its own process, SEPARATE from the business jobwarden:work
+# fleet, so a wedged supervisor or a saturated worker fleet can never starve or
+# block scheduled work (incl. scheduled artisan commands). Pair it with a local
+# reaper on the same host for Tier-2 crash recovery.
+[Unit]
+Description=JobWarden scheduled-tier runner (jobwarden:scheduled-worker)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=www-data
+WorkingDirectory=/var/www/app
+ExecStart=/usr/bin/php artisan jobwarden:scheduled-worker --capacity=5
+Restart=always
+RestartSec=2
+KillSignal=SIGTERM
+TimeoutStopSec=120
+
+[Install]
+WantedBy=multi-user.target

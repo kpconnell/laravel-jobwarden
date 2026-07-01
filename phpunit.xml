@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<phpunit xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:noNamespaceSchemaLocation="vendor/phpunit/phpunit/phpunit.xsd"
+         bootstrap="vendor/autoload.php"
+         colors="true"
+         cacheDirectory=".phpunit.cache"
+         failOnWarning="true"
+         failOnRisky="true"
+         beStrictAboutOutputDuringTests="true">
+    <testsuites>
+        <testsuite name="JobWarden">
+            <directory>tests</directory>
+        </testsuite>
+    </testsuites>
+    <source>
+        <include>
+            <directory>src</directory>
+        </include>
+    </source>
+    <php>
+        <!--
+          Default to sqlite for the fast unit lane. NOT force="true": when the
+          container exports JOBWARDEN_TEST_DB=pgsql, that real env var wins, so
+          inside host1 the suite runs against Postgres automatically.
+        -->
+        <env name="JOBWARDEN_TEST_DB" value="sqlite"/>
+    </php>
+</phpunit>

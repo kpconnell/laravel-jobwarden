@@ -1,0 +1,70 @@
+{
+    "name": "kpconnell/laravel-jobwarden",
+    "description": "Durable, database-backed job, batch & scheduling engine for Laravel — the relational database is the source of truth and the coordination layer.",
+    "keywords": ["laravel", "jobs", "queue", "batch", "scheduler", "durable", "state-machine", "workers", "orphan-recovery"],
+    "type": "library",
+    "license": "MIT",
+    "homepage": "https://github.com/kpconnell/laravel-jobwarden",
+    "authors": [
+        {
+            "name": "Kevin Connell",
+            "email": "kevin@connells.net"
+        }
+    ],
+    "support": {
+        "issues": "https://github.com/kpconnell/laravel-jobwarden/issues",
+        "source": "https://github.com/kpconnell/laravel-jobwarden"
+    },
+    "require": {
+        "php": "^8.3",
+        "ext-json": "*",
+        "ext-pcntl": "*",
+        "ext-posix": "*",
+        "illuminate/console": "^11.0 || ^12.0",
+        "illuminate/database": "^11.0 || ^12.0",
+        "illuminate/events": "^11.0 || ^12.0",
+        "illuminate/http": "^11.0 || ^12.0",
+        "illuminate/routing": "^11.0 || ^12.0",
+        "illuminate/support": "^11.0 || ^12.0",
+        "livewire/livewire": "^3.5",
+        "symfony/process": "^7.0",
+        "symfony/uid": "^7.0"
+    },
+    "require-dev": {
+        "orchestra/testbench": "^9.0 || ^10.0",
+        "phpunit/phpunit": "^11.0"
+    },
+    "autoload": {
+        "psr-4": {
+            "JobWarden\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "JobWarden\\Tests\\": "tests/",
+            "Workbench\\App\\": "workbench/app/",
+            "Workbench\\Database\\": "workbench/database/"
+        }
+    },
+    "extra": {
+        "laravel": {
+            "providers": [
+                "JobWarden\\JobWardenServiceProvider"
+            ]
+        }
+    },
+    "config": {
+        "platform": {
+            "php": "8.4"
+        },
+        "sort-packages": true,
+        "allow-plugins": {
+            "composer/*": true
+        }
+    },
+    "scripts": {
+        "test": "phpunit"
+    },
+    "minimum-stability": "stable",
+    "prefer-stable": true
+}

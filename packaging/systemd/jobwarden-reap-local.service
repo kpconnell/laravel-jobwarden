@@ -1,0 +1,22 @@
+# Per-host local reaper (Tier 2). MUST run in the same PID namespace as the
+# supervisor + its children (same host/container) so it can verify /proc stamps
+# and signal reparented children. Type=notify + WatchdogSec means a wedged reaper
+# is restarted fast (it pets the watchdog only on a healthy scan). Requires PHP
+# ext-sockets for sd_notify.
+[Unit]
+Description=JobWarden local reaper (jobwarden:reap:local)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+NotifyAccess=main
+User=www-data
+WorkingDirectory=/var/www/app
+ExecStart=/usr/bin/php artisan jobwarden:reap:local
+Restart=always
+RestartSec=2
+WatchdogSec=20
+
+[Install]
+WantedBy=multi-user.target

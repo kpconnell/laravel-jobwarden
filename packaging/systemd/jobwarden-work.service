@@ -1,0 +1,21 @@
+# Per-host supervisor (Tier 1). One per host; size --capacity to the box.
+# On SIGTERM it drains: stops claiming, lets in-flight children finish, exits 0.
+# Set TimeoutStopSec ≥ your drain window (and use jobwarden.supervisor.drain_timeout
+# or your orchestrator's task protection for long jobs).
+[Unit]
+Description=JobWarden supervisor (jobwarden:work)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=www-data
+WorkingDirectory=/var/www/app
+ExecStart=/usr/bin/php artisan jobwarden:work --capacity=10
+Restart=always
+RestartSec=2
+KillSignal=SIGTERM
+TimeoutStopSec=120
+
+[Install]
+WantedBy=multi-user.target

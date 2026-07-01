@@ -1,0 +1,117 @@
+<?php
+
+declare(strict_types=1);
+
+namespace JobWarden\Tests\Http;
+
+use JobWarden\JobWarden;
+use JobWarden\Http\Livewire\Batches;
+use JobWarden\Http\Livewire\JobShow;
+use JobWarden\Http\Livewire\Jobs;
+use JobWarden\Http\Livewire\Overview;
+use JobWarden\Http\Livewire\Schedules;
+use JobWarden\Models\Job;
+use JobWarden\Models\Schedule;
+use JobWarden\States\JobState;
+use JobWarden\Tests\Concerns\RefreshesJobWardenSchema;
+use JobWarden\Tests\TestCase;
+use Livewire\Livewire;
+
+final class DashboardTest extends TestCase
+{
+    use RefreshesJobWardenSchema;
+
+    protected function setUp(): void
+    {
+        parent::setUp();
+        $this->setUpJobWardenSchema();
+        JobWarden::auth(fn ($request) => true);
+    }
+
+    public function test_the_gate_guards_the_dashboard_route(): void
+    {
+        JobWarden::auth(fn ($request) => false);
+        $this->get('jobwarden')->assertForbidden();
+
+        JobWarden::auth(fn ($request) => true);
+        $this->get('jobwarden')->assertOk()->assertSee('Overview');
+    }
+
+    public function test_overview_renders_state_counts(): void
+    {
+        Job::create(['job_class' => 'X', 'state' => JobState::Running, 'lane' => 'default']);
+
+        Livewire::test(Overview::class)->assertOk()->assertSee('Overview')->assertSee('running');
+    }
+
+    public function test_jobs_list_filters_by_state(): void
+    {
+        Job::create(['job_class' => 'Alpha', 'state' => JobState::Queued]);
+        Job::create(['job_class' => 'Beta', 'state' => JobState::Failed]);
+
+        Livewire::test(Jobs::class)
+            ->set('state', 'failed')
+            ->assertSee('Beta')
+            ->assertDontSee('Alpha');
+    }
+
+    public function test_job_detail_cancel_action(): void
+    {
+        $job = Job::create(['job_class' => 'X', 'state' => JobState::Queued]);
+
+        Livewire::test(JobShow::class, ['job' => $job->id])
+            ->assertOk()
+            ->call('cancel')
+            ->assertSee('cancel requested');
+
+        $this->assertSame(JobState::Canceled, $job->refresh()->state);
+    }
+
+    public function test_create_a_command_schedule_from_the_dashboard(): void
+    {
+        Livewire::test(Schedules::class)
+            ->set('name', 'nightly')
+            ->set('cron', '0 3 * * *')
+            ->set('type', 'command')
+            ->set('command', 'cache:prune')
+            ->set('idempotent', true)
+            ->call('create')
+            ->assertSee('schedule created');
+
+        $this->assertSame(1, Schedule::where('name', 'nightly')->count());
+        $this->assertTrue((bool) Schedule::where('name', 'nightly')->value('idempotent'));
+    }
+
+    public function test_create_schedule_rejects_a_bad_cron(): void
+    {
+        Livewire::test(Schedules::class)
+            ->set('name', 'bad')->set('cron', 'garbage')->set('type', 'command')->set('command', 'x')
+            ->call('create')
+            ->assertHasErrors('cron');
+
+        $this->assertSame(0, Schedule::count());
+    }
+
+    public function test_toggle_and_run_a_schedule(): void
+    {
+        $schedule = $this->app->make(JobWarden::class)->scheduleCommand('s', '0 3 * * *', 'cache:prune');
+
+        Livewire::test(Schedules::class)
+            ->call('toggle', $schedule->id)
+            ->call('runNow', $schedule->id);
+
+        $this->assertFalse((bool) Schedule::find($schedule->id)->enabled);
+        $this->assertSame(1, Job::where('schedule_id', $schedule->id)->where('lane', 'scheduled')->count());
+    }
+
+    public function test_cancel_a_batch_from_the_dashboard(): void
+    {
+        $batch = $this->app->make(JobWarden::class)->batch('b')->add('a', 'JobA')->dispatch();
+
+        Livewire::test(Batches::class)
+            ->call('cancel', $batch->id)
+            ->assertSee('batch canceled');
+
+        $this->assertSame('canceled', $batch->refresh()->state->value);
+    }
+}

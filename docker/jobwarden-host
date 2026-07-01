@@ -1,0 +1,120 @@
+#!/usr/bin/env bash
+#
+# jobwarden-host — run ONE JobWarden "host": a single machine that takes on many
+# ROLES. This is the container's main process; `tini` is PID 1 (see the image
+# ENTRYPOINT) and reaps zombies + forwards signals to this script.
+#
+# Roles are chosen with JOBWARDEN_ROLES (comma-separated); default is all of
+# them. Each role is launched as a child whose stdout/stderr are INHERITED —
+# never redirected. That one rule is what keeps `docker logs` / CloudWatch / ACI
+# logs golden: FD 1/2 flow container-stdout → tini → here → each role, so every
+# role's structured log line lands on the container's stdout. (Job children log
+# to the DB sink on a separate channel, so this stream stays role-lifecycle only.)
+#
+# Each role is supervised independently: a transient crash is restarted in place
+# without disturbing the other roles (and the restart is a LOUD log line, never a
+# silent death). A role that crash-loops escalates to a whole-host exit so the
+# runtime (Docker restart policy / ECS / ACI) surfaces it and backs off. SIGTERM
+# drains every role gracefully.
+#
+# The same image + this script run unchanged on Docker/ECS/ACI/k8s — only the
+# role set (an env var) and the wrapper differ.
+
+set -uo pipefail
+
+log() { printf '[jobwarden-host] %s\n' "$*"; }
+
+# The artisan entrypoint (overridable so the launcher logic is testable with a
+# mock). In this image the app is the testbench workbench.
+ARTISAN="${JOBWARDEN_ARTISAN:-php vendor/bin/testbench}"
+
+# ---- role → command -------------------------------------------------------
+role_command() {
+  case "$1" in
+    supervisor)       echo "jobwarden:work --capacity=${JOBWARDEN_CAPACITY:-6}" ;;
+    scheduled-worker) echo "jobwarden:scheduled-worker --capacity=${JOBWARDEN_SCHED_CAPACITY:-4}" ;;
+    local-reaper)     echo "jobwarden:reap:local" ;;
+    global-reaper)    echo "jobwarden:reap:global" ;;
+    scheduler)        echo "jobwarden:schedule" ;;
+    dashboard)        echo "serve --host=0.0.0.0 --port=${JOBWARDEN_DASHBOARD_PORT:-8080}" ;;
+    *)                return 1 ;;
+  esac
+}
+
+declare -A CMD_OF     # role  -> artisan subcommand + args
+declare -A PID_OF     # role  -> current child pid
+declare -A ROLE_OF    # pid   -> role
+declare -a DEATHS=()  # epoch-seconds of recent restarts (crash-loop window)
+DRAIN=0
+
+start_role() {
+  local role="$1"
+  log "role=${role} starting: ${ARTISAN} ${CMD_OF[$role]}"
+  # INHERIT stdout/stderr — the launcher never redirects a role's output.
+  # shellcheck disable=SC2086
+  ${ARTISAN} ${CMD_OF[$role]} &
+  local pid=$!
+  PID_OF[$role]=$pid
+  ROLE_OF[$pid]=$role
+}
+
+drain() {
+  DRAIN=1
+  log "SIGTERM/SIGINT — draining ${#PID_OF[@]} role(s)"
+  local role
+  for role in "${!PID_OF[@]}"; do kill -TERM "${PID_OF[$role]}" 2>/dev/null || true; done
+}
+trap drain TERM INT
+
+# ---- resolve requested roles ---------------------------------------------
+IFS=',' read -ra REQUESTED <<< "${JOBWARDEN_ROLES:-supervisor,scheduled-worker,local-reaper,scheduler,global-reaper,dashboard}"
+for raw in "${REQUESTED[@]}"; do
+  role="$(echo "$raw" | tr -d '[:space:]')"
+  [ -z "$role" ] && continue
+  if ! cmd="$(role_command "$role")"; then
+    log "unknown role '${role}' — skipping"
+    continue
+  fi
+  CMD_OF[$role]="$cmd"
+done
+if [ "${#CMD_OF[@]}" -eq 0 ]; then
+  log "no valid roles in JOBWARDEN_ROLES='${JOBWARDEN_ROLES:-}' — nothing to run"
+  exit 1
+fi
+
+log "host id=$(cat /etc/machine-id 2>/dev/null | cut -c1-12) roles: ${!CMD_OF[*]}"
+for role in "${!CMD_OF[@]}"; do start_role "$role"; done
+
+# ---- supervise ------------------------------------------------------------
+EXIT=0
+while [ "$DRAIN" -eq 0 ]; do
+  wait -n                       # wake when any role exits (or a signal trap fires)
+  [ "$DRAIN" -eq 1 ] && break
+
+  for role in "${!PID_OF[@]}"; do
+    pid="${PID_OF[$role]}"
+    kill -0 "$pid" 2>/dev/null && continue     # still alive
+    unset "ROLE_OF[$pid]"
+
+    # crash-loop guard: > N restarts within W seconds → hand off to the runtime.
+    now="$(date +%s)"
+    window="${JOBWARDEN_RESTART_WINDOW:-60}"
+    DEATHS+=("$now")
+    recent=(); for t in "${DEATHS[@]}"; do [ $(( now - t )) -lt "$window" ] && recent+=("$t"); done
+    DEATHS=("${recent[@]}")
+    if [ "${#DEATHS[@]}" -gt "${JOBWARDEN_MAX_RESTARTS:-8}" ]; then
+      log "roles crash-looping (${#DEATHS[@]} restarts in ${window}s) — exiting host for a runtime restart"
+      EXIT=42
+      drain
+      break 2
+    fi
+
+    log "role=${role} exited — restarting in place"
+    start_role "$role"
+  done
+done
+
+# ---- drain & exit ---------------------------------------------------------
+for role in "${!PID_OF[@]}"; do wait "${PID_OF[$role]}" 2>/dev/null || true; done
+log "all roles stopped — host exiting (code=${EXIT})"
+exit "$EXIT"

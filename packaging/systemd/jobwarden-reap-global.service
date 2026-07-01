@@ -1,0 +1,20 @@
+# HA global reaper (Tier 3). Run it on ≥2 hosts — the DB leader lease makes
+# multiple instances safe (only one scans at a time). Cross-host / DB-only, so it
+# needs no shared PID namespace.
+[Unit]
+Description=JobWarden global reaper (jobwarden:reap:global)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=www-data
+WorkingDirectory=/var/www/app
+ExecStart=/usr/bin/php artisan jobwarden:reap:global
+Restart=always
+RestartSec=2
+KillSignal=SIGTERM
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target

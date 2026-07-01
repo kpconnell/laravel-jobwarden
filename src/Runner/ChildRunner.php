@@ -1,0 +1,237 @@
+<?php
+
+declare(strict_types=1);
+
+namespace JobWarden\Runner;
+
+use JobWarden\Contracts\JobWardenJob;
+use JobWarden\Contracts\Terminable;
+use JobWarden\Logging\JobLogCapture;
+use JobWarden\Models\JobAttempt;
+use JobWarden\Process\Contracts\ProcessProbe;
+use JobWarden\Process\Contracts\ProcessTitle;
+use JobWarden\Process\Pidfile;
+use JobWarden\Recovery\RecoveryService;
+use JobWarden\StateMachine\Exceptions\IllegalTransitionException;
+use JobWarden\StateMachine\Exceptions\StaleFencingTokenException;
+use JobWarden\StateMachine\StateMachine;
+use JobWarden\StateMachine\TransitionContext;
+use JobWarden\States\ActorType;
+use JobWarden\States\AttemptState;
+use JobWarden\States\JobState;
+use Illuminate\Support\Carbon;
+use Illuminate\Support\Facades\Log;
+
+/**
+ * What `jobwarden:run {attempt} --token --nonce` executes in the dedicated child
+ * process (spec §6.1). Verifies the fencing token, writes the pidfile + nonce,
+ * moves the attempt dispatched→running, runs the handler, and reports the
+ * determinate outcome. A hard crash (no report) is caught by the supervisor's
+ * Tier-1 waitpid instead.
+ */
+final class ChildRunner
+{
+    /** Head cap on the stored trace string — keeps the throw site, bounds bloat. */
+    private const MAX_TRACE_CHARS = 8000;
+
+    public function __construct(
+        private readonly StateMachine $stateMachine,
+        private readonly RecoveryService $recovery,
+        private readonly ProcessProbe $probe,
+        private readonly Pidfile $pidfile,
+        private readonly ProcessTitle $title,
+        private readonly JobLogCapture $logs,
+    ) {
+    }
+
+    public function run(string $attemptId, int $token, string $nonce): int
+    {
+        $attempt = JobAttempt::query()->find($attemptId);
+        if ($attempt === null || (int) $attempt->fencing_token !== $token) {
+            return ExitCode::STALE_TOKEN;
+        }
+
+        $job = $attempt->job;
+        if ($job === null) {
+            return ExitCode::STALE_TOKEN;
+        }
+
+        $pid = getmypid();
+        $startTime = $this->probe->startTime((int) $pid);
+        $this->pidfile->write($attemptId, [
+            'pid' => $pid,
+            'start_time' => $startTime,
+            'nonce' => $nonce,
+            'token' => $token,
+        ]);
+        $this->title->set("jobwarden:run {$attemptId} ".substr($nonce, 0, 8));
+
+        $snapshot = [
+            'child_pid' => $pid,
+            'child_start_time' => $startTime,
+            'proc_nonce' => $nonce,
+            'host_id' => $attempt->host_id,
+        ];
+
+        // dispatched → running (the first real work; carries the epoch).
+        try {
+            $this->stateMachine->applyAttemptTransition(
+                $attempt,
+                AttemptState::Running,
+                TransitionContext::for(ActorType::Worker, null, 'started')
+                    ->expectingToken($token)
+                    ->withProcessSnapshot($snapshot)
+            );
+        } catch (IllegalTransitionException|StaleFencingTokenException) {
+            $this->pidfile->delete($attemptId);
+
+            return ExitCode::STALE_TOKEN;
+        }
+
+        $this->installGracefulStop();
+
+        // Capture every Log facade call made during the job — handler logs AND
+        // the supervisor wrappers below — into job_logs, scoped to this attempt.
+        $this->logs->begin((string) $job->id, $attemptId);
+        $this->logs->install();
+        Log::info("Starting job {$job->job_class}", ['step' => 'starting', 'attempt' => (int) $attempt->attempt_number]);
+
+        try {
+            $handler = app($job->job_class);
+            if (! $handler instanceof JobWardenJob) {
+                throw new \RuntimeException("{$job->job_class} must implement ".JobWardenJob::class);
+            }
+
+            $handler->handle(new JobContext(
+                (string) $job->id,
+                $attemptId,
+                (int) $attempt->attempt_number,
+                (array) ($job->params ?? []),
+            ));
+        } catch (\Throwable $e) {
+            Log::error('Job failed: '.$e->getMessage(), ['step' => 'failed', 'exception' => $e::class]);
+            $this->logs->end();
+
+            return $this->fail($attempt, $job, $token, $e, $handler ?? null);
+        }
+
+        Log::info('Job finished successfully', ['step' => 'finished']);
+        $this->logs->end();
+
+        return $this->succeed($attempt, $job, $token);
+    }
+
+    private function succeed(JobAttempt $attempt, $job, int $token): int
+    {
+        try {
+            $this->stateMachine->applyAttemptTransition(
+                $attempt,
+                AttemptState::Succeeded,
+                TransitionContext::for(ActorType::Worker, null, 'completed')->expectingToken($token)
+            );
+            $this->stateMachine->applyJobTransition(
+                $job,
+                JobState::Succeeded,
+                TransitionContext::for(ActorType::Worker, null, 'completed')
+            );
+        } catch (StaleFencingTokenException) {
+            // Fenced out (reaped while finishing). Leave authoritative state alone.
+        }
+
+        $this->pidfile->delete((string) $attempt->id);
+
+        return ExitCode::SUCCESS;
+    }
+
+    private function fail(JobAttempt $attempt, $job, int $token, \Throwable $e, ?JobWardenJob $handler): int
+    {
+        $this->recordError($attempt, $job, $e);
+
+        try {
+            $this->stateMachine->applyAttemptTransition(
+                $attempt,
+                AttemptState::Failed,
+                TransitionContext::for(ActorType::Worker, null, 'handler threw')
+                    ->expectingToken($token)
+                    ->withContext(['error' => $e->getMessage()])
+            );
+            $this->recovery->afterAttemptFailure($job, ActorType::Worker, 'attempt failed: '.$e->getMessage());
+        } catch (StaleFencingTokenException) {
+            // Fenced out — a reaper already took over.
+        }
+
+        $this->pidfile->delete((string) $attempt->id);
+
+        return ExitCode::FAILURE;
+    }
+
+    /**
+     * Persist the failure as durable, structured state — with the stack trace —
+     * on BOTH the attempt (`job_attempts.error`, spec §4.3 "class, message, trace
+     * reference") and the Job itself (`jobs.last_error`, spec §4.2). This makes
+     * "what failed and WHERE" answerable from the job/attempt rows directly,
+     * rather than only by grepping log lines that carry the message but not the
+     * throw site.
+     */
+    private function recordError(JobAttempt $attempt, $job, \Throwable $e): void
+    {
+        $error = $this->describe($e);
+
+        $attempt->forceFill([
+            'error' => $error,
+            'finished_at' => Carbon::now(),
+        ])->save();
+
+        $job->forceFill(['last_error' => $error])->saveQuietly();
+    }
+
+    /** @return array<string,mixed> */
+    private function describe(\Throwable $e): array
+    {
+        $error = [
+            'class' => $e::class,
+            'message' => $e->getMessage(),
+            'file' => $e->getFile().':'.$e->getLine(),
+            'trace' => $this->trace($e),
+        ];
+
+        if (($previous = $e->getPrevious()) !== null) {
+            $error['previous'] = [
+                'class' => $previous::class,
+                'message' => $previous->getMessage(),
+                'file' => $previous->getFile().':'.$previous->getLine(),
+            ];
+        }
+
+        return $error;
+    }
+
+    /**
+     * PHP orders trace frames most-recent-first, so a head cap keeps the throw
+     * site and its immediate callers (the useful part) while bounding a
+     * pathologically deep trace from bloating the row.
+     */
+    private function trace(\Throwable $e): string
+    {
+        $trace = $e->getTraceAsString();
+
+        return strlen($trace) > self::MAX_TRACE_CHARS
+            ? substr($trace, 0, self::MAX_TRACE_CHARS)."\n… trace truncated"
+            : $trace;
+    }
+
+    private function installGracefulStop(): void
+    {
+        if (! function_exists('pcntl_async_signals')) {
+            return;
+        }
+
+        pcntl_async_signals(true);
+        // The supervisor escalates SIGTERM → SIGKILL; a non-cooperative handler is
+        // killed and recorded `stopped` by the supervisor. Terminable jobs that
+        // poll for a stop can checkpoint within the grace window.
+        pcntl_signal(SIGTERM, static function (): void {
+            // Flag-only; cooperative handlers observe via their own loop.
+        });
+    }
+}

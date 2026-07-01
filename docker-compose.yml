@@ -1,0 +1,118 @@
+# JobWarden — realistic local-dev topology.
+#
+# A "host" is ONE container that takes on many ROLES (supervisor, scheduled
+# worker, local reaper, scheduler, global reaper, dashboard) — chosen with
+# JOBWARDEN_ROLES (default: all). Supervisor + local reaper are just two
+# processes in the same box, so /proc + signals work with no cross-container
+# PID-namespace coupling. Scale hosts with:
+#
+#     docker compose up -d --scale host=3
+#
+# Running every role on every host is safe: the DB coordinates the singletons
+# (global reaper via its leader lease, scheduler via SKIP LOCKED + a unique
+# occurrence constraint), so the database decides who is actually active.
+#
+# The IMAGE is the portable unit — init is baked in (tini), roles are env-driven —
+# so the same image drops into ECS / ACI / k8s unchanged; only this compose
+# wrapper is Docker-specific.
+
+x-host: &host
+  build:
+    context: .
+    dockerfile: docker/Dockerfile
+  image: jobwarden-host
+  volumes:
+    - .:/app
+    - jobwarden-vendor:/app/vendor
+  environment: &env
+    JOBWARDEN_TEST_DB: mysql
+    JOBWARDEN_DB_DRIVER: mysql
+    JOBWARDEN_DB_HOST: db
+    JOBWARDEN_DB_PORT: "3306"
+    JOBWARDEN_DB_NAME: jobwarden
+    JOBWARDEN_DB_USER: jobwarden
+    JOBWARDEN_DB_PASSWORD: secret
+  restart: unless-stopped
+
+services:
+  # ---- the one durable stateful service ------------------------------------
+  db:
+    image: mariadb:11.4
+    environment:
+      MARIADB_DATABASE: jobwarden
+      MARIADB_USER: jobwarden
+      MARIADB_PASSWORD: secret
+      MARIADB_ROOT_PASSWORD: rootsecret
+    command: ["--transaction-isolation=READ-COMMITTED"]
+    volumes:
+      - jobwarden-maria-data:/var/lib/mysql     # durable named volume
+    ports:
+      - "33060:3306"
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 2s
+      timeout: 3s
+      retries: 40
+
+  # Optional Postgres for the 3-engine test matrix (not started by default):
+  #   docker compose --profile pg up -d pg
+  pg:
+    profiles: ["pg"]
+    image: postgres:18
+    environment:
+      POSTGRES_DB: jobwarden
+      POSTGRES_USER: jobwarden
+      POSTGRES_PASSWORD: secret
+    volumes:
+      - jobwarden-pg-data:/var/lib/postgresql/data
+    ports:
+      - "55432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U jobwarden -d jobwarden"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  # ---- one-shot: create the schema, then exit. Hosts wait on it. -----------
+  migrate:
+    <<: *host
+    restart: "no"
+    command: ["sh", "-lc", "php vendor/bin/testbench migrate:install --database=jobwarden; php vendor/bin/testbench migrate --database=jobwarden --force"]
+    depends_on:
+      db:
+        condition: service_healthy
+
+  # ---- the scalable worker host: many roles per container ------------------
+  # Every host runs the worker + coordination roles; the DB coordinates the
+  # singletons (global reaper via its lease, scheduler via SKIP LOCKED), so it's
+  # safe on every replica. Scale hosts with:  docker compose up -d --scale host=3
+  host:
+    <<: *host
+    environment:
+      <<: *env
+      JOBWARDEN_ROLES: "supervisor,scheduled-worker,local-reaper,scheduler,global-reaper"
+    depends_on:
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
+  # ---- dashboard / operator API: same image, just the dashboard role -------
+  # Split out so it owns a stable published port while worker hosts scale freely.
+  dashboard:
+    <<: *host
+    environment:
+      <<: *env
+      JOBWARDEN_ROLES: "dashboard"
+    ports:
+      - "8899:8080"          # http://localhost:8899/jobwarden
+    depends_on:
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
+volumes:
+  jobwarden-vendor:
+  jobwarden-maria-data:
+  jobwarden-pg-data:

@@ -1,0 +1,20 @@
+# Scheduler (spec §7). Multi-instance safe — run it on ≥1 host; concurrent
+# schedulers cannot double-enqueue an occurrence (schedule-row lock + the
+# schedule_runs UNIQUE constraint). Missed runs are caught up on restart.
+[Unit]
+Description=JobWarden scheduler (jobwarden:schedule)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=www-data
+WorkingDirectory=/var/www/app
+ExecStart=/usr/bin/php artisan jobwarden:schedule
+Restart=always
+RestartSec=2
+KillSignal=SIGTERM
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target

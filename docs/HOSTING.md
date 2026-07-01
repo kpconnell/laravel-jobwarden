@@ -77,7 +77,40 @@ results and drive operator actions.
 > Only run the standalone `dashboard` *role* from the image when you want the UI on a
 > box that *isn't* already running your Laravel app.
 
-## Topology 1 — the smallest real deployment
+## Already have a fleet? It's just artisan commands
+
+You do **not** need the JobWarden container image. The image + `JOBWARDEN_ROLES` launcher
+is a convenience for greenfield setups that want a single artifact. If you already build
+and run your own Laravel app image (an ECS fleet, k8s, systemd on VMs…), JobWarden is
+simply **a few long-running `php artisan` commands** you run on *your* image:
+
+1. `composer require kpconnell/laravel-jobwarden` and rebuild your app image.
+2. The **UI is already served** by any web instance running that image (auto-mounted, see
+   above) — nothing to deploy for it.
+3. Run these as long-running processes, using your image with the container command
+   overridden. Nothing beyond your DB connection is required:
+
+   | Process | Command | How many |
+   |---|---|---|
+   | Workers | `php artisan jobwarden:work` | scale to taste — each bundles its Tier-2 reaper |
+   | Global reaper | `php artisan jobwarden:reap:global` | 1–2 (leader-leased; the fleet-wide backstop) |
+   | Scheduler | `php artisan jobwarden:schedule` | 1+ (only if you use scheduling) |
+
+That's the entire runtime — no JobWarden image, no `JOBWARDEN_ROLES`.
+
+- **ECS** — two services on your existing task image: a **worker** service (container
+  command `["php","artisan","jobwarden:work"]`, desired-count = N, autoscaled), and a
+  small **control** service (one task, two containers running `jobwarden:schedule` and
+  `jobwarden:reap:global`, desired-count 1 — or 2 for HA; the leader lease keeps one
+  global reaper active and schedulers are `SKIP LOCKED`-safe).
+- **Kubernetes** — the same commands as a worker `Deployment` (replicas = N) and a
+  1-replica control `Deployment`.
+- **VMs** — three systemd units (see [`packaging/systemd/`](../packaging/systemd)).
+
+The container image below is worth it only when you *don't* already have a way to run a
+long-running process — then it hands you one artifact that runs any subset of roles.
+
+## Topology 1 — the smallest real deployment (using the image)
 
 Your existing API host serves the UI; one worker box does all the work; one database
 holds all the state.
@@ -159,9 +192,13 @@ Two equally valid ways to place the singletons:
   - **Claim contention.** `SKIP LOCKED` is designed for this and scales well; if you
     see idle spin, tune `poll_interval_ms` and `--capacity` rather than adding boxes.
 
-## Substrates
+## Substrates (deploying the JobWarden image)
 
-The **image is the portable unit** — init (`tini`) is baked in and roles are env-driven —
+> This section is the **image** path. If you're bringing the package into your own app
+> image, use ["Already have a fleet?"](#already-have-a-fleet-its-just-artisan-commands)
+> above — you just run the artisan commands and can skip the image entirely.
+
+The **image is a portable unit** — init (`tini`) is baked in and roles are env-driven —
 so the same artifact runs everywhere. Only the wrapper differs. JobWarden's runtime is
 **Linux-only** (it uses `/proc`, POSIX signals, `proc_open`/`pcntl`).
 

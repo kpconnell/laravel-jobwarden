@@ -50,7 +50,12 @@ final class SkipLockedClaimDriver implements ClaimDriver
                         ->orWhere('available_at', '<=', $conn->raw('CURRENT_TIMESTAMP'));
                 })
                 ->orderByDesc('priority')
-                ->orderBy('available_at')
+                // Age within priority: order by created_at, NOT available_at. A
+                // requeued orphan/retry keeps its original created_at, so once its
+                // backoff makes it eligible it claims AHEAD of fresher work instead
+                // of landing at the back of the lane. available_at remains the
+                // eligibility gate (the WHERE above), never the sort key.
+                ->orderBy('created_at')
                 ->limit($want)
                 ->lock('for update skip locked')
                 ->pluck('id');

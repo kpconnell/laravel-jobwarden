@@ -17,7 +17,7 @@ RUN apt-get update \
         git \
         unzip \
         libzip-dev \
-    && docker-php-ext-install -j"$(nproc)" pcntl pdo_pgsql pgsql pdo_mysql zip sockets \
+    && docker-php-ext-install -j"$(nproc)" pcntl pdo_pgsql pgsql pdo_mysql zip sockets opcache \
     && rm -rf /var/lib/apt/lists/*
 
 # pdo_sqlite, posix, and json are enabled by default in the official image.
@@ -28,6 +28,10 @@ COPY docker/php.ini /usr/local/etc/php/conf.d/zz-jobwarden.ini
 COPY docker/entrypoint.sh /usr/local/bin/jobwarden-entrypoint
 COPY docker/jobwarden-host /usr/local/bin/jobwarden-host
 RUN chmod +x /usr/local/bin/jobwarden-entrypoint /usr/local/bin/jobwarden-host
+
+# OPcache's file_cache (see php.ini) needs its directory to EXIST at startup, or
+# `opcache.file_cache_only=1` fatals PHP before it runs anything. Bake it in.
+RUN mkdir -p /tmp/jobwarden-opcache && chmod 1777 /tmp/jobwarden-opcache
 
 ENV COMPOSER_ALLOW_SUPERUSER=1
 

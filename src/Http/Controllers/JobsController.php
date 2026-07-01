@@ -10,6 +10,7 @@ use JobWarden\Models\Job;
 use JobWarden\Models\JobLog;
 use JobWarden\Operations\OperatorActions;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\DB;
 
 /**
  * Read + operator actions over jobs. Returns Eloquent models/paginators directly
@@ -18,14 +19,62 @@ use Illuminate\Http\Request;
  */
 final class JobsController
 {
-    /** Dispatch one ad-hoc JobWarden job through the gated operator API. */
+    /**
+     * Dispatch through the gated operator API. Accepts either a single job object
+     * ({job_class, params, ...}) or a BULK array ({"jobs": [ {...}, {...} ]}). The
+     * bulk form pays one HTTP round-trip + one framework bootstrap for the whole
+     * batch instead of per job — the difference between feeding a fleet and
+     * starving it at scale.
+     */
     public function store(Request $request, JobWarden $jobwarden)
     {
+        if ($request->has('jobs')) {
+            return $this->storeBulk($request, $jobwarden);
+        }
+
         $data = $this->dispatchData($request);
 
         $job = $jobwarden->dispatch($data['job_class'], $data['params'] ?? [], $this->dispatchOptions($data, $request));
 
         return response()->json($job, 201);
+    }
+
+    /**
+     * Bulk dispatch: {"jobs": [ {job_class, params, idempotent, ...}, ... ]}.
+     * All rows are created in one transaction, so the batch is atomic — a bad
+     * spec rolls the whole request back rather than half-creating it. Only
+     * job_class is strictly validated (it gates arbitrary class resolution); the
+     * remaining per-job options are read defensively, exactly as the single path.
+     */
+    private function storeBulk(Request $request, JobWarden $jobwarden)
+    {
+        $max = (int) config('jobwarden.api.max_bulk', 2000);
+
+        $request->validate([
+            'jobs' => "required|array|min:1|max:{$max}",
+            'jobs.*.job_class' => ['required', 'string', $this->jobClassRule()],
+            'jobs.*.params' => 'array',
+        ]);
+
+        $specs = (array) $request->input('jobs');
+
+        $ids = DB::connection(config('jobwarden.connection'))->transaction(
+            function () use ($specs, $jobwarden, $request): array {
+                $ids = [];
+                foreach ($specs as $spec) {
+                    $job = $jobwarden->dispatch(
+                        $spec['job_class'],
+                        $spec['params'] ?? [],
+                        $this->dispatchOptions($spec, $request)
+                    );
+                    $ids[] = $job->id;
+                }
+
+                return $ids;
+            }
+        );
+
+        return response()->json(['created' => count($ids), 'ids' => $ids], 201);
     }
 
     public function index(Request $request)

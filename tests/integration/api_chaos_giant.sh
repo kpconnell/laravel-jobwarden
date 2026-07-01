@@ -30,6 +30,9 @@ set -uo pipefail
 
 API="${JOBWARDEN_API_URL:-http://localhost:8899/jobwarden/api}"
 JOB_CLASS="${JOBWARDEN_API_CHAOS_JOB_CLASS:-Workbench\\\\App\\\\Jobs\\\\ChaosMonkeyJob}"
+# Plain (single-backslash) class name for the PHP bulk-body generator — json_encode
+# escapes the backslashes itself, so we must NOT pre-escape them here.
+JOB_CLASS_PLAIN="${JOBWARDEN_API_CHAOS_JOB_CLASS_PLAIN:-Workbench\App\Jobs\ChaosMonkeyJob}"
 RUN_ID="${JOBWARDEN_API_CHAOS_RUN_ID:-giant-$(date +%s)-$$}"
 
 # ---- curl behaviour -------------------------------------------------------
@@ -73,6 +76,14 @@ STDERR_JOBS="${JOBWARDEN_GIANT_STDERR_JOBS:-$(scale 8000 0)}"
 THROW_JOBS="${JOBWARDEN_GIANT_THROW_JOBS:-$(scale 6000 0)}"
 CRASH_JOBS="${JOBWARDEN_GIANT_CRASH_JOBS:-$(scale 4000 0)}"
 
+# A slice of the success cohort is dispatched NON-idempotent, to exercise the
+# OTHER half of the guard: when the restart orphans one of these, recovery must
+# NOT auto-retry it — the lost outcome is indeterminate, so it PARKS in `orphaned`
+# for an operator (spec §11a). Carved out of SUCCESS_JOBS so the total is unchanged.
+NONIDEMPOTENT_PCT="${JOBWARDEN_GIANT_NONIDEMPOTENT_PCT:-10}"
+NONIDEM_JOBS=$(php -r 'echo (int) round($argv[1] * $argv[2] / 100);' "$SUCCESS_JOBS" "$NONIDEMPOTENT_PCT")
+SUCCESS_JOBS=$((SUCCESS_JOBS - NONIDEM_JOBS))
+
 # Retry budgets. SUCCEED cohorts need headroom to survive being orphaned by the
 # restart (each orphan burns one attempt); FAIL cohorts are bounded so they
 # deterministically exhaust to `failed`.
@@ -85,9 +96,21 @@ FAIL_MAX_ATTEMPTS="${JOBWARDEN_GIANT_FAIL_MAX_ATTEMPTS:-3}"
 # jobs. 0 = instant.
 SUCCESS_SLEEP_MS="${JOBWARDEN_GIANT_SUCCESS_SLEEP_MS:-2500}"
 
-TARGET_JOBS=$((SUCCESS_JOBS + LOGSTORM_JOBS + ARTIFACT_JOBS + STDERR_JOBS + THROW_JOBS + CRASH_JOBS))
-EXPECTED_SUCCEEDED=$((SUCCESS_JOBS + LOGSTORM_JOBS + ARTIFACT_JOBS + STDERR_JOBS))
+# Bulk dispatch: how many jobs per POST /jobs body, and how many bodies in flight.
+# One bulk POST pays a single framework bootstrap for the whole batch, so this is
+# what turns dispatch from the bottleneck into a non-event. Keep <= the API's
+# jobwarden.api.max_bulk (default 2000). BULK_CONCURRENCY ~= dashboard serve workers.
+BULK_SIZE="${JOBWARDEN_GIANT_BULK_SIZE:-500}"
+BULK_CONCURRENCY="${JOBWARDEN_GIANT_BULK_CONCURRENCY:-8}"
+
+TARGET_JOBS=$((SUCCESS_JOBS + NONIDEM_JOBS + LOGSTORM_JOBS + ARTIFACT_JOBS + STDERR_JOBS + THROW_JOBS + CRASH_JOBS))
+# Idempotent successes ALWAYS converge (they retry through any orphaning).
+EXPECTED_IDEMPOTENT_SUCCEEDED=$((SUCCESS_JOBS + LOGSTORM_JOBS + ARTIFACT_JOBS + STDERR_JOBS))
 EXPECTED_FAILED=$((THROW_JOBS + CRASH_JOBS))
+# Non-idempotent successes split: those the restart didn't catch succeed; those it
+# caught in-flight PARK in `orphaned`. So `succeeded` is a RANGE, not a fixed number:
+#   EXPECTED_IDEMPOTENT_SUCCEEDED  <=  succeeded  <=  EXPECTED_SUCCEEDED_MAX
+EXPECTED_SUCCEEDED_MAX=$((EXPECTED_IDEMPOTENT_SUCCEEDED + NONIDEM_JOBS))
 RESTART_AT=$((TARGET_JOBS / RESTART_AT_FRACTION))
 
 PASS=0
@@ -129,6 +152,17 @@ live_jobs() {
     p="$(state_total pending)";  q="$(state_total queued)";   r="$(state_total retrying)"
     ru="$(state_total running)"; o="$(state_total orphaned)"
     echo $(( ${p:-0} + ${q:-0} + ${r:-0} + ${ru:-0} + ${o:-0} ))
+}
+
+# ACTIVE = live work that is still moving (pending/queued/retrying/running), i.e.
+# live jobs MINUS parked orphans. The drain is "done" when active hits 0: all
+# idempotent work has reached a terminal state and the only survivors (if any) are
+# non-idempotent jobs deliberately parked in `orphaned` for an operator.
+active_jobs() {
+    local p q r ru
+    p="$(state_total pending)";  q="$(state_total queued)"
+    r="$(state_total retrying)"; ru="$(state_total running)"
+    echo $(( ${p:-0} + ${q:-0} + ${r:-0} + ${ru:-0} ))
 }
 
 dispatch_one() {
@@ -210,6 +244,86 @@ dispatch_mixed() {
         "$total" "$TARGET_JOBS" "$d_s" "$d_l" "$d_a" "$d_e" "$d_t" "$d_c"
 }
 
+# BULK interleaved dispatch: PHP fair-interleaves every cohort, chunks the plan
+# into BULK_SIZE-job bodies, and writes one JSON `{"jobs":[...]}` payload per line;
+# bash then POSTs those bodies concurrently. One bootstrap per body instead of per
+# job — this is what makes the fleet the bottleneck (busy, pinned) instead of the
+# dispatcher. The mix is preserved: each body is a proportional slice of all types.
+dispatch_bulk() {
+    local plan gen
+    plan="$(mktemp)"; gen="$(mktemp)"
+    cat > "$gen" <<'PHPGEN'
+<?php
+// argv: specJson jobClass runId bulkSize successSleepMs outFile
+$spec = json_decode($argv[1], true);
+$jobClass = $argv[2]; $runId = $argv[3];
+$bulk = max(1, (int) $argv[4]); $sleepMs = (int) $argv[5]; $out = $argv[6];
+
+$done = []; $t = 0;
+foreach ($spec as $m => $s) { $done[$m] = 0; $t += (int) $s['n']; }
+$seq = [];
+for ($i = 0; $i < $t; $i++) {                 // fair-interleave the modes
+    $best = null; $bestScore = 2.0;
+    foreach ($spec as $m => $s) {
+        if ((int) $s['n'] <= 0 || $done[$m] >= (int) $s['n']) continue;
+        $r = $done[$m] / (int) $s['n'];
+        if ($r < $bestScore) { $bestScore = $r; $best = $m; }
+    }
+    $seq[] = $best; $done[$best]++;
+}
+$paramsFor = static function (string $mode) use ($sleepMs) {
+    switch ($mode) {
+        case 'success':  return ['sleep_ms' => $sleepMs];
+        case 'logstorm': return ['lines' => 10];
+        case 'artifact': return ['payload_bytes' => 256];
+        case 'stderr':   return ['lines' => 6];
+        default:         return [];
+    }
+};
+$f = fopen($out, 'w');
+$chunk = [];
+$flush = static function () use (&$chunk, $f) {
+    if ($chunk) { fwrite($f, json_encode(['jobs' => $chunk]) . "\n"); $chunk = []; }
+};
+foreach ($seq as $key) {                      // $key is the cohort; $s['mode'] the job mode
+    $s = $spec[$key];
+    $mode = $s['mode'];
+    $chunk[] = [
+        'job_class' => $jobClass,
+        'name' => $runId,
+        'params' => array_merge(['mode' => $mode, 'jobwarden_run_id' => $runId], $paramsFor($mode)),
+        'idempotent' => (bool) $s['idem'],
+        'max_attempts' => (int) $s['att'],
+        'priority' => (int) $s['pri'],
+    ];
+    if (count($chunk) >= $bulk) { $flush(); }
+}
+$flush();
+fclose($f);
+PHPGEN
+    php "$gen" \
+        "{\"success\":{\"n\":$SUCCESS_JOBS,\"att\":$SUCCEED_MAX_ATTEMPTS,\"pri\":50,\"mode\":\"success\",\"idem\":true},\"nonidem\":{\"n\":$NONIDEM_JOBS,\"att\":1,\"pri\":50,\"mode\":\"success\",\"idem\":false},\"logstorm\":{\"n\":$LOGSTORM_JOBS,\"att\":$SUCCEED_MAX_ATTEMPTS,\"pri\":40,\"mode\":\"logstorm\",\"idem\":true},\"artifact\":{\"n\":$ARTIFACT_JOBS,\"att\":$SUCCEED_MAX_ATTEMPTS,\"pri\":40,\"mode\":\"artifact\",\"idem\":true},\"stderr\":{\"n\":$STDERR_JOBS,\"att\":$SUCCEED_MAX_ATTEMPTS,\"pri\":30,\"mode\":\"stderr\",\"idem\":true},\"throw\":{\"n\":$THROW_JOBS,\"att\":$FAIL_MAX_ATTEMPTS,\"pri\":30,\"mode\":\"throw\",\"idem\":true},\"crash\":{\"n\":$CRASH_JOBS,\"att\":$FAIL_MAX_ATTEMPTS,\"pri\":20,\"mode\":\"crash\",\"idem\":true}}" \
+        "$JOB_CLASS_PLAIN" "$RUN_ID" "$BULK_SIZE" "$SUCCESS_SLEEP_MS" "$plan"
+    rm -f "$gen"
+
+    local bodies posted=0 launched=0 pids="" pid body
+    bodies="$(wc -l < "$plan" | tr -d ' ')"
+    while IFS= read -r body; do
+        ( printf '%s' "$body" | curl -fsS --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time 120 \
+            --retry "$CURL_RETRIES" --retry-delay "$CURL_RETRY_DELAY" --retry-all-errors \
+            -X POST "$API/jobs" -H 'Content-Type: application/json' --data-binary @- >/dev/null || exit 1 ) &
+        pids="$pids $!"; launched=$((launched+1)); posted=$((posted+1))
+        if [ "$launched" -ge "$BULK_CONCURRENCY" ]; then
+            for pid in $pids; do wait "$pid" || DISPATCH_FAILURES=$((DISPATCH_FAILURES+1)); done
+            pids=""; launched=0
+            printf "  bulk %5s/%-5s bodies (%s jobs/body)\r" "$posted" "$bodies" "$BULK_SIZE"
+        fi
+    done < "$plan"
+    for pid in $pids; do wait "$pid" || DISPATCH_FAILURES=$((DISPATCH_FAILURES+1)); done
+    rm -f "$plan"
+    printf "  bulk %5s/%-5s bodies posted (%s jobs/body)\n" "$posted" "$bodies" "$BULK_SIZE"
+}
+
 trigger_restart() {
     [ "$RESTART_MODE" = "none" ] && { RESTARTED=1; return 0; }
     local scope=""
@@ -284,8 +398,8 @@ PHP
 hdr "CHECK API + FLEET"
 echo "  api=$API"
 echo "  run_id=$RUN_ID  scale=$SCALE"
-echo "  target=$TARGET_JOBS  succeed=$EXPECTED_SUCCEEDED  fail=$EXPECTED_FAILED"
-echo "  cohorts: success=$SUCCESS_JOBS logstorm=$LOGSTORM_JOBS artifact=$ARTIFACT_JOBS stderr=$STDERR_JOBS throw=$THROW_JOBS crash=$CRASH_JOBS"
+echo "  target=$TARGET_JOBS  idempotent-succeed=$EXPECTED_IDEMPOTENT_SUCCEEDED  fail=$EXPECTED_FAILED  non-idempotent=$NONIDEM_JOBS (${NONIDEMPOTENT_PCT}% of success)"
+echo "  cohorts: success=$SUCCESS_JOBS nonidem=$NONIDEM_JOBS logstorm=$LOGSTORM_JOBS artifact=$ARTIFACT_JOBS stderr=$STDERR_JOBS throw=$THROW_JOBS crash=$CRASH_JOBS"
 echo "  restart_mode=$RESTART_MODE  restart_at=$RESTART_AT terminal jobs  curl_concurrency=$CURL_CONCURRENCY"
 api GET /stats >/dev/null || { bad "API not reachable at $API"; exit 1; }
 ok "operator API is reachable"
@@ -294,11 +408,12 @@ supervisors="$(api GET '/stats' | php -r '$j=json_decode(stream_get_contents(STD
 echo "  active supervisor workers=$supervisors"
 [ "${supervisors:-0}" -ge 8 ] && ok "a real multi-host supervisor fleet is active ($supervisors)" || bad "only $supervisors supervisor worker(s) active"
 
-hdr "DISPATCH $TARGET_JOBS JOBS — INTERLEAVED MIX (all idempotent, one curl each)"
-echo "  types woven together: success(${SUCCESS_SLEEP_MS}ms) + logstorm + artifact + stderr + throw + crash"
+hdr "DISPATCH $TARGET_JOBS JOBS — INTERLEAVED MIX, BULK"
+echo "  types woven together: success(${SUCCESS_SLEEP_MS}ms) + nonidem + logstorm + artifact + stderr + throw + crash"
+echo "  bulk: $BULK_SIZE jobs/body, $BULK_CONCURRENCY bodies in flight"
 existing="$(job_total)"
 if [ "$existing" = "0" ]; then
-    dispatch_mixed
+    dispatch_bulk
 elif [ "$existing" = "$TARGET_JOBS" ]; then
     echo "  found existing run with $existing jobs; resuming drain/inspection"
 else
@@ -311,14 +426,22 @@ jobs="$(job_total)"
 
 hdr "DRAIN + RESTART CHAOS VIA CURL"
 deadline=$((SECONDS+DRAIN_SAFETY_SECONDS))
+settled=0
 while [ $SECONDS -lt $deadline ]; do
     print_progress
     if [ "$RESTARTED" = "0" ] && [ "$(state_total succeeded)" -ge "$RESTART_AT" ]; then
         echo
         trigger_restart
     fi
-    live="$(live_jobs)"
-    [ "${live:-1}" = "0" ] && [ "$RESTARTED" = "1" ] && break
+    # Done when all live work has drained and only parked orphans (if any) remain.
+    # Require two consecutive zero reads so a transient dip while an idempotent
+    # orphan is mid-resolution (orphaned → retrying) doesn't end the drain early.
+    if [ "$(active_jobs)" = "0" ] && [ "$RESTARTED" = "1" ]; then
+        settled=$((settled+1))
+        [ "$settled" -ge 2 ] && break
+    else
+        settled=0
+    fi
     sleep 3
 done
 echo
@@ -335,11 +458,60 @@ orphaned="$(state_total orphaned)"
 echo "  total=$total live=$live succeeded=$succeeded failed=$failed stopped=$stopped canceled=$canceled orphaned=$orphaned"
 echo "  peak-during-drain: live=$PEAK_LIVE orphaned=$PEAK_ORPHANED retrying=$PEAK_RETRYING  restarted=$RESTARTED"
 
-[ "$total" = "$TARGET_JOBS" ]              && ok "no job lost or duplicated: exactly $TARGET_JOBS jobs visible" || bad "total=$total expected $TARGET_JOBS"
-[ "${live:-1}" = "0" ]                     && ok "NO JOB LEFT BEHIND: every job drained to a terminal state"   || bad "$live jobs still live/limbo (orphaned=$orphaned)"
-[ "$succeeded" = "$EXPECTED_SUCCEEDED" ]   && ok "$EXPECTED_SUCCEEDED idempotent jobs succeeded"               || bad "succeeded=$succeeded expected $EXPECTED_SUCCEEDED"
-[ "$failed" = "$EXPECTED_FAILED" ]         && ok "$EXPECTED_FAILED throw/crash jobs deterministically failed"  || bad "failed=$failed expected $EXPECTED_FAILED"
-[ $((succeeded + failed)) = "$TARGET_JOBS" ] && ok "terminal ledger balances (succeeded+failed = target)"      || bad "succeeded+failed=$((succeeded+failed)) != $TARGET_JOBS"
+active="$(active_jobs)"
+
+[ "$total" = "$TARGET_JOBS" ] \
+    && ok "no job lost or duplicated: exactly $TARGET_JOBS jobs visible" \
+    || bad "total=$total expected $TARGET_JOBS"
+
+# Whatever the mix, NOTHING may be stuck mid-flight — no job left running/queued/
+# retrying/pending. All idempotent work must have converged to a terminal state.
+[ "${active:-1}" = "0" ] \
+    && ok "no job stuck in running/queued/retrying limbo — all live work converged" \
+    || bad "$active jobs still active (neither terminal nor parked)"
+
+# The throw/crash cohort is deterministic regardless of the restart.
+[ "$failed" = "$EXPECTED_FAILED" ] \
+    && ok "$EXPECTED_FAILED throw/crash jobs deterministically failed" \
+    || bad "failed=$failed expected $EXPECTED_FAILED"
+
+if [ "${NONIDEM_JOBS:-0}" -gt 0 ]; then
+    # ---- BOTH halves of the idempotency guard ----
+    # (1) idempotent successes always converge; non-idempotent ones the restart
+    #     missed also succeed → `succeeded` lands in a known RANGE.
+    { [ "$succeeded" -ge "$EXPECTED_IDEMPOTENT_SUCCEEDED" ] && [ "$succeeded" -le "$EXPECTED_SUCCEEDED_MAX" ]; } \
+        && ok "succeeded in expected range [$EXPECTED_IDEMPOTENT_SUCCEEDED..$EXPECTED_SUCCEEDED_MAX] (got $succeeded)" \
+        || bad "succeeded=$succeeded outside [$EXPECTED_IDEMPOTENT_SUCCEEDED..$EXPECTED_SUCCEEDED_MAX]"
+    # (2) every survivor is a PARKED orphan (active==0 ⇒ live==orphaned).
+    [ "$live" = "$orphaned" ] \
+        && ok "every survivor is a PARKED orphan, not stuck work (live=$live, all orphaned)" \
+        || bad "live=$live but orphaned=$orphaned — some survivors are not parked orphans"
+    # (3) full accounting, parked orphans included.
+    [ $((succeeded + failed + orphaned)) = "$TARGET_JOBS" ] \
+        && ok "ledger balances with parked orphans: succeeded+failed+orphaned = target" \
+        || bad "succeeded+failed+orphaned=$((succeeded + failed + orphaned)) != $TARGET_JOBS"
+    # (4) parked for the RIGHT reason: sampled orphans are all non-idempotent.
+    if [ "${orphaned:-0}" -gt 0 ]; then
+        parked="$(api GET "/jobs?name=$RUN_ID&state=orphaned&per_page=200" | php -r '$j=json_decode(stream_get_contents(STDIN),true);$t=0;$ni=0;foreach(($j["data"]??[]) as $r){$t++; if(empty($r["idempotent"]))$ni++;} echo "$ni $t";')"
+        p_ni="${parked%% *}"; p_tot="${parked##* }"
+        { [ "${p_tot:-0}" -gt 0 ] && [ "${p_ni:-0}" = "${p_tot:-1}" ]; } \
+            && ok "all sampled parked orphans are NON-idempotent ($p_ni/$p_tot) — never auto-retried" \
+            || bad "some sampled parked orphans are idempotent ($p_ni/$p_tot) — the guard leaked"
+    fi
+    echo "  NON-IDEMPOTENT GUARD: $orphaned of $NONIDEM_JOBS non-idempotent jobs were caught in-flight by the restart and correctly PARKED for an operator (never auto-retried, never lost)."
+else
+    # ---- strict all-idempotent mode: everything reaches a terminal state ----
+    [ "${live:-1}" = "0" ] \
+        && ok "NO JOB LEFT BEHIND: every job drained to a terminal state" \
+        || bad "$live jobs still live/limbo (orphaned=$orphaned)"
+    [ "$succeeded" = "$EXPECTED_IDEMPOTENT_SUCCEEDED" ] \
+        && ok "$EXPECTED_IDEMPOTENT_SUCCEEDED idempotent jobs succeeded" \
+        || bad "succeeded=$succeeded expected $EXPECTED_IDEMPOTENT_SUCCEEDED"
+    [ $((succeeded + failed)) = "$TARGET_JOBS" ] \
+        && ok "terminal ledger balances (succeeded+failed = target)" \
+        || bad "succeeded+failed=$((succeeded + failed)) != $TARGET_JOBS"
+fi
+
 if [ "$RESTART_MODE" != "none" ]; then
     [ "$PEAK_ORPHANED" -gt "0" ] && ok "restart was real: attempts were orphaned then recovered (peak orphaned=$PEAK_ORPHANED)" \
         || echo "  NOTE: peak orphaned=0 — restart may have landed between reaper scans; ledger fidelity still holds"

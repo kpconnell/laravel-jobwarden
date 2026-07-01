@@ -43,7 +43,23 @@ services:
       MARIADB_USER: jobwarden
       MARIADB_PASSWORD: secret
       MARIADB_ROOT_PASSWORD: rootsecret
-    command: ["--transaction-isolation=READ-COMMITTED"]
+    # READ-COMMITTED is required by the claim path. The InnoDB buffer pool is
+    # bumped WELL above the 128M default because it sizes BOTH the page cache and
+    # the lock table: a large queued backlog drained via FOR UPDATE SKIP LOCKED can
+    # otherwise blow the lock table ("1206: total number of locks exceeds the lock
+    # table size") and OOM the container (exit 137). max_connections covers the
+    # fleet (10 hosts x supervisor + co-reaper + per-job children). Both are
+    # env-overridable so you can dial them to the Docker VM's memory.
+    command:
+      - "--transaction-isolation=READ-COMMITTED"
+      - "--innodb-buffer-pool-size=${MARIADB_BUFFER_POOL:-2G}"
+      - "--innodb-log-file-size=${MARIADB_LOG_FILE_SIZE:-512M}"
+      - "--max-connections=${MARIADB_MAX_CONNECTIONS:-500}"
+    # Soft floor only — no HARD mem_limit, so we never re-trigger the container OOM
+    # (exit 137) by capping the db below what its buffer pool + connections need.
+    # The 2G buffer pool is the real memory bound; raise MARIADB_BUFFER_POOL if the
+    # Docker VM has room to spare.
+    mem_reservation: "${MARIADB_MEM_RESERVATION:-2g}"
     volumes:
       - jobwarden-maria-data:/var/lib/mysql     # durable named volume
     ports:

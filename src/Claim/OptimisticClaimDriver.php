@@ -55,7 +55,9 @@ final class OptimisticClaimDriver implements ClaimDriver
                     ->orWhere('available_at', '<=', $conn->raw('CURRENT_TIMESTAMP'));
             })
             ->orderByDesc('priority')
-            ->orderBy('available_at')
+            // Age within priority (see SkipLockedClaimDriver): a requeued orphan/
+            // retry keeps its original created_at and claims ahead of fresher work.
+            ->orderBy('created_at')
             ->limit($want * 4)
             ->pluck('id');
 

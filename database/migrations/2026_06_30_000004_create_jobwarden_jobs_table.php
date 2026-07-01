@@ -47,21 +47,35 @@ return new class extends Migration
             $table->index('batch_id');
             $table->index('schedule_id');
 
-            // Cross-engine composite claim index. The claim scan filters by lane
-            // (a worker only claims its own lane) + state, so lane leads. Postgres
-            // additionally gets a partial index below (the hot path is state='queued').
-            $table->index(['lane', 'state', 'priority', 'available_at'], $this->prefix().'jobs_claim_idx');
+            // The composite claim index is created AFTER the table (raw SQL, below)
+            // so it can use a DESCENDING priority column to match the claim's
+            // `ORDER BY priority DESC, available_at ASC`. Laravel's fluent index()
+            // can't express per-column sort direction.
 
             $table->foreign('batch_id')->references('id')->on($this->table('batches'))->nullOnDelete();
             $table->foreign('schedule_id')->references('id')->on($this->table('schedules'))->nullOnDelete();
         });
 
-        // Postgres partial index: the claim scan only ever looks at queued rows.
+        // Sort-matching composite claim index (all engines). The claim filters by
+        // lane + state, then orders `priority DESC, available_at ASC`. The index MUST
+        // match that sort direction: otherwise MySQL/MariaDB filesort the ENTIRE
+        // queued backlog and the `FOR UPDATE SKIP LOCKED` claim locks every row it
+        // sifts — exhausting the InnoDB lock table at scale ("1206: total number of
+        // locks exceeds the lock table size"). With the descending column the claim
+        // reads in index order and locks only ~claim_batch rows. Descending index
+        // columns are supported on MySQL 8.0+, MariaDB 10.8+, SQLite, and Postgres.
+        $jobs = $this->table('jobs');
+        $claim = $this->prefix().'jobs_claim_idx';
+        $this->schema()->getConnection()->statement(
+            "CREATE INDEX {$claim} ON {$jobs} (lane, state, priority DESC, created_at ASC)"
+        );
+
+        // Postgres additionally gets a partial index — the claim scan only ever
+        // looks at queued rows, so a WHERE-filtered index is smaller and hotter.
         if ($this->driver() === 'pgsql') {
-            $jobs = $this->table('jobs');
-            $idx = $this->prefix().'jobs_queued_partial_idx';
+            $partial = $this->prefix().'jobs_queued_partial_idx';
             $this->schema()->getConnection()->statement(
-                "CREATE INDEX {$idx} ON {$jobs} (lane, priority DESC, available_at) WHERE state = 'queued'"
+                "CREATE INDEX {$partial} ON {$jobs} (lane, priority DESC, created_at) WHERE state = 'queued'"
             );
         }
     }

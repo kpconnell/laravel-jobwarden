@@ -21,20 +21,21 @@
     </div>
 
     <table>
-        <thead><tr><th>Job</th><th>Name</th><th>Class</th><th>Lane</th><th>State</th><th>Att</th><th>Created</th></tr></thead>
+        <thead><tr><th>Job</th><th>Name</th><th>Class</th><th>Lane</th><th>State</th><th>Att</th><th>Created</th><th>Started</th></tr></thead>
         <tbody>
             @forelse ($jobs as $job)
                 <tr>
-                    <td><a href="{{ route('jobwarden.jobs.show', $job->id) }}"><code>{{ \Illuminate\Support\Str::substr($job->id, 0, 8) }}</code></a></td>
+                    <td><a href="{{ route('jobwarden.jobs.show', $job->id) }}"><code>{{ \Illuminate\Support\Str::substr($job->id, -8) }}</code></a></td>
                     <td class="muted">{{ $job->name ?? '—' }}</td>
                     <td>{{ class_basename($job->job_class) }}</td>
                     <td class="muted">{{ $job->lane }}</td>
                     <td><span class="badge state-{{ $job->state->value }}">{{ $job->state->value }}</span></td>
                     <td class="muted">{{ $job->attempt_count }}/{{ $job->max_attempts }}</td>
                     <td class="muted">{{ optional($job->created_at)->diffForHumans() }}</td>
+                    <td class="muted">{{ optional($job->started_at)->diffForHumans() ?? '—' }}</td>
                 </tr>
             @empty
-                <tr><td colspan="7" class="muted">no jobs match</td></tr>
+                <tr><td colspan="8" class="muted">no jobs match</td></tr>
             @endforelse
         </tbody>
     </table>

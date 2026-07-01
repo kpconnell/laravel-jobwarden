@@ -47,6 +47,17 @@ final class ChildRunner
 
     public function run(string $attemptId, int $token, string $nonce): int
     {
+        // --- instrumentation: separate framework-boot cost from starvation wait ---
+        // boot_wall = time from PHP process start (REQUEST_TIME_FLOAT) to here;
+        // boot_cpu  = CPU actually consumed to get here (getrusage). If boot_cpu is
+        // large it's real compile/boot work (opcache's target); if boot_wall >>
+        // boot_cpu the child mostly WAITED for a core (capacity/contention).
+        $t0 = microtime(true);
+        $bootWallMs = isset($_SERVER['REQUEST_TIME_FLOAT'])
+            ? ($t0 - (float) $_SERVER['REQUEST_TIME_FLOAT']) * 1000.0
+            : -1.0;
+        $bootCpuMs = $this->cpuMsTotal();
+
         $attempt = JobAttempt::query()->find($attemptId);
         if ($attempt === null || (int) $attempt->fencing_token !== $token) {
             return ExitCode::STALE_TOKEN;
@@ -103,12 +114,14 @@ final class ChildRunner
                 throw new \RuntimeException("{$job->job_class} must implement ".JobWardenJob::class);
             }
 
+            $handlerStart = microtime(true);
             $handler->handle(new JobContext(
                 (string) $job->id,
                 $attemptId,
                 (int) $attempt->attempt_number,
                 (array) ($job->params ?? []),
             ));
+            $handlerWallMs = (microtime(true) - $handlerStart) * 1000.0;
         } catch (\Throwable $e) {
             Log::error('Job failed: '.$e->getMessage(), ['step' => 'failed', 'exception' => $e::class]);
             $this->logs->end();
@@ -116,10 +129,29 @@ final class ChildRunner
             return $this->fail($attempt, $job, $token, $e, $handler ?? null);
         }
 
+        Log::info('child timing', [
+            'step' => 'timing',
+            'boot_wall_ms' => (int) round($bootWallMs),
+            'boot_cpu_ms' => (int) round($bootCpuMs),
+            'handler_wall_ms' => (int) round($handlerWallMs),
+            'child_wall_ms' => (int) round((microtime(true) - $t0) * 1000.0),
+            'child_cpu_ms' => (int) round($this->cpuMsTotal()),
+        ]);
         Log::info('Job finished successfully', ['step' => 'finished']);
         $this->logs->end();
 
         return $this->succeed($attempt, $job, $token);
+    }
+
+    /** Total CPU (user+system) this process has consumed so far, in ms. */
+    private function cpuMsTotal(): float
+    {
+        $ru = getrusage();
+
+        return (
+            ($ru['ru_utime.tv_sec'] ?? 0) + ($ru['ru_utime.tv_usec'] ?? 0) / 1e6
+            + ($ru['ru_stime.tv_sec'] ?? 0) + ($ru['ru_stime.tv_usec'] ?? 0) / 1e6
+        ) * 1000.0;
     }
 
     private function succeed(JobAttempt $attempt, $job, int $token): int

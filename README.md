@@ -1,5 +1,9 @@
 # Laravel JobWarden
 
+[![Tests](https://github.com/kpconnell/laravel-jobwarden/actions/workflows/tests.yml/badge.svg)](https://github.com/kpconnell/laravel-jobwarden/actions/workflows/tests.yml)
+[![Latest Version](https://img.shields.io/packagist/v/kpconnell/laravel-jobwarden.svg)](https://packagist.org/packages/kpconnell/laravel-jobwarden)
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 A durable, database-backed **job, batch & scheduling engine** for Laravel — a deliberate alternative to the
 Redis/Horizon model in which **the relational database is the source of truth and the coordination layer**.
 Correctness, recovery, and observability come from durable state transitions, per-process fencing tokens, an

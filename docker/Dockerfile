@@ -35,7 +35,38 @@ RUN mkdir -p /tmp/jobwarden-opcache && chmod 1777 /tmp/jobwarden-opcache
 
 ENV COMPOSER_ALLOW_SUPERUSER=1
 
-WORKDIR /app
+# ---- FULL BAKE ------------------------------------------------------------
+# The real Laravel app + this package are baked onto the image's overlayfs (OFF
+# the virtiofs bind mount), composer-installed with an authoritative classmap and
+# `optimize`d. This is what keeps per-job boots ~150ms even at high concurrency:
+# nothing the child touches at boot goes through the single virtiofs FUSE daemon
+# (which serializes file ops and is what tanked throughput on the bind mount).
+#
+# The package is copied to /package and required by the app via a NON-symlinked
+# path repo, so its source (incl. the ChildRunner timing probes) is baked in too.
+# Source edits therefore require a rebuild — the trade-off for a virtiofs-free boot.
+COPY composer.json composer.lock /package/
+COPY src /package/src
+COPY config /package/config
+COPY database /package/database
+COPY routes /package/routes
+COPY resources /package/resources
+COPY runtime /srv/app
+RUN cd /srv/app \
+    && mkdir -p bootstrap/cache storage/framework/cache/data storage/framework/sessions storage/framework/views storage/logs \
+    && composer config repositories.jobwarden '{"type":"path","url":"/package","options":{"symlink":false}}' \
+    # The app's lock was resolved against the old path repo ("../"), which points
+    # nowhere in the image — so `composer install` would silently skip the package.
+    # Drop the lock and re-resolve against /package so it mirrors in and lands in
+    # the authoritative classmap.
+    && rm -f composer.lock \
+    && composer update --no-interaction --no-progress --optimize-autoloader --classmap-authoritative \
+    && php artisan optimize
+
+# CWD is the baked app on the image's overlayfs — never a bind mount. A child's
+# inherited working directory matters: if CWD sat on a virtiofs mount, every
+# getcwd()/realpath in the boot path would round-trip the host FUSE daemon.
+WORKDIR /srv/app
 
 # PID 1 = tini → entrypoint (mints this container's machine-id) → the CMD.
 # Default CMD is a full "host": one container, many roles (see jobwarden-host).

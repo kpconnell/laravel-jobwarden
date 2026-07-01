@@ -168,8 +168,20 @@ final class GlobalReaper
         return $conn->table($this->tbl('workers'))
             ->select('id', 'host_id')
             ->where('role', 'supervisor')  // only job-claiming workers stamp attempts
-            ->whereIn('state', ['active', 'starting', 'draining'])
+            // Stale-beyond-budget = not-alive. Include `dead`, not just the live
+            // states: a prior reap can mark a worker `dead` yet die before finishing
+            // its orphan pass (or be killed mid-loop by a container teardown),
+            // stranding that worker's in-flight attempts forever because a `dead`
+            // row was never re-scanned. Gate on actually owning an in-flight attempt
+            // so we don't re-touch already-cleaned dead rows on every scan.
+            ->whereIn('state', ['active', 'starting', 'draining', 'dead'])
             ->whereRaw('heartbeat_at < '.SqlTime::nowMinus($conn, $this->budgetSeconds()))
+            ->whereExists(function ($q) use ($conn): void {
+                $q->selectRaw('1')
+                    ->from($this->tbl('job_attempts').' as a')
+                    ->whereColumn('a.worker_id', $this->tbl('workers').'.id')
+                    ->whereIn('a.state', [AttemptState::Dispatched->value, AttemptState::Running->value]);
+            })
             ->get()
             ->all();
     }

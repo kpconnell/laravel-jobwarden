@@ -1,0 +1,225 @@
+<?php
+
+declare(strict_types=1);
+
+return [
+
+    /*
+    |--------------------------------------------------------------------------
+    | Dedicated connection
+    |--------------------------------------------------------------------------
+    | JobWarden runs on its own DB connection so the engine can live on a
+    | separate database/replica topology, independent of the app's default
+    | connection. EVERYTHING in the engine resolves its handle from here.
+    */
+    'connection' => env('JOBWARDEN_CONNECTION', 'jobwarden'),
+
+    'table_prefix' => env('JOBWARDEN_TABLE_PREFIX', 'jobwarden_'),
+
+    /*
+    |--------------------------------------------------------------------------
+    | Primary key strategy
+    |--------------------------------------------------------------------------
+    | uuid7 (default, sortable, distributed) or snowflake (deferred).
+    */
+    'id' => [
+        'strategy' => env('JOBWARDEN_ID_STRATEGY', 'uuid7'),
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Claiming
+    |--------------------------------------------------------------------------
+    | auto       => detect engine; SKIP LOCKED where supported, else optimistic.
+    | skip_locked => force SELECT ... FOR UPDATE SKIP LOCKED.
+    | optimistic  => force the guarded-UPDATE fallback.
+    */
+    'claim' => [
+        'driver' => env('JOBWARDEN_CLAIM_DRIVER', 'auto'),
+        'batch_size' => (int) env('JOBWARDEN_CLAIM_BATCH_SIZE', 1),
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Host lease (the ONE coarse heartbeat; the only timeout in the system)
+    |--------------------------------------------------------------------------
+    | heartbeat_interval * missed_beats = host-down detection budget (~40s).
+    | Refreshed by the local reaper against the DB clock, never per job.
+    */
+    'host_lease' => [
+        'heartbeat_interval' => (int) env('JOBWARDEN_HEARTBEAT_INTERVAL', 10),
+        'missed_beats' => (int) env('JOBWARDEN_MISSED_BEATS', 3),
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Reapers
+    |--------------------------------------------------------------------------
+    */
+    'reaper' => [
+        // Tier 2 stamp-verification cadence (seconds).
+        'local_scan_interval' => (int) env('JOBWARDEN_LOCAL_SCAN_INTERVAL', 5),
+        // Exactly ONE local reaper scans per host; any others (e.g. a host running
+        // both jobwarden:work and jobwarden:scheduled-worker, each bundling one)
+        // idle as hot spares. This is the per-host lease TTL (seconds) electing it.
+        'local_lease_ttl' => (int) env('JOBWARDEN_LOCAL_LEASE_TTL', 15),
+        // When a local reaper kills its own children on lost connectivity (seconds).
+        'self_fence_ttl' => (int) env('JOBWARDEN_SELF_FENCE_TTL', 25),
+        // Tier 3 leader-lease TTL (seconds).
+        'global_lease_ttl' => (int) env('JOBWARDEN_GLOBAL_LEASE_TTL', 15),
+        'global_scan_interval' => (int) env('JOBWARDEN_GLOBAL_SCAN_INTERVAL', 5),
+        // Reconciliation backstop (leader-only): heal a job stuck in `running`
+        // whose current attempt already settled — the residue of a process dying
+        // between the attempt and job transitions. Only jobs whose attempt has
+        // been settled this many seconds are touched, so a healthy worker
+        // mid-completion is never raced. Fencing already prevents any double-run.
+        'reconcile_grace_sec' => (int) env('JOBWARDEN_RECONCILE_GRACE', 30),
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Supervisor / execution
+    |--------------------------------------------------------------------------
+    */
+    'supervisor' => [
+        'capacity' => (int) env('JOBWARDEN_CAPACITY', 5),
+        // jobwarden:work bundles a co-resident local reaper (as a separate child
+        // process) by default, so a worker can never run without Tier-2 recovery.
+        // Set false only for advanced split topologies where you run
+        // jobwarden:reap:local as its own supervised process.
+        'bundle_reaper' => filter_var(env('JOBWARDEN_BUNDLE_REAPER', true), FILTER_VALIDATE_BOOLEAN),
+        // child (default, real PID/exit/signal, isolation) | in_process (deferred).
+        'execution_mode' => env('JOBWARDEN_EXECUTION_MODE', 'child'),
+        'graceful_timeout' => (int) env('JOBWARDEN_GRACEFUL_TIMEOUT', 10),
+        'poll_interval_ms' => (int) env('JOBWARDEN_POLL_INTERVAL_MS', 500),
+
+        // On SIGTERM the supervisor stops claiming and waits for in-flight
+        // children to finish, up to this many seconds. 0 = wait indefinitely
+        // (the recommended default when the orchestrator protects busy tasks,
+        // e.g. ECS task scale-in protection, so long idempotent jobs complete).
+        // A child that outlasts the timeout keeps running and self-reports; if
+        // the container is then torn down, a reaper recovers it (idempotent → re-run).
+        'drain_timeout' => (int) env('JOBWARDEN_DRAIN_TIMEOUT', 0),
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Retry / backoff / idempotency
+    |--------------------------------------------------------------------------
+    */
+    'retry' => [
+        'max_attempts' => (int) env('JOBWARDEN_MAX_ATTEMPTS', 1),
+        'backoff' => [
+            'strategy' => env('JOBWARDEN_BACKOFF_STRATEGY', 'exponential'),
+            'base' => (int) env('JOBWARDEN_BACKOFF_BASE', 5),
+            'cap' => (int) env('JOBWARDEN_BACKOFF_CAP', 300),
+        ],
+        // park (recommended) | auto_fail — what to do with a non-idempotent orphan.
+        'non_idempotent_orphan_policy' => env('JOBWARDEN_NONIDEMPOTENT_ORPHAN', 'park'),
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Stuck detection (alive + verified, but not advancing) — never auto-reaped
+    |--------------------------------------------------------------------------
+    */
+    'stuck' => [
+        'max_runtime_sec' => env('JOBWARDEN_MAX_RUNTIME_SEC') !== false
+            ? (int) env('JOBWARDEN_MAX_RUNTIME_SEC')
+            : null,
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Scheduler
+    |--------------------------------------------------------------------------
+    */
+    'scheduler' => [
+        'tick_interval' => (int) env('JOBWARDEN_TICK_INTERVAL', 5),
+        'missed_policy' => env('JOBWARDEN_MISSED_POLICY', 'run_latest'),
+        'overlap_policy' => env('JOBWARDEN_OVERLAP_POLICY', 'skip'),
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Logs (LogIndex + pluggable LogBodySink)
+    |--------------------------------------------------------------------------
+    */
+    'logs' => [
+        'sink' => env('JOBWARDEN_LOG_SINK', 'database'),
+        'retention_days' => (int) env('JOBWARDEN_LOG_RETENTION_DAYS', 30),
+        'buffer_size' => (int) env('JOBWARDEN_LOG_BUFFER_SIZE', 50),
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Retention / pruning (jobwarden:prune)
+    |--------------------------------------------------------------------------
+    | Terminal jobs older than `jobs_days` are deleted (cascading to their
+    | attempts/events/logs/artifacts); dead/stopped worker rows older than
+    | `workers_days` are removed.
+    */
+    'retention' => [
+        'jobs_days' => (int) env('JOBWARDEN_RETENTION_JOBS_DAYS', 30),
+        'workers_days' => (int) env('JOBWARDEN_RETENTION_WORKERS_DAYS', 7),
+        'schedule_runs_days' => (int) env('JOBWARDEN_RETENTION_SCHEDULE_RUNS_DAYS', 90),
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Process layer (liveness verification)
+    |--------------------------------------------------------------------------
+    | probe: auto (detect OS) | linux | fake (tests). The production target is
+    | Linux (/proc start-times, machine-id + boot_id).
+    */
+    'process' => [
+        'probe' => env('JOBWARDEN_PROBE', 'auto'),
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Runtime path (pidfiles, etc.)
+    |--------------------------------------------------------------------------
+    */
+    'runtime_path' => env('JOBWARDEN_RUNTIME_PATH', storage_path('jobwarden')),
+
+    /*
+    |--------------------------------------------------------------------------
+    | Optional Redis signaling (never required for correctness)
+    |--------------------------------------------------------------------------
+    */
+    'redis' => [
+        'enabled' => (bool) env('JOBWARDEN_REDIS_ENABLED', false),
+        'connection' => env('JOBWARDEN_REDIS_CONNECTION', 'default'),
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Operator API (read + actions; foundation for the dashboard)
+    |--------------------------------------------------------------------------
+    | A gated JSON API over the read models and operator actions. Authorize
+    | access with JobWarden::auth(fn ($request) => ...) — it defaults to local
+    | environment only, exactly like Horizon's gate.
+    */
+    'api' => [
+        'enabled' => (bool) env('JOBWARDEN_API_ENABLED', true),
+        'prefix' => env('JOBWARDEN_API_PREFIX', 'jobwarden/api'),
+        'middleware' => ['api'],
+        'pagination' => (int) env('JOBWARDEN_API_PER_PAGE', 50),
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Dashboard (Livewire operator console)
+    |--------------------------------------------------------------------------
+    | Server-rendered, DB-polled. Same JobWarden::auth() gate as the API. Needs
+    | the `web` middleware group (sessions/CSRF) for Livewire.
+    */
+    'dashboard' => [
+        'enabled' => (bool) env('JOBWARDEN_DASHBOARD_ENABLED', true),
+        'prefix' => env('JOBWARDEN_DASHBOARD_PREFIX', 'jobwarden'),
+        'middleware' => ['web'],
+        'poll' => env('JOBWARDEN_DASHBOARD_POLL', '5s'),
+    ],
+
+];

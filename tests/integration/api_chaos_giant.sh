@@ -29,10 +29,10 @@
 set -uo pipefail
 
 API="${JOBWARDEN_API_URL:-http://localhost:8899/jobwarden/api}"
-JOB_CLASS="${JOBWARDEN_API_CHAOS_JOB_CLASS:-Workbench\\\\App\\\\Jobs\\\\ChaosMonkeyJob}"
+JOB_CLASS="${JOBWARDEN_API_CHAOS_JOB_CLASS:-App\\\\Jobs\\\\ChaosMonkeyJob}"
 # Plain (single-backslash) class name for the PHP bulk-body generator — json_encode
 # escapes the backslashes itself, so we must NOT pre-escape them here.
-JOB_CLASS_PLAIN="${JOBWARDEN_API_CHAOS_JOB_CLASS_PLAIN:-Workbench\App\Jobs\ChaosMonkeyJob}"
+JOB_CLASS_PLAIN="${JOBWARDEN_API_CHAOS_JOB_CLASS_PLAIN:-App\Jobs\ChaosMonkeyJob}"
 RUN_ID="${JOBWARDEN_API_CHAOS_RUN_ID:-giant-$(date +%s)-$$}"
 
 # ---- curl behaviour -------------------------------------------------------

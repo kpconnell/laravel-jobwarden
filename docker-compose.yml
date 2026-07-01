@@ -21,9 +21,13 @@ x-host: &host
     context: .
     dockerfile: docker/Dockerfile
   image: jobwarden-host
-  volumes:
-    - .:/app
-    - jobwarden-vendor:/app/vendor
+  # NO source bind mount. The app + package are fully baked to /srv/app (see the
+  # Dockerfile FULL BAKE). A `.:/app` mount would only spin up a host-side
+  # `virtiofsd` serving files no process opens — and on Docker Desktop that daemon
+  # pegs the Mac's CPU while the guest VM sits starved (the classic "guest idle,
+  # host at 100%" that inflated per-job boots to seconds of pure off-CPU wait).
+  # Source edits already require a rebuild (opcache validate_timestamps=0), so the
+  # mount bought nothing. Rebuild to pick up code changes.
   environment: &env
     JOBWARDEN_TEST_DB: mysql
     JOBWARDEN_DB_DRIVER: mysql
@@ -32,6 +36,22 @@ x-host: &host
     JOBWARDEN_DB_NAME: jobwarden
     JOBWARDEN_DB_USER: jobwarden
     JOBWARDEN_DB_PASSWORD: secret
+    # Roles run the BAKED real Laravel app's artisan (on the image's overlayfs, off
+    # the virtiofs bind mount). The launcher reads this; child job runners inherit
+    # it via base_path('artisan').
+    JOBWARDEN_ARTISAN: "php /srv/app/artisan"
+    # Deliberately small: on Docker Desktop the host-side helper (VM + disk),
+    # not the guest, is the scarce resource, so we run FEW concurrent boots and
+    # let each get real cycles. 2 hosts x 5 = 10 concurrent children total.
+    JOBWARDEN_CAPACITY: "5"
+    # EXPERIMENT: the supervisor sleeps this long between loop iterations, so with
+    # the default 500ms a freed slot stays empty until the next tick -> the fleet
+    # runs in waves of `capacity` (period ~= poll interval) and averages
+    # ~capacity/poll = 20/s. Dropping it to 50ms refills slots ~10x sooner to test
+    # whether the waves flatten. If confirmed, replace with adaptive cadence in the
+    # Supervisor (fast under load, back off when idle) so idle fleets don't hammer
+    # the DB at 20 polls/sec.
+    JOBWARDEN_POLL_INTERVAL_MS: "50"
   restart: unless-stopped
 
 services:
@@ -55,6 +75,13 @@ services:
       - "--innodb-buffer-pool-size=${MARIADB_BUFFER_POOL:-2G}"
       - "--innodb-log-file-size=${MARIADB_LOG_FILE_SIZE:-512M}"
       - "--max-connections=${MARIADB_MAX_CONNECTIONS:-500}"
+      # Each job commits several small transactions (attempt/job transitions +
+      # events + logs). With the default flush=1 that's an fsync PER COMMIT, and on
+      # Docker Desktop's virtualized disk each fsync stalls ~ms → dominates per-job
+      # latency (the ~1.7s DB overhead). =2 writes to the OS cache on commit and
+      # fsyncs ~once/sec: no per-commit disk wait. Durability: an OS/host crash can
+      # lose ~1s; a graceful mysqld restart loses nothing. Set =1 for strict ACID.
+      - "--innodb-flush-log-at-trx-commit=${MARIADB_FLUSH_LOG:-2}"
     # Soft floor only — no HARD mem_limit, so we never re-trigger the container OOM
     # (exit 137) by capping the db below what its buffer pool + connections need.
     # The 2G buffer pool is the real memory bound; raise MARIADB_BUFFER_POOL if the
@@ -93,7 +120,7 @@ services:
   migrate:
     <<: *host
     restart: "no"
-    command: ["sh", "-lc", "php vendor/bin/testbench migrate:install --database=jobwarden; php vendor/bin/testbench migrate --database=jobwarden --force"]
+    command: ["sh", "-lc", "cd /srv/app && php artisan migrate --force"]
     depends_on:
       db:
         condition: service_healthy
@@ -129,6 +156,5 @@ services:
         condition: service_completed_successfully
 
 volumes:
-  jobwarden-vendor:
   jobwarden-maria-data:
   jobwarden-pg-data:

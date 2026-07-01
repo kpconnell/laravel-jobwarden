@@ -5,3 +5,8 @@ node_modules/
 .phpunit.result.cache
 storage/
 *.log
+# The runtime app's vendor holds a dangling path-repo symlink and 82MB of deps we
+# reinstall fresh in the image (composer install + authoritative classmap). Exclude
+# it so the bake doesn't copy the broken symlink or the stale tree.
+runtime/vendor/
+runtime/bootstrap/cache/

@@ -31,7 +31,7 @@ Two consequences that shape every topology below:
 
 | Role | Command | What it does | Placement |
 |---|---|---|---|
-| `supervisor` | `jobwarden:work` | Claims + runs jobs on the **default** lane (one child process per job). | Any number of hosts. |
+| `supervisor` | `jobwarden:work` | Claims + runs jobs on the **default** lane (a separate process per job — see [Execution model](#execution-model-child-vs-prefork)). | Any number of hosts. |
 | `scheduled-worker` | `jobwarden:scheduled-worker` | Same, for the isolated **scheduled** lane. | Any number of hosts. |
 | `local-reaper` | `jobwarden:reap:local` | Tier-2 recovery: `/proc`-verifies this host's children, fast. | **Bundled into each worker** (one active per host, leased). Run standalone only for advanced splits. |
 | `scheduler` | `jobwarden:schedule` | Materializes due schedule runs. | Run 1+; concurrent-safe. |
@@ -189,8 +189,13 @@ Two equally valid ways to place the singletons:
   - **Heartbeat writes.** Each worker writes one lease heartbeat every
     `host_lease.heartbeat_interval` (default 10s) — cheap, but it's `N/interval`
     writes/sec at scale.
-  - **Claim contention.** `SKIP LOCKED` is designed for this and scales well; if you
-    see idle spin, tune `poll_interval_ms` and `--capacity` rather than adding boxes.
+  - **Claim contention.** `SKIP LOCKED` is designed for this and scales well. If you see
+    idle spin (slots not staying full), the cause is usually per-job **boot cost** or the
+    **poll cadence**, not the claim — reach for `prefork` and a lower `poll_interval_ms`
+    before adding boxes (see [Execution model](#execution-model-child-vs-prefork)).
+  - **Write rate.** Each job makes a handful of small writes (claim, transitions, audit
+    event, logs). Under `prefork` — where the framework boot no longer hides it — this
+    commit rate, not the workers, becomes the throughput ceiling; size the DB for it.
 
 ## Substrates (deploying the JobWarden image)
 
@@ -207,7 +212,10 @@ so the same artifact runs everywhere. Only the wrapper differs. JobWarden's runt
   `/etc/machine-id` exists (it does on any normal install).
 - **Docker.** The image + `JOBWARDEN_ROLES` + `restart: unless-stopped`. See
   [`docker-compose.yml`](../docker-compose.yml) for a full local stack; scale worker
-  hosts with `docker compose up -d --scale host=N`.
+  hosts with `docker compose up -d --scale host=N`. The image clears its baked config
+  cache at container start so runtime `JOBWARDEN_*` overrides actually apply — **if you
+  bake your own image and run `php artisan config:cache`, a baked cache freezes `env()`
+  at build time**, so either set these vars at build or clear the cache on boot.
 - **ECS / ACI.** One task/container group per host role-set, image + `JOBWARDEN_ROLES`,
   desired-count to scale. The baked-in init means you don't rely on any
   runtime-specific "init process" flag.
@@ -217,6 +225,44 @@ so the same artifact runs everywhere. Only the wrapper differs. JobWarden's runt
   Deployment. (Only if you take the advanced split — reaper in its *own* container —
   do the two need a shared PID namespace, `shareProcessNamespace: true`.)
 
+## Execution model: `child` vs `prefork`
+
+Every claimed job runs in its **own process** — a distinct PID the supervisor
+`waitpid`s (Tier-1), can `SIGKILL` to cancel, and whose crash, leak, or OOM is fully
+contained. *How that process is created* is set by `JOBWARDEN_EXECUTION_MODE`:
+
+- **`child` (default)** — the supervisor `proc_open`s a fresh `php artisan
+  jobwarden:run` per job. Maximum isolation, but every job pays a full framework
+  **cold boot** (tens to ~150ms of CPU + I/O, depending on your app and opcache) before
+  it runs a line of handler code.
+- **`prefork`** — the supervisor boots the framework **once** and `pcntl_fork()`s per
+  job. The child inherits the booted framework copy-on-write, runs one job in-process,
+  and exits. It keeps the *same* per-job isolation — a separate, `waitpid`-able,
+  `SIGKILL`-able PID with its own address space and a clean copy-on-write slate (no
+  cross-job state carryover) — but **eliminates the per-job boot**. It needs the `pcntl`
+  extension (already part of JobWarden's Linux runtime) and falls back to `child` where
+  `pcntl` is unavailable.
+
+**When to reach for `prefork`:** high job rates with short handlers, where the framework
+boot dominates per-job cost. In load testing it lifted sustained throughput several-fold
+(the boot went from the dominant cost to ~zero). For long-running jobs (seconds and up)
+the boot is noise — `child` is simpler and perfectly fine.
+
+**What it costs:** immediately after the fork the child reconnects its own DB handle —
+the one resource a fork must not share with its parent (a graceful close on the inherited
+socket would drop the *parent's* connection). That reconnect is ~1ms against the ~100ms+
+boot it avoids. The supervisor itself stays pristine and periodically recycles
+(`JOBWARDEN_PREFORK_RECYCLE_AFTER`, default 50000 forks) so no slow parent-side leak can
+seep into the copy-on-write baseline: the worker drains its in-flight forks, exits, and
+its supervisor (the image launcher, or systemd/k8s for a bare command) brings it right
+back.
+
+**The next ceiling is the database.** Once the boot is gone, per-job cost is dominated by
+the handful of small writes each job makes (claim, state transitions, the audit event,
+logs). Throughput then tracks your DB's commit rate, not the workers — size the DB (and,
+on MariaDB, consider `innodb_flush_log_at_trx_commit=2` to trade ≤1s of crash durability
+for much cheaper commits) before adding more worker boxes.
+
 ## Tuning knobs
 
 All are env vars (defaults shown); recovery is governed by the host-lease budget.
@@ -224,10 +270,12 @@ All are env vars (defaults shown); recovery is governed by the host-lease budget
 | Env | Default | Effect |
 |---|---|---|
 | `JOBWARDEN_CAPACITY` | 6 | Concurrent jobs per supervisor (default lane). |
+| `JOBWARDEN_EXECUTION_MODE` | `child` | `child` = fresh `php` per job (full isolation, per-job boot); `prefork` = fork the booted supervisor per job (same isolation, no boot; needs `pcntl`). See [Execution model](#execution-model-child-vs-prefork). |
+| `JOBWARDEN_PREFORK_RECYCLE_AFTER` | 50000 | `prefork` only: forks before the master drains + restarts for a fresh baseline (0 disables). |
 | `JOBWARDEN_SCHED_CAPACITY` | 4 | Concurrency for the scheduled lane. |
 | `JOBWARDEN_HEARTBEAT_INTERVAL` | 10 | Seconds between worker lease heartbeats. |
 | `JOBWARDEN_MISSED_BEATS` | 3 | Missed beats before a worker is declared dead. |
-| `JOBWARDEN_POLL_INTERVAL_MS` | 500 | How often a supervisor polls for claimable work. |
+| `JOBWARDEN_POLL_INTERVAL_MS` | 500 | How often a supervisor polls for work **and refills freed slots**. Jobs that finish faster than this leave slots idle between cycles — lower it for high-rate short jobs (pairs with `prefork`). |
 | `JOBWARDEN_GLOBAL_LEASE_TTL` | 15 | Global-reaper leader lease TTL (failover time). |
 | `JOBWARDEN_LOCAL_SCAN_INTERVAL` | 5 | Tier-2 local reaper scan cadence. |
 | `JOBWARDEN_LOCAL_LEASE_TTL` | 15 | Per-host lease TTL electing the single active local reaper. |

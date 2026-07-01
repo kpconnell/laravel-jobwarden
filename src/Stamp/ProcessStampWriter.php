@@ -22,7 +22,9 @@ final class ProcessStampWriter
             ->where('fencing_token', $fencingToken)
             ->update([
                 'child_pid' => $childPid,
-                'child_start_time' => $childStartTime,
+                // Nullable integer column: write null (not '') when the /proc start-time
+                // couldn't be read, so an unreadable liveness clock never fails the stamp.
+                'child_start_time' => $childStartTime === '' ? null : $childStartTime,
                 'proc_nonce' => $nonce,
                 'updated_at' => $this->connection()->raw('CURRENT_TIMESTAMP'),
             ]);

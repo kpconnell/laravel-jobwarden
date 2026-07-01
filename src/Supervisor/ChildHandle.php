@@ -22,13 +22,16 @@ final class ChildHandle
     public ?float $stopRequestedAt = null;
 
     public function __construct(
-        public readonly mixed $process,      // proc_open resource
+        public readonly mixed $process,      // proc_open resource (null for a pcntl fork)
         public readonly int $pid,
         public readonly string $attemptId,
         public readonly string $jobId,
         public readonly int $fencingToken,
         public readonly float $startedAt,
         public readonly mixed $logHandle = null,
+        // prefork children have no proc_open resource: they are reaped by pcntl_waitpid
+        // on $pid, and they redirect their own stdout/stderr (no logHandle here).
+        public readonly bool $isFork = false,
     ) {
     }
 

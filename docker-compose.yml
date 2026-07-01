@@ -44,6 +44,10 @@ x-host: &host
     # not the guest, is the scarce resource, so we run FEW concurrent boots and
     # let each get real cycles. 2 hosts x 5 = 10 concurrent children total.
     JOBWARDEN_CAPACITY: "5"
+    # PREFORK: run each job by pcntl_fork()ing the already-booted supervisor instead of
+    # proc_open'ing a fresh `php artisan jobwarden:run` (which cold-boots the framework
+    # ~144ms per job). Same per-job PID isolation, minus the boot. See config/jobwarden.php.
+    JOBWARDEN_EXECUTION_MODE: "prefork"
     # EXPERIMENT: the supervisor sleeps this long between loop iterations, so with
     # the default 500ms a freed slot stays empty until the next tick -> the fleet
     # runs in waves of `capacity` (period ~= poll interval) and averages

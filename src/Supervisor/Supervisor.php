@@ -49,6 +49,10 @@ final class Supervisor
 
     private ?float $drainStartedAt = null;
 
+    private ?ForkExecutor $forkExecutor = null;
+
+    private int $forkCount = 0;
+
     public function __construct(
         private readonly ClaimDriverFactory $claimFactory,
         private readonly Admitter $admitter,
@@ -112,6 +116,14 @@ final class Supervisor
 
             if ($onTick !== null) {
                 $onTick();
+            }
+
+            if ($this->shouldRecycle()) {
+                Log::info('prefork: recycling master — draining in-flight forks then restarting for a fresh baseline', [
+                    'role' => 'supervisor',
+                    'forks' => $this->forkCount,
+                ]);
+                $this->signals->requestDrain();
             }
 
             if ($this->signals->isDraining()) {
@@ -210,6 +222,12 @@ final class Supervisor
 
     private function spawn(string $attemptId, string $jobId, int $token): void
     {
+        if ($this->isPrefork()) {
+            $this->spawnForked($attemptId, $jobId, $token);
+
+            return;
+        }
+
         $nonce = bin2hex(random_bytes(8));
         $command = array_merge($this->runCommandPrefix(), [
             $attemptId,
@@ -269,9 +287,110 @@ final class Supervisor
         Log::info('spawned job child', ['job' => $jobId, 'attempt' => $attemptId, 'pid' => $pid, 'token' => $token]);
     }
 
+    private function isPrefork(): bool
+    {
+        return (string) config('jobwarden.supervisor.execution_mode') === 'prefork'
+            && function_exists('pcntl_fork');
+    }
+
+    private function forkExecutor(): ForkExecutor
+    {
+        return $this->forkExecutor ??= new ForkExecutor($this->stampWriter, $this->probe);
+    }
+
+    /**
+     * PREFORK spawn: fork the already-booted supervisor instead of proc_open'ing a fresh
+     * PHP. The child runs the job in-process (ForkExecutor) and pcntl_exec's out; only the
+     * parent returns here. The claim transaction has already committed, so we never fork
+     * with an open transaction on the shared DB connection.
+     */
+    private function spawnForked(string $attemptId, string $jobId, int $token): void
+    {
+        $nonce = bin2hex(random_bytes(8));
+        $logFile = $this->runtimePath().'/logs/attempt-'.$attemptId.'.log';
+
+        $pid = $this->forkExecutor()->fork($attemptId, $token, $nonce, $logFile);
+        if ($pid === -1) {
+            $this->failToSpawn($attemptId, $jobId, $token, 'pcntl_fork failed to launch the job child');
+
+            return;
+        }
+
+        $this->children->add(new ChildHandle(
+            process: null,
+            pid: $pid,
+            attemptId: $attemptId,
+            jobId: $jobId,
+            fencingToken: $token,
+            startedAt: microtime(true),
+            logHandle: null,
+            isFork: true,
+        ));
+
+        $this->forkCount++;
+        Log::info('forked job child', ['job' => $jobId, 'attempt' => $attemptId, 'pid' => $pid, 'token' => $token]);
+    }
+
+    /**
+     * PREFORK: has the master forked enough times to warrant a fresh baseline? When it
+     * has, we request a drain — the loop finishes in-flight forks, run() returns, and the
+     * launcher restarts the role — rather than pcntl_exec'ing ourselves, so recovery,
+     * signal handling, and the co-reaper lifecycle all go through the normal path.
+     */
+    private function shouldRecycle(): bool
+    {
+        $after = (int) config('jobwarden.supervisor.prefork_recycle_after', 0);
+
+        return $after > 0
+            && $this->isPrefork()
+            && $this->forkCount >= $after
+            && ! $this->signals->isDraining();
+    }
+
+    /**
+     * Tier-1 reap for a prefork child: pcntl_waitpid on its pid (there is no proc_open
+     * resource). The child redirected its own stdout/stderr, so there's no logHandle here.
+     */
+    private function reapForked(ChildHandle $handle): void
+    {
+        $res = pcntl_waitpid($handle->pid, $status, WNOHANG);
+        if ($res === 0) {
+            $this->escalateStopIfRequested($handle);
+
+            return; // still running
+        }
+
+        if ($res > 0) {
+            $handle->exitCode = pcntl_wifexited($status) ? pcntl_wexitstatus($status) : null;
+            $handle->termSignal = pcntl_wifsignaled($status) ? pcntl_wtermsig($status) : null;
+        }
+        // $res === -1: no such child (already reaped / never ours) — treat as gone.
+
+        $this->finalize($handle);
+        $this->ingestProcessOutput($handle);
+        $this->pidfile->delete($handle->attemptId);
+        $this->children->forget($handle->attemptId);
+
+        $crashed = $handle->termSignal !== null || ($handle->exitCode !== null && $handle->exitCode !== 0);
+        Log::log($crashed ? 'warning' : 'info', 'reaped forked child', [
+            'job' => $handle->jobId,
+            'attempt' => $handle->attemptId,
+            'pid' => $handle->pid,
+            'exit_code' => $handle->exitCode,
+            'term_signal' => $handle->termSignal,
+            'duration_ms' => $handle->durationMs(),
+        ]);
+    }
+
     private function reap(): void
     {
         foreach ($this->children->all() as $handle) {
+            if ($handle->isFork) {
+                $this->reapForked($handle);
+
+                continue;
+            }
+
             $status = proc_get_status($handle->process);
 
             if ($status['running']) {

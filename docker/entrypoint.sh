@@ -20,4 +20,15 @@ if [ ! -s /etc/machine-id ]; then
     fi
 fi
 
+# The image bakes a config cache (php artisan optimize) using BUILD-time env, which
+# freezes every runtime override — JOBWARDEN_EXECUTION_MODE, JOBWARDEN_POLL_INTERVAL_MS,
+# JOBWARDEN_CAPACITY, etc. all silently fall back to their baked defaults. We CLEAR it (not
+# re-cache: `config:cache` re-evaluates env() against .env and would just re-freeze the
+# defaults, since these overrides come from the process env, not .env). Cleared, the app
+# reads config live from files + env on boot — which resolves the process env correctly.
+# In prefork the long-lived master parses config once, so there is no per-job cost.
+if [ -f /srv/app/artisan ]; then
+    php /srv/app/artisan config:clear >/dev/null 2>&1 || true
+fi
+
 exec "$@"

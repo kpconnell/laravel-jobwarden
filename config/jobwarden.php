@@ -88,10 +88,23 @@ return [
         // Set false only for advanced split topologies where you run
         // jobwarden:reap:local as its own supervised process.
         'bundle_reaper' => filter_var(env('JOBWARDEN_BUNDLE_REAPER', true), FILTER_VALIDATE_BOOLEAN),
-        // child (default, real PID/exit/signal, isolation) | in_process (deferred).
+        // How each claimed job runs:
+        //   child   (default) — proc_open a fresh `php artisan jobwarden:run` per job:
+        //             maximal isolation, but a ~144ms framework boot on every job.
+        //   prefork — pcntl_fork() from the already-booted supervisor per job: the SAME
+        //             per-job PID isolation (crash/leak contained, waitpid-reaped, clean
+        //             COW slate) minus the boot. Requires the pcntl extension; falls back
+        //             to 'child' where it is unavailable.
+        //   in_process (deferred).
         'execution_mode' => env('JOBWARDEN_EXECUTION_MODE', 'child'),
         'graceful_timeout' => (int) env('JOBWARDEN_GRACEFUL_TIMEOUT', 10),
         'poll_interval_ms' => (int) env('JOBWARDEN_POLL_INTERVAL_MS', 500),
+        // PREFORK only: recycle the long-lived master after this many forks — it drains
+        // its in-flight forks, exits, and the launcher restarts it with a fresh, pristine
+        // COW baseline. This bounds any slow master-side memory growth that would
+        // otherwise be inherited by every fork. 0 disables. Fires rarely at real
+        // throughput (~every few minutes), well under the launcher's crash-loop threshold.
+        'prefork_recycle_after' => (int) env('JOBWARDEN_PREFORK_RECYCLE_AFTER', 50000),
 
         // On SIGTERM the supervisor stops claiming and waits for in-flight
         // children to finish, up to this many seconds. 0 = wait indefinitely

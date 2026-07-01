@@ -1,6 +1,6 @@
 {
     "name": "kpconnell/laravel-jobwarden",
-    "description": "Durable, database-backed job, batch & scheduling engine for Laravel — the relational database is the source of truth and the coordination layer.",
+    "description": "A database-backed alternative to Horizon & Laravel Queues — durable jobs, sophisticated batches, high observability & scheduling that survive worker and host crashes, with no Redis to operate.",
     "keywords": ["laravel", "jobs", "queue", "batch", "scheduler", "durable", "state-machine", "workers", "orphan-recovery"],
     "type": "library",
     "license": "MIT",

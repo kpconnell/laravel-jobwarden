@@ -143,6 +143,43 @@ the normal recovery decision: `idempotent → retry within budget, else park`.
 - `$context->artifact(type, name, opts)` — attach a support-case artifact
   (request/response pair, file on a disk, dump) to this attempt; bundled by
   `jobwarden:logs --export`.
+- `$context->result([...])` — store the job's completion payload (see Results).
+
+## Results
+
+A handler that produces a completion payload stores it with:
+
+```php
+public function handle(JobContext $context): void
+{
+    // ... do the work ...
+    $context->result(['imported' => $count, 'report_artifact_id' => $artifactId]);
+}
+```
+
+The payload lands in `jobs.result` (JSON) and is returned by `GET /jobs/{id}` —
+the caller dispatches, holds the job id, polls for a terminal `state`, and reads
+`result` when it's `succeeded`. Semantics:
+
+- **Committed atomically with the succeeded transition.** A poller can never see
+  `state = succeeded` without the result; a fenced-out child (reaped while
+  finishing) never lands one. Nothing persists unless the run succeeds — the
+  result is the success-mirror of `last_error`.
+- **Last call wins.** Calling `result()` repeatedly just replaces the buffer.
+- **Bounded.** Payloads over `jobwarden.results.max_bytes` (default 64 KB) — or
+  payloads that aren't JSON-encodable — throw at the call site and fail the run
+  loudly.
+
+Generally speaking, **results are not freight**. The result is a completion
+summary the poller can act on — counts, ids, statuses, pointers. If the job
+produces actual output data (an export, a generated file, a big report), ship
+it where bulk data belongs — an S3/filesystem-disk upload, recorded with
+`$context->artifact(...)` — and put the location or artifact id in the result.
+The size cap exists to enforce exactly this: the hot `jobs` table is not a
+blob store.
+
+For **progress** during a run, use logging (below), not `result()` — the result
+is a completion payload, invisible until the job succeeds.
 
 ## Idempotency
 

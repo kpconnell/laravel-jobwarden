@@ -115,13 +115,15 @@ final class ChildRunner
             // recorded as a normal handler failure — loud, with the throw site.
             $handler = $this->handlers->make($job->job_class, (array) ($job->params ?? []));
 
-            $handlerStart = microtime(true);
-            $handler->handle(new JobContext(
+            $context = new JobContext(
                 (string) $job->id,
                 $attemptId,
                 (int) $attempt->attempt_number,
                 (array) ($job->params ?? []),
-            ));
+            );
+
+            $handlerStart = microtime(true);
+            $handler->handle($context);
             $handlerWallMs = (microtime(true) - $handlerStart) * 1000.0;
         } catch (\Throwable $e) {
             Log::error('Job failed: '.$e->getMessage(), ['step' => 'failed', 'exception' => $e::class]);
@@ -141,7 +143,7 @@ final class ChildRunner
         Log::info('Job finished successfully', ['step' => 'finished']);
         $this->logs->end();
 
-        return $this->succeed($attempt, $job, $token);
+        return $this->succeed($attempt, $job, $token, $context->bufferedResult());
     }
 
     /** Total CPU (user+system) this process has consumed so far, in ms. */
@@ -155,13 +157,16 @@ final class ChildRunner
         ) * 1000.0;
     }
 
-    private function succeed(JobAttempt $attempt, $job, int $token): int
+    private function succeed(JobAttempt $attempt, $job, int $token, ?array $result): int
     {
         try {
             // ONE transaction: the attempt AND the job move together, so a crash
             // can never leave `attempt=succeeded, job=running` (the reconciliation
             // sweep is the backstop if the process dies before this even runs).
-            $this->connection()->transaction(function () use ($attempt, $job, $token): void {
+            // The handler's buffered result commits here too: a poller can never
+            // see `succeeded` without it, and a fenced-out child's result rolls
+            // back with the refused transition instead of clobbering the new owner.
+            $this->connection()->transaction(function () use ($attempt, $job, $token, $result): void {
                 $this->stateMachine->applyAttemptTransition(
                     $attempt,
                     AttemptState::Succeeded,
@@ -172,6 +177,10 @@ final class ChildRunner
                     JobState::Succeeded,
                     TransitionContext::for(ActorType::Worker, null, 'completed')
                 );
+
+                if ($result !== null) {
+                    $job->forceFill(['result' => $result])->saveQuietly();
+                }
             });
         } catch (StaleFencingTokenException) {
             // Fenced out (reaped while finishing). Leave authoritative state alone.

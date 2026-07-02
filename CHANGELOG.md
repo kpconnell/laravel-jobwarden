@@ -7,6 +7,16 @@ All notable changes to `laravel-jobwarden` are documented here. The format follo
 ## [Unreleased]
 
 ### Added
+- **Job completion results (`jobs.result`).** A handler stores a completion payload with
+  `$context->result([...])`; it commits **atomically with the succeeded transition**, so a
+  caller polling `GET /jobs/{id}` can never observe `state=succeeded` without its final
+  result, and a fenced-out child (reaped while finishing) rolls its result back instead of
+  clobbering the new owner's run. Success-only — failures keep their story in `last_error`.
+  Bounded by `jobwarden.results.max_bytes` (default 64 KB): results are a completion
+  summary, **not freight** — ship bulk output to a filesystem disk / S3 via
+  `$context->artifact(...)` and put the artifact id in the result. Oversized or
+  non-JSON-encodable payloads fail the run loudly at the call site. See
+  **docs/JOB-AUTHORING.md → Results** and the polling contract in **docs/API.md**.
 - **Dashboard timestamps render in the viewer's timezone.** Every `*_at` shown in the
   dashboard (created/started/finished, worker heartbeat, next-due, and log/event times) is
   now emitted as an absolute Unix-epoch value computed **in SQL** — `UNIX_TIMESTAMP()` /

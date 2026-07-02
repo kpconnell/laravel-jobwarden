@@ -14,6 +14,7 @@ use JobWarden\Tests\Concerns\RefreshesJobWardenSchema;
 use JobWarden\Tests\TestCase;
 use Workbench\App\Jobs\FailingJob;
 use Workbench\App\Jobs\MarkerJob;
+use Workbench\App\Jobs\ResultJob;
 use Workbench\App\Jobs\TypedParamsJob;
 
 /**
@@ -50,6 +51,68 @@ final class ChildRunnerTest extends TestCase
         $this->assertSame(AttemptState::Succeeded, JobAttempt::find($attempt->id)->state);
         $this->assertSame(JobState::Succeeded, Job::find($job->id)->state);
         $this->assertStringStartsWith('done:', (string) @file_get_contents($marker));
+        $this->assertNull(Job::find($job->id)->result, 'a handler that never calls result() leaves it null');
+    }
+
+    public function test_result_set_by_the_handler_commits_with_success(): void
+    {
+        [$job, $attempt] = $this->dispatched(ResultJob::class, [
+            'result' => ['imported' => 42, 'skipped' => ['a', 'b']],
+        ], idempotent: true);
+
+        $code = $this->runner()->run($attempt->id, 1, 'n');
+
+        $this->assertSame(ExitCode::SUCCESS, $code);
+        $job = Job::find($job->id);
+        $this->assertSame(JobState::Succeeded, $job->state);
+        $this->assertSame(['imported' => 42, 'skipped' => ['a', 'b']], $job->result);
+    }
+
+    public function test_result_is_discarded_when_the_handler_fails_after_setting_it(): void
+    {
+        [$job, $attempt] = $this->dispatched(ResultJob::class, [
+            'result' => ['partial' => true],
+            'then_fail' => true,
+        ], idempotent: false, maxAttempts: 1);
+
+        $code = $this->runner()->run($attempt->id, 1, 'n');
+
+        $this->assertSame(ExitCode::FAILURE, $code);
+        $job = Job::find($job->id);
+        $this->assertSame(JobState::Failed, $job->state);
+        $this->assertNull($job->result, 'result is success-only; a failed run must not leave one');
+    }
+
+    public function test_oversized_result_fails_the_run_at_the_call_site(): void
+    {
+        config(['jobwarden.results.max_bytes' => 1024]);
+        [$job, $attempt] = $this->dispatched(ResultJob::class, ['fill_bytes' => 2048], idempotent: false, maxAttempts: 1);
+
+        $code = $this->runner()->run($attempt->id, 1, 'n');
+
+        $this->assertSame(ExitCode::FAILURE, $code);
+        $this->assertSame(JobState::Failed, Job::find($job->id)->state);
+        $this->assertNull(Job::find($job->id)->result);
+        $this->assertStringContainsString('max_bytes', JobAttempt::find($attempt->id)->error['message']);
+    }
+
+    public function test_fenced_out_child_cannot_land_its_result(): void
+    {
+        // The handler simulates a reaper takeover mid-run (fencing token bumped
+        // in the DB). succeed()'s guarded transition misses, and the WHOLE
+        // commit — including the buffered result — rolls back.
+        [$job, $attempt] = $this->dispatched(ResultJob::class, [
+            'result' => ['stale' => 'must not land'],
+            'fence_out' => true,
+        ], idempotent: true);
+
+        $code = $this->runner()->run($attempt->id, 1, 'n');
+
+        // The child exits quietly on a fence-out; the new owner holds the outcome.
+        $this->assertSame(ExitCode::SUCCESS, $code);
+        $job = Job::find($job->id);
+        $this->assertNull($job->result, 'a fenced-out result must roll back with the refused transition');
+        $this->assertSame(JobState::Running, $job->state, 'authoritative state is left for the new owner');
     }
 
     public function test_non_idempotent_failure_fails_the_job(): void

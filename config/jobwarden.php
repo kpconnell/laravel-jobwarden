@@ -151,6 +151,19 @@ return [
 
     /*
     |--------------------------------------------------------------------------
+    | Results (jobs.result — the completion payload)
+    |--------------------------------------------------------------------------
+    | A handler stores its completion payload via $context->result([...]); it
+    | commits atomically with the succeeded transition. Bounded here so the hot
+    | jobs table never accretes megabyte rows — anything bigger belongs in
+    | job_artifacts, with the result carrying the artifact id.
+    */
+    'results' => [
+        'max_bytes' => (int) env('JOBWARDEN_RESULT_MAX_BYTES', 65536),
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
     | Scheduler
     |--------------------------------------------------------------------------
     */

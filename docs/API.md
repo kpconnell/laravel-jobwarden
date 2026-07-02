@@ -48,13 +48,20 @@ Base path below is relative to the configured prefix (`jobwarden/api`).
 |---|---|
 | `GET /stats` | Overview counts: jobs by state, jobs by lane, batches by state, schedule + worker counts. |
 | `GET /jobs` | Paginated. Filters: `state` (repeatable), `lane`, `name`, `created_by`, `batch_id`, `schedule_id`, `q` (job_class substring), `per_page`. |
-| `GET /jobs/{id}` | One job with `attempts`, `events`, `artifacts` loaded. |
+| `GET /jobs/{id}` | One job with `attempts`, `events`, `artifacts` loaded. This is the completion-polling endpoint: watch `state`; on `succeeded` the handler's completion payload (if it stored one) is in `result`. |
 | `GET /jobs/{id}/logs` | Log lines. `after=<id>` for the live-tail cursor, `limit` (default 200). |
 | `GET /batches` | Paginated. Filter: `state`. |
 | `GET /batches/{id}` | One batch with its member `jobs`. |
 | `GET /schedules` | Paginated. Filter: `enabled`. |
 | `GET /schedules/{id}` | One schedule with `recent_runs` (last 25 occurrences). |
 | `GET /workers` | Registered processes (supervisors, schedulers, reapers). `all=1` to include stopped/dead, `role` to filter. |
+
+**Polling contract.** Dispatch returns the job id; poll `GET /jobs/{id}` until
+`state` is terminal (`succeeded` | `failed` | `canceled` | `stopped`). `result`
+is written **atomically with the succeeded transition**, so `state = succeeded`
+guarantees the final `result` is present in the same read (null if the handler
+never stored one) — no re-read needed. `result` is success-only; failures carry
+their story in `last_error`.
 
 ### Job actions
 

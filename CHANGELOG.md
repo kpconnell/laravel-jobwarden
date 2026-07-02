@@ -43,6 +43,14 @@ All notable changes to `laravel-jobwarden` are documented here. The format follo
   **docs/JOB-AUTHORING.md** for the binding rules and supported types.
 
 ### Fixed
+- **`created_at` / `updated_at` are stamped on the DB clock, not the app timezone.** Eloquent's
+  automatic timestamps wrote `Carbon::now()` in `app.timezone`, leaving `created_at` — the one
+  time column not already stamped with `CURRENT_TIMESTAMP` — skewed by the app↔DB-session offset.
+  It surfaced once the dashboard read the true stored epoch: a job showed "created 4 hours ago"
+  while `started_at` (DB-clock) was correct. `JobWardenModel` now restamps both via the query
+  builder (`SqlTime::nowExpr()`, `CURRENT_TIMESTAMP` — freezable under `setTestNow`) inside the
+  insert transaction, matching every other coordination timestamp and adding no extra commit. A
+  caller-supplied `created_at`/`updated_at` (import/replay) is left untouched.
 - **`job_events.reason` is now MEDIUMTEXT** (new migration — run `php artisan migrate`).
   Failure reasons embed the exception message; past ~239 chars, strict-mode MariaDB/MySQL
   rejected the audit INSERT (error 1406) inside the failure-recording transaction itself.

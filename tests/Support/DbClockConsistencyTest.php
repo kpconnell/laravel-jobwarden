@@ -8,6 +8,7 @@ use JobWarden\JobWarden;
 use JobWarden\Models\Job;
 use JobWarden\Recovery\Admitter;
 use JobWarden\States\JobState;
+use JobWarden\Support\SqlTime;
 use JobWarden\Tests\Concerns\RefreshesJobWardenSchema;
 use JobWarden\Tests\TestCase;
 use Illuminate\Support\Carbon;
@@ -61,6 +62,23 @@ final class DbClockConsistencyTest extends TestCase
         // ...and the admit pass (also DB-clock now) must not promote it early.
         $this->app->make(Admitter::class)->admit();
         $this->assertSame(JobState::Pending, Job::find($job->id)->state, 'admit promoted a not-yet-due job');
+    }
+
+    public function test_created_at_is_stamped_from_the_db_clock_not_the_app_timezone(): void
+    {
+        $job = $this->app->make(JobWarden::class)->dispatch(MarkerJob::class, [], ['idempotent' => true]);
+
+        // created_at drives claim FIFO ordering and the dashboard; like every other JobWarden
+        // time column it must land on the DB clock, not the app timezone (America/New_York here).
+        // Read the stored value's true epoch — it must sit on the DB clock, not hours off.
+        $conn = (new Job)->getConnection();
+        $createdMs = (float) $conn->selectOne(
+            'SELECT '.SqlTime::epochMsExpr($conn, 'created_at').' AS ms FROM '.(new Job)->getTable().' WHERE id = ?',
+            [$job->id]
+        )->ms;
+
+        $drift = abs((int) round($createdMs / 1000) - SqlTime::now($conn)->getTimestamp());
+        $this->assertLessThanOrEqual(5, $drift, "created_at drifted {$drift}s from the DB clock — it was written on the app timezone");
     }
 
     private function dueByDbClock(string $id): bool

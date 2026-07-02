@@ -12,17 +12,59 @@ idempotency-gated retry guard, and verifiable OS-process identity — never from
 > **Status: `1.0.0-beta`.** The distributed-correctness core and the full feature set are complete and proven
 > against SQLite, MariaDB/MySQL, and PostgreSQL (134 tests). APIs may shift slightly before `1.0.0`.
 
-## Why
+## The core idea: positive control of every process
 
-- **Survives worker death.** A worker (or its whole host) can crash mid-job. A reaper detects the dead
-  process by its stale lease, orphans its in-flight work with a bumped fencing token, and re-runs it elsewhere —
-  and every step is recorded in a durable audit ledger.
+Horizon and every Redis/SQS/database *queue* share one blind spot: **the moment a job is handed to a worker, the
+system loses sight of it.** The job becomes an in-flight payload behind a visibility timeout. Nothing knows which
+OS process on which host is actually running it, whether that process is alive or wedged, or how to reach it.
+Recovery is a guess on a timer, and re-delivery is blind at-least-once — which can double-run your work.
+
+JobWarden inverts that. Every job runs in a **child process the supervisor spawned and watches**, and the
+database row for that attempt carries the process's full OS identity: `host_id`, the supervisor and child
+**PIDs**, each PID's `/proc` **start-time**, and a per-spawn **nonce**. A row maps to a real, reuse-proof Linux
+process. The engine always knows *what is running, where, on which PID* — and can **prove** it before it acts.
+
+That one property — **positive control** — is what unlocks everything a queue structurally cannot do:
+
+| | Redis / Horizon / SQS queue | JobWarden |
+|---|---|---|
+| **What the system knows** | "a job is in flight somewhere" | the exact host + PID + start-time behind every attempt |
+| **Detecting a dead/wedged worker** | wait out a visibility timeout / missed heartbeat | *verified* — `waitpid`, then `/proc` stamp checks, across three tiers |
+| **Recovery latency** | bounded by the job's own timeout (a 4 h job ⇒ ~4 h) | decoupled from job duration (a dead host is caught in ~40 s) |
+| **Re-delivery safety** | blind at-least-once; can silently double-run | fencing token + **binary** idempotency gate: retry *or* park |
+| **Killing one specific running job** | not possible — no handle to the process | targeted SIGTERM→SIGKILL of the exact stamped PID, *confirmed dead* |
+| **Reused-PID safety** | n/a | start-time match means a recycled PID is never mistaken for the original |
+| **Graceful deploys** | in-flight jobs abandoned / blindly re-queued | drain: stop claiming, bleed off in-flight work, then exit |
+| **Blast radius of a bad job** | can wedge or OOM the worker and its siblings | one job = one child; a crash/OOM/segfault can't take the supervisor down |
+
+### What positive control buys you
+
+- **Detect orphans — verified, not guessed.** Detection runs in three tiers: the supervisor `waitpid`s its own
+  children instantly; a per-host local reaper checks each attempt's `/proc` stamp (catching a *dead supervisor*
+  whose child reparented to `init`); and a leader-leased global reaper catches whole dead hosts via an expired
+  lease. It keys on the **per-process** `worker_id`, so restarting a box never masks the incarnation that died on
+  it — and a 4-hour job on a pulled-plug host is recovered in ~40 s, not 4 hours.
+- **Kill a specific running job — on demand.** An operator cancel flips `cancel_requested`; the supervisor
+  SIGTERMs *that exact child*, waits a grace window, then SIGKILLs. A reaper that finds a supervisor-less child
+  SIGTERM→SIGKILLs it and **confirms it is dead before orphaning** — so a replacement never runs while the
+  original still breathes. Every kill is start-time-checked, so a recycled PID is never the victim.
+- **Isolate every job.** One job = one child process. A job that segfaults, OOMs, or blocks for an hour can't
+  take down the supervisor or its siblings, and because the supervisor is *watching* it, a busy job is never
+  mistaken for a dead one. Lanes and a dedicated DB connection isolate fleets and coordination traffic.
+- **Bleed off work for zero-loss deploys.** On SIGTERM the supervisor stops claiming, lets its in-flight
+  children finish (a bounded drain window), then exits — so a rolling deploy drains gracefully instead of
+  abandoning jobs. (Prefork recycling reuses the same drain to periodically rebaseline the worker.)
+- **Never double-run by accident.** Reassignment bumps a **fencing token**, so a presumed-dead worker that comes
+  back can't clobber the new owner. And idempotency is binary: a lost idempotent job retries automatically; a
+  non-idempotent one **parks** for an operator instead of silently running twice. Every step lands in a durable
+  audit ledger.
+
+Two more things queues make you bolt on, here for free:
+
 - **No Redis to operate.** Your database is already durable, transactional, and backed up. JobWarden coordinates
   entirely through it (`FOR UPDATE SKIP LOCKED`, with an optimistic-CAS fallback where that isn't available).
-- **Idempotency is a first-class, binary decision.** Each job declares `idempotent()`. Lost idempotent jobs
-  retry automatically; non-idempotent ones **park** for an operator instead of silently double-running.
-- **Batches, DAGs, and scheduling** are built in — fan-out, chains, arbitrary dependency graphs, cron, and
-  one-off runs — all on the same durable substrate.
+- **Batches, DAGs & scheduling, built in** — fan-out, chains, arbitrary dependency graphs, cron, and one-off
+  runs — all on the same durable substrate, all under the same positive control.
 
 JobWarden coexists with Laravel's Bus/Queue; it does **not** hijack `dispatch()`.
 
@@ -42,7 +84,8 @@ php artisan jobwarden:install --migrate
 
 `jobwarden:install` publishes `config/jobwarden.php` and the migrations; `--migrate` runs them. By default
 JobWarden uses a **dedicated database connection** (`config('jobwarden.connection')`) so its coordination
-traffic is isolated from your app's.
+traffic is isolated from your app's. Every setting is env-driven with sensible defaults — you don't have to
+publish the config to tune it; see **[docs/CONFIGURATION.md](docs/CONFIGURATION.md)** for the full reference.
 
 ## Defining a job
 

@@ -1,7 +1,8 @@
 # Hosting JobWarden
 
 This guide covers how to actually lay JobWarden out on real infrastructure — from a
-single box to a scaled fleet — and how the pieces relate. For the API/dashboard
+single box to a scaled fleet — and how the pieces relate. For every configuration knob
+and how to set it see [CONFIGURATION.md](CONFIGURATION.md); for the API/dashboard
 endpoint reference see [API.md](API.md); for defining and dispatching jobs see the
 [README](../README.md).
 
@@ -265,7 +266,10 @@ for much cheaper commits) before adding more worker boxes.
 
 ## Tuning knobs
 
-All are env vars (defaults shown); recovery is governed by the host-lease budget.
+The hosting-relevant subset is below (all env vars, defaults shown; recovery is governed
+by the host-lease budget). For the **complete** reference — every knob, grouped, plus how
+to set values (env vs publish, the `config:cache` caveat) — see
+[CONFIGURATION.md](CONFIGURATION.md).
 
 | Env | Default | Effect |
 |---|---|---|

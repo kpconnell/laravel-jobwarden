@@ -21,6 +21,9 @@ final class ChildHandle
 
     public ?float $stopRequestedAt = null;
 
+    /** The SIGKILL escalation fires every tick until the child dies; log it once. */
+    public bool $sigkillLogged = false;
+
     public function __construct(
         public readonly mixed $process,      // proc_open resource (null for a pcntl fork)
         public readonly int $pid,

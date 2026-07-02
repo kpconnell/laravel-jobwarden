@@ -498,6 +498,11 @@ final class Supervisor
         try {
             if ($handle->stopRequested) {
                 $this->stateMachine->applyAttemptTransition($attempt, AttemptState::Stopped, (clone $context)->because('stopped by operator'));
+                $this->logStopLine($handle, sprintf(
+                    'stopped by operator; child reaped (exit=%s signal=%s)',
+                    $handle->exitCode ?? 'n/a',
+                    $handle->termSignal ?? 'n/a'
+                ));
                 if ($job !== null) {
                     $this->stateMachine->applyJobTransition($job, JobState::Stopped, TransitionContext::for(ActorType::Supervisor, null, 'stopped by operator'));
                 }
@@ -566,26 +571,55 @@ final class Supervisor
 
     private function escalateStopIfRequested(ChildHandle $handle): void
     {
+        $grace = (int) config('jobwarden.supervisor.graceful_timeout', 10);
+
         if (! $handle->stopRequested) {
             $cancel = $this->connection()->table($this->tbl('jobs'))
                 ->where('id', $handle->jobId)
                 ->where('cancel_requested', true)
-                ->exists();
+                ->first(['cancel_mode', 'cancel_reason']);
 
-            if ($cancel) {
+            if ($cancel !== null) {
                 $handle->stopRequested = true;
                 $handle->stopRequestedAt = microtime(true);
                 $this->probe->signal($handle->pid, self::SIGTERM);
                 Log::warning('stopping child (cancel requested): SIGTERM', ['attempt' => $handle->attemptId, 'pid' => $handle->pid]);
+
+                $reason = (string) ($cancel->cancel_reason ?? '');
+                $this->logStopLine($handle, sprintf(
+                    '%s requested%s; SIGTERM sent (%ds grace, then SIGKILL)',
+                    $cancel->cancel_mode === 'stop' ? 'stop' : 'cancel',
+                    $reason !== '' ? ': '.$reason : '',
+                    $grace
+                ));
             }
 
             return;
         }
 
-        $grace = (int) config('jobwarden.supervisor.graceful_timeout', 10);
         if ($handle->stopRequestedAt !== null && (microtime(true) - $handle->stopRequestedAt) >= $grace) {
             $this->probe->signal($handle->pid, self::SIGKILL);
             Log::warning('force-killing child after grace window: SIGKILL', ['attempt' => $handle->attemptId, 'pid' => $handle->pid]);
+
+            if (! $handle->sigkillLogged) {
+                $handle->sigkillLogged = true;
+                $this->logStopLine($handle, sprintf('grace window (%ds) expired; SIGKILL sent', $grace));
+            }
+        }
+    }
+
+    /**
+     * Inject a stop-lifecycle line into the job's own log (the same seam a
+     * reaper uses), so a canceled job's log shows request → signal → reap.
+     * Best-effort: a log failure must never break signaling or finalize.
+     */
+    private function logStopLine(ChildHandle $handle, string $message): void
+    {
+        try {
+            $this->jobLogger->write($handle->jobId, $handle->attemptId, 'warning', $message,
+                ['source' => 'supervisor', 'pid' => $handle->pid], 'stop');
+        } catch (\Throwable) {
+            // best-effort
         }
     }
 

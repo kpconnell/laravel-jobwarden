@@ -33,6 +33,9 @@ All notable changes to `laravel-jobwarden` are documented here. The format follo
   **docs/JOB-AUTHORING.md** for the binding rules and supported types.
 
 ### Fixed
+- **`job_events.reason` is now MEDIUMTEXT** (new migration — run `php artisan migrate`).
+  Failure reasons embed the exception message; past ~239 chars, strict-mode MariaDB/MySQL
+  rejected the audit INSERT (error 1406) inside the failure-recording transaction itself.
 - **Aggregate atomicity: a terminal attempt can no longer strand its job in `running`.**
   A worker completing/failing an attempt, and a reaper orphaning one, now move the
   attempt **and** the job (plus the recovery decision) in a **single transaction**, so

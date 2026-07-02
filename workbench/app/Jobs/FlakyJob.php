@@ -11,27 +11,32 @@ use RuntimeException;
 /**
  * Idempotent and flaky: fails the first `fail_until` runs (tracked in a counter
  * file), then succeeds. Exercises idempotent retry + backoff + the admit pass
- * across multiple attempts.
+ * across multiple attempts. Parameter names mirror the params keys verbatim
+ * (binding is by exact name), hence the snake_case.
  */
 final class FlakyJob implements JobWardenJob
 {
+    public function __construct(
+        private readonly string $counter = '',
+        private readonly int $fail_until = 1,
+        private readonly string $marker = '',
+    ) {
+    }
+
     public function handle(JobContext $context): void
     {
-        $counterFile = (string) ($context->params['counter'] ?? '');
-        $failUntil = (int) ($context->params['fail_until'] ?? 1);
-
-        $count = $counterFile !== '' && is_file($counterFile) ? (int) file_get_contents($counterFile) : 0;
+        $count = $this->counter !== '' && is_file($this->counter) ? (int) file_get_contents($this->counter) : 0;
         $count++;
-        if ($counterFile !== '') {
-            file_put_contents($counterFile, (string) $count);
+        if ($this->counter !== '') {
+            file_put_contents($this->counter, (string) $count);
         }
 
-        if ($count <= $failUntil) {
-            throw new RuntimeException("flaky failure {$count}/{$failUntil}");
+        if ($count <= $this->fail_until) {
+            throw new RuntimeException("flaky failure {$count}/{$this->fail_until}");
         }
 
-        if (! empty($context->params['marker'])) {
-            file_put_contents((string) $context->params['marker'], "succeeded after {$count}");
+        if ($this->marker !== '') {
+            file_put_contents($this->marker, "succeeded after {$count}");
         }
     }
 

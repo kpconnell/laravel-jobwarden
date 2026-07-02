@@ -14,15 +14,18 @@ use Illuminate\Support\Facades\Log;
  */
 final class ChattyJob implements JobWardenJob
 {
+    public function __construct(
+        private readonly int $steps = 3,
+        private readonly int $delay = 0,
+    ) {
+    }
+
     public function handle(JobContext $context): void
     {
-        $steps = (int) ($context->params['steps'] ?? 3);
-        $delay = (int) ($context->params['delay'] ?? 0);
-
-        for ($i = 1; $i <= $steps; $i++) {
-            Log::info("working step {$i}/{$steps}", ['step' => 'progress', 'i' => $i]);
-            if ($delay > 0) {
-                sleep($delay);
+        for ($i = 1; $i <= $this->steps; $i++) {
+            Log::info("working step {$i}/{$this->steps}", ['step' => 'progress', 'i' => $i]);
+            if ($this->delay > 0) {
+                sleep($this->delay);
             }
         }
 

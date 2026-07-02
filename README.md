@@ -100,15 +100,17 @@ use JobWarden\Runner\JobContext;
 
 final class ImportCatalog implements JobWardenJob
 {
+    use \JobWarden\Dispatch\Dispatchable;
+
     public function __construct(
-        private readonly CatalogClient $client,   // service — container DI
         private readonly string $storeId,         // data — bound from params by name
         private readonly bool $fullSync = false,  // data — optional param
     ) {
     }
 
-    public function handle(JobContext $context): void
+    public function handle(JobContext $context, ?CatalogClient $client = null): void
     {
+        // $client is container-injected per-run (constructors are data-only)
         // ... do the work; throwing = failure, returning = success ...
     }
 
@@ -119,14 +121,20 @@ final class ImportCatalog implements JobWardenJob
 }
 ```
 
-Backed enums and date-times coerce from their JSON representations; Eloquent models are deliberately not
-hydrated (pass the key, fetch in `handle()`); the full params array also remains available as
-`$context->params`. See **[docs/JOB-AUTHORING.md](docs/JOB-AUTHORING.md)** for the binding rules, supported
-types, and everything available inside a run.
+The constructor carries data — a literal mirror of the params JSON — and `handle()` receives services via
+container method injection. Backed enums and date-times coerce from their JSON representations; Eloquent
+models are deliberately not hydrated (pass the key, fetch in `handle()`). See
+**[docs/JOB-AUTHORING.md](docs/JOB-AUTHORING.md)** for the binding rules, supported types, and everything
+available inside a run.
 
 ## Dispatching
 
 ```php
+// Horizon-style, via the opt-in Dispatchable trait — idempotency comes from the class:
+ImportCatalog::dispatch('store-42', fullSync: true);
+ImportCatalog::inLane('reports')->delay(300)->maxAttempts(3)->dispatch(storeId: 'store-42');
+
+// or the service API (the HTTP-API/schedule path):
 use JobWarden\JobWarden;
 
 app(JobWarden::class)->dispatch(ImportCatalog::class, ['storeId' => 'store-42'], [

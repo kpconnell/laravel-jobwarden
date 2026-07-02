@@ -10,15 +10,17 @@ use Illuminate\Database\Eloquent\Model;
 
 /**
  * Resolves a job handler from `jobs.job_class`, binding the job's stored params
- * (the JSON column) to constructor parameters BY NAME — the container fills every
- * unbound service dependency as before. The wire format stays plain JSON: params
- * remain inspectable in the dashboard, dispatchable over the HTTP API, and
- * deterministic across retries on other hosts.
+ * (the JSON column) to constructor parameters BY NAME. The wire format stays
+ * plain JSON: params remain inspectable in the dashboard, dispatchable over the
+ * HTTP API, and deterministic across retries on other hosts.
  *
- * The rule handler authors code against (docs/JOB-AUTHORING.md): class-typed
- * constructor parameters are services; data parameters are scalar / array /
- * backed-enum / date-time and must appear in the params JSON (or declare a
- * default). Exactly two coercions bridge JSON to richer types:
+ * The rule handler authors code against (docs/JOB-AUTHORING.md): constructors
+ * are DATA-ONLY. Every parameter is scalar / array / backed-enum / date-time —
+ * a literal mirror of the params JSON — and must appear in the params (or
+ * declare a default). Services are received in handle(), which ChildRunner
+ * invokes through the container (method injection); a class-typed constructor
+ * parameter that isn't an enum or date-time is refused before construction.
+ * Exactly two coercions bridge JSON to richer types:
  *
  *   backed enums   "full"                   → ImportMode::Full
  *   date-times     "2026-07-01T09:00:00Z"   → CarbonImmutable / DateTime…
@@ -27,10 +29,11 @@ use Illuminate\Database\Eloquent\Model;
  * fetch in handle(), where the missing-row policy (fail / park / skip) belongs
  * and where a retry sees current DB state by construction.
  *
- * Data-shaped types are also GUARDED when no params key matches. Without the
- * guard the container would "succeed" silently in exactly the wrong way — an
- * unbound `Carbon $asOf` resolves to NOW, an unbound model to an EMPTY instance.
- * Missing data must fail loud, not run wrong.
+ * Nothing is ever left for the container to invent. Before the data-only rule,
+ * an unbound data-shaped parameter had to be guarded case by case — the
+ * container would "succeed" silently in exactly the wrong way (an unbound
+ * `Carbon $asOf` resolves to NOW, an unbound model to an EMPTY instance). Now
+ * every parameter is bound, defaulted, or refused loudly.
  */
 final class HandlerFactory
 {
@@ -49,10 +52,11 @@ final class HandlerFactory
     }
 
     /**
-     * Named-parameter overrides for the container: params matched by exact
-     * constructor-parameter name (coerced where the declared type calls for it);
-     * everything unmatched is left for DI. Extra params keys are simply not
-     * overrides — they stay reachable through JobContext::$params.
+     * One override per constructor parameter: the matching params key (coerced
+     * where the declared type calls for it) or the parameter's own declared
+     * default. Params keys that match no parameter are ignored by binding
+     * (schedule/API metadata may ride along); a parameter with neither a key
+     * nor a default is refused loudly.
      *
      * @param  array<string,mixed>  $params
      * @return array<string,mixed>
@@ -66,6 +70,7 @@ final class HandlerFactory
 
         $overrides = [];
         foreach ($constructor->getParameters() as $parameter) {
+            $this->assertDataParameter($parameter, $jobClass);
             $name = $parameter->getName();
 
             if (array_key_exists($name, $params)) {
@@ -74,28 +79,25 @@ final class HandlerFactory
                 continue;
             }
 
-            if (! $this->isDataParameter($parameter)) {
-                continue; // service (or defaulted primitive): the container's job
-            }
-
-            // An optional data param falls back to ITS OWN declared default.
-            // Left to the container, `?CarbonImmutable $asOf = null` would
-            // resolve to now() and a defaulted model to an empty instance —
-            // the default only kicks in when resolution FAILS, and here it
-            // wouldn't.
+            // Set the declared default EXPLICITLY rather than leaving it to the
+            // container — a default only kicks in there when resolution FAILS,
+            // and for `?CarbonImmutable $asOf = null` it wouldn't fail: the
+            // container would construct a date-time of "now".
             if ($parameter->isDefaultValueAvailable()) {
                 $overrides[$name] = $parameter->getDefaultValue();
 
                 continue;
             }
 
+            if ($parameter->isVariadic()) {
+                continue;
+            }
+
             $type = $parameter->getType();
-            \assert($type instanceof \ReflectionNamedType);
+            $typeName = $type instanceof \ReflectionNamedType ? $type->getName() : (string) $type;
             throw new \RuntimeException(
-                "[{$jobClass}] constructor parameter \${$name} ({$type->getName()}) is data, not a service, "
-                .'and the job has no matching params key. Add the key at dispatch or declare a default — '
-                .'refusing container fallback, which would silently construct a wrong value '
-                ."(an empty model, a date-time of 'now')."
+                "[{$jobClass}] constructor parameter \${$name} ({$typeName}) has no matching params key "
+                .'and no default. Add the key at dispatch or declare a default.'
             );
         }
 
@@ -103,30 +105,47 @@ final class HandlerFactory
     }
 
     /**
-     * Data-shaped declared types: values with identity or an instant, which the
-     * container can nonetheless "construct" out of thin air. These must come
-     * from params (or a declared default), never from DI.
+     * Constructors are data-only. Builtins, backed enums and date-times are the
+     * job's payload; a model is refused with the pass-the-id rule; any other
+     * class/interface type is a service in the wrong place — it belongs in
+     * handle(), where the container injects it per-run.
      */
-    private function isDataParameter(\ReflectionParameter $parameter): bool
+    private function assertDataParameter(\ReflectionParameter $parameter, string $jobClass): void
     {
         $type = $parameter->getType();
         if (! $type instanceof \ReflectionNamedType || $type->isBuiltin()) {
-            return false;
+            return; // untyped / builtin / union: data, bound or defaulted verbatim
         }
 
         $class = $type->getName();
+        $name = $parameter->getName();
 
-        return is_a($class, Model::class, true)
-            || is_a($class, \DateTimeInterface::class, true)
-            || is_subclass_of($class, \BackedEnum::class);
+        if (is_a($class, Model::class, true)) {
+            throw new \RuntimeException(
+                "[{$jobClass}] constructor parameter \${$name} is an Eloquent model — model hydration is not "
+                ."supported. Put the key in params (e.g. '{$name}Id') and fetch the model in handle(), "
+                .'which owns the missing-row policy and sees current DB state on a retry.'
+            );
+        }
+
+        if (is_subclass_of($class, \BackedEnum::class) || is_a($class, \DateTimeInterface::class, true)) {
+            return;
+        }
+
+        throw new \RuntimeException(
+            "[{$jobClass}] constructor parameter \${$name} ({$class}) is a service — constructors are "
+            .'data-only, a mirror of the params JSON (scalar / array / backed-enum / date-time). '
+            .'Receive services in handle() instead; it is invoked through the container.'
+        );
     }
 
     /**
      * Bridge a JSON value to the parameter's declared type. Only backed enums
      * and date-times are coerced; scalars/arrays pass verbatim (the container
-     * invokes constructors from weak-mode code, so `"42"` still binds to `int`).
-     * Any other class type passes verbatim too — a mismatch is a TypeError,
-     * which fails the attempt loud with the throw site recorded.
+     * invokes constructors from weak-mode code, so `"42"` still binds to `int`)
+     * — a mismatch is a TypeError, which fails the attempt loud with the throw
+     * site recorded. assertDataParameter() has already refused any other class
+     * type before a value reaches here.
      */
     private function coerce(\ReflectionParameter $parameter, mixed $value, string $jobClass): mixed
     {
@@ -141,14 +160,6 @@ final class HandlerFactory
 
         $class = $type->getName();
         $name = $parameter->getName();
-
-        if (is_a($class, Model::class, true)) {
-            throw new \RuntimeException(
-                "[{$jobClass}] constructor parameter \${$name} is an Eloquent model — model hydration is not "
-                ."supported. Put the key in params (e.g. '{$name}Id') and fetch the model in handle(), "
-                .'which owns the missing-row policy and sees current DB state on a retry.'
-            );
-        }
 
         if (is_subclass_of($class, \BackedEnum::class)) {
             return $this->toEnum($class, $value, $name, $jobClass);

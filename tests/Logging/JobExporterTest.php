@@ -38,7 +38,7 @@ final class JobExporterTest extends TestCase
         JobLog::create(['job_id' => $job->id, 'attempt_id' => $attempt->id, 'seq' => 1, 'ts' => now(), 'level' => 'info', 'body_sink' => 'database', 'body_ref' => 'charged card ok']);
 
         // A handler-recorded artifact (inline summary, no file).
-        (new JobContext($job->id, $attempt->id, 1, []))->artifact('response', 'stripe-response', [
+        (new JobContext($job->id, $attempt->id, 1))->artifact('response', 'stripe-response', [
             'content_type' => 'application/json',
             'meta' => ['status' => 200, 'id' => 'ch_123'],
         ]);

@@ -4,15 +4,19 @@ declare(strict_types=1);
 
 namespace JobWarden\Runner;
 
+use Closure;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
 use Symfony\Component\Uid\Uuid;
 
 /**
- * Execution context handed to a JobWardenJob::handle(). Carries identity + params,
- * lets a handler attach support-case artifacts (request/response pairs, files,
- * dumps) that get bundled into `jobwarden:logs --export` (spec §9.3), and buffers
- * the completion payload set via result().
+ * The per-attempt capability handle passed to JobWardenJob::handle(). Carries
+ * execution identity, lets a handler attach support-case artifacts
+ * (request/response pairs, files, dumps) that get bundled into
+ * `jobwarden:logs --export` (spec §9.3), buffers the completion payload set via
+ * result(), and exposes the cooperative stop flag. The job's DATA does not live
+ * here — params bind to the handler's constructor (see Runner\HandlerFactory);
+ * services are injected into handle() by the container.
  */
 final class JobContext
 {
@@ -23,8 +27,20 @@ final class JobContext
         public readonly string $jobId,
         public readonly string $attemptId,
         public readonly int $attemptNumber,
-        public readonly array $params = [],
+        private readonly ?Closure $stopSignal = null,
     ) {
+    }
+
+    /**
+     * Has the supervisor asked this run to stop (SIGTERM: deploy, scale-down)?
+     * Cooperation is optional — a long-running handler that polls this in its
+     * loop can checkpoint and return within the grace window; one that doesn't
+     * is SIGKILLed after the grace period and recorded `stopped` by the
+     * supervisor. Correctness never depends on checking it.
+     */
+    public function stopRequested(): bool
+    {
+        return $this->stopSignal !== null && ($this->stopSignal)();
     }
 
     /**

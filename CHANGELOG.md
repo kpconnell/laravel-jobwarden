@@ -29,20 +29,53 @@ All notable changes to `laravel-jobwarden` are documented here. The format follo
   MariaDB/MySQL, Postgres, SQLite, SQL Server branches, plus an ANSI-interval fallback that
   runs — with accepted tz drift — on any other engine) and a `withDisplayEpochs()` model
   scope; the conversion re-applies after each Livewire poll so `wire:poll` can't revert it.
-- **Constructor param binding for job handlers.** The stored params (JSON) now bind to
-  handler constructor parameters **by exact name** — services keep resolving from the
-  container — so handlers declare typed, promoted properties instead of digging through
-  `$context->params`. Backed enums coerce from their backing value and date-times from
-  ISO-8601 strings; the full params array still reaches `JobContext`, so existing
-  handlers are unaffected. Data-shaped parameters (models, date-times, enums) with no
-  matching params key are **refused loudly** instead of falling through to the container,
-  which would silently construct an empty model or a date of "now". Eloquent models are
+- **`JobClass::dispatch(...)` — Horizon-style dispatch (opt-in `Dispatchable` trait).**
+  `ImportCatalog::dispatch('store-42', ImportMode::Full)` — positional (constructor
+  order), named, or mixed args become the params JSON (enums store their backing value,
+  date-times ISO-8601 with offset; models and other objects are refused at the dispatch
+  site). Options chain first and `dispatch()` is always the terminal call, returning the
+  created `Job` synchronously: `ImportCatalog::inLane('reports')->delay(300)->dispatch(...)`
+  (`inLane`, `delay`, `availableAt`, `priority`, `maxAttempts`, `maxRuntime`, `named`,
+  `idempotencyKey`, `tags`, `backoff`, `createdBy`). There is deliberately **no
+  `__destruct()` commit** (unlike Laravel's `PendingDispatch`) — nothing dispatches at GC
+  time. The params **round-trip through HandlerFactory before the row is created**, so a
+  dispatch that would fail to bind on the worker fails at the dispatch site with no row —
+  and the instance's `idempotent()` declaration **stamps the row's idempotency guard**:
+  the class is the single source of truth, never repeated per dispatch. Laravel's
+  Bus/Queue `dispatch()` is untouched (spec §0); `Bus::fake()` won't see these — assert
+  on the jobs table.
+- **Constructor param binding for job handlers — constructors are data-only; services
+  move to `handle()`.** The stored params (JSON) bind to handler constructor parameters
+  **by exact name**, so handlers declare typed, promoted properties instead of digging
+  through `$context->params` (which is gone — one source of truth). Every constructor
+  parameter is scalar / array / backed-enum / date-time, a literal mirror of the params
+  JSON: backed enums coerce from their backing value, date-times from ISO-8601 strings,
+  and a parameter with no matching key and no default is **refused loudly** — nothing is
+  ever left for the container to invent (which would silently construct an empty model or
+  a date of "now"). A **service-typed constructor parameter is refused**: `handle()` is
+  now invoked **through the container**, so services method-inject per-run
+  (`handle(JobContext $context, ?Mailer $mailer = null)` — declared optional because the
+  interface pins the signature; the container still fills it). Eloquent models are
   deliberately never hydrated — pass the key, fetch in `handle()`, own the missing-row
-  policy. The contract check now also runs **before** construction, so a non-JobWardenJob
-  class can no longer execute constructor side effects. See the new
-  **docs/JOB-AUTHORING.md** for the binding rules and supported types.
+  policy. The contract check runs **before** construction, so a non-JobWardenJob class
+  can no longer execute constructor side effects. See **docs/JOB-AUTHORING.md** for the
+  binding rules and supported types.
+- **Cooperative stop flag: `$context->stopRequested()`.** The child's SIGTERM handler now
+  sets a real flag (it was a documented no-op), and long-running handlers can poll it to
+  checkpoint and exit cleanly within the grace window. Cooperation stays optional — a
+  handler that never checks is SIGKILLed after the grace period and recorded `stopped`,
+  exactly as before; correctness never depends on it. `JobContext` is now the slim
+  per-attempt capability handle: identity, `result()`, `artifact()`, `stopRequested()` —
+  job data lives in the constructor.
 
 ### Fixed
+- **Documented: handlers must not use the `STDOUT`/`STDERR` constants — use `Log::` or
+  `php://stderr`.** Prefork children close the constants to reclaim fds 1/2 into the
+  per-attempt log (the dying-words capture), so `fwrite(STDERR, …)` throws in a handler
+  under prefork (found by the chaos fleet backtest: the entire raw-stderr cohort failed,
+  and crash-mode jobs threw before ever reaching their SIGKILL). The chaos/crash test
+  fixtures now write via `php://stderr`, which opens fd 2 fresh and works identically in
+  both execution modes. See **docs/JOB-AUTHORING.md → Logging**.
 - **`created_at` / `updated_at` are stamped on the DB clock, not the app timezone.** Eloquent's
   automatic timestamps wrote `Carbon::now()` in `app.timezone`, leaving `created_at` — the one
   time column not already stamped with `CURRENT_TIMESTAMP` — skewed by the app↔DB-session offset.

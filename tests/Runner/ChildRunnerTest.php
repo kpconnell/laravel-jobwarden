@@ -154,7 +154,7 @@ final class ChildRunnerTest extends TestCase
         $this->assertTrue($job->available_at->isFuture(), 'retry should be delayed by backoff');
     }
 
-    public function test_constructor_params_bind_by_name_with_enum_and_date_coercion(): void
+    public function test_constructor_params_bind_by_name_and_services_inject_into_handle(): void
     {
         $marker = $this->runtime.'/typed.json';
         [$job, $attempt] = $this->dispatched(TypedParamsJob::class, [
@@ -162,7 +162,7 @@ final class ChildRunnerTest extends TestCase
             'mode' => 'full',                       // → ImportMode::Full
             'limit' => 25,
             'asOf' => '2026-07-01T09:00:00Z',       // → CarbonImmutable
-            'extra' => 'not-a-constructor-param',   // ignored by binding, kept in context
+            'extra' => 'not-a-constructor-param',   // ignored by binding (ride-along metadata)
         ], idempotent: true);
 
         $code = $this->runner()->run($attempt->id, 1, 'n');
@@ -174,8 +174,8 @@ final class ChildRunnerTest extends TestCase
         $this->assertSame('full', $seen['mode']);
         $this->assertSame(25, $seen['limit']);
         $this->assertSame('2026-07-01T09:00:00+00:00', $seen['as_of']);
-        $this->assertTrue($seen['service_resolved'], 'unbound service params still come from the container');
-        $this->assertSame('not-a-constructor-param', $seen['context_params']['extra'], 'the full params array still reaches JobContext');
+        $this->assertTrue($seen['service_resolved'], 'handle() is container-invoked: service params method-inject');
+        $this->assertSame(1, $seen['attempt'], 'JobContext still carries execution identity');
     }
 
     public function test_missing_required_constructor_param_fails_the_attempt_loud(): void

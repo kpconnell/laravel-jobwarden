@@ -20,20 +20,28 @@ use RuntimeException;
  */
 final class ResultJob implements JobWardenJob
 {
+    public function __construct(
+        private readonly array $result = ['ok' => true],
+        private readonly int $fill_bytes = 0,
+        private readonly bool $then_fail = false,
+        private readonly bool $fence_out = false,
+    ) {
+    }
+
     public function handle(JobContext $context): void
     {
-        $payload = (array) ($context->params['result'] ?? ['ok' => true]);
-        if (($fill = (int) ($context->params['fill_bytes'] ?? 0)) > 0) {
-            $payload['fill'] = str_repeat('x', $fill);
+        $payload = $this->result;
+        if ($this->fill_bytes > 0) {
+            $payload['fill'] = str_repeat('x', $this->fill_bytes);
         }
 
         $context->result($payload);
 
-        if (! empty($context->params['then_fail'])) {
+        if ($this->then_fail) {
             throw new RuntimeException('failed after setting a result');
         }
 
-        if (! empty($context->params['fence_out'])) {
+        if ($this->fence_out) {
             JobAttempt::query()->whereKey($context->attemptId)->increment('fencing_token');
         }
     }

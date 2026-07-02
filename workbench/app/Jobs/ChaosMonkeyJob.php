@@ -12,28 +12,37 @@ use RuntimeException;
 /**
  * Parameter-driven hostile job for chaos tests. One class can succeed noisily,
  * emit raw process output, write artifacts, throw, hard-crash, or resist stop.
+ * Parameter names mirror the params keys verbatim (binding is by exact name),
+ * hence the snake_case; `lines` defaults per mode (25 logstorm / 8 stderr).
  */
 final class ChaosMonkeyJob implements JobWardenJob
 {
+    public function __construct(
+        private readonly string $mode = 'success',
+        private readonly string $marker = '',
+        private readonly int $sleep_ms = 0,
+        private readonly int $lines = 0,
+        private readonly int $payload_bytes = 128,
+        private readonly int $seconds = 20,
+    ) {
+    }
+
     public function handle(JobContext $context): void
     {
-        $mode = (string) ($context->params['mode'] ?? 'success');
-        $marker = (string) ($context->params['marker'] ?? '');
+        Log::info('chaos job entered', ['step' => 'chaos_start', 'mode' => $this->mode]);
 
-        Log::info('chaos job entered', ['step' => 'chaos_start', 'mode' => $mode]);
-
-        match ($mode) {
-            'success' => $this->succeed($context, $marker),
-            'logstorm' => $this->logstorm($context, $marker),
-            'artifact' => $this->artifact($context, $marker),
-            'stderr' => $this->stderr($context, $marker),
+        match ($this->mode) {
+            'success' => $this->succeed($context),
+            'logstorm' => $this->logstorm($context),
+            'artifact' => $this->artifact($context),
+            'stderr' => $this->stderr($context),
             'throw' => $this->throw($context),
             'crash' => $this->crash($context),
-            'stubborn' => $this->stubborn($context, $marker),
-            default => throw new RuntimeException("unknown chaos mode [{$mode}]"),
+            'stubborn' => $this->stubborn($context),
+            default => throw new RuntimeException("unknown chaos mode [{$this->mode}]"),
         };
 
-        Log::info('chaos job leaving normally', ['step' => 'chaos_done', 'mode' => $mode]);
+        Log::info('chaos job leaving normally', ['step' => 'chaos_done', 'mode' => $this->mode]);
     }
 
     public function idempotent(): bool
@@ -41,46 +50,47 @@ final class ChaosMonkeyJob implements JobWardenJob
         return true;
     }
 
-    private function succeed(JobContext $context, string $marker): void
+    private function succeed(JobContext $context): void
     {
-        $sleepMs = (int) ($context->params['sleep_ms'] ?? 0);
-        if ($sleepMs > 0) {
-            usleep($sleepMs * 1000);
+        if ($this->sleep_ms > 0) {
+            usleep($this->sleep_ms * 1000);
         }
 
-        $this->mark($marker, 'success', $context);
+        $this->mark('success', $context);
     }
 
-    private function logstorm(JobContext $context, string $marker): void
+    private function logstorm(JobContext $context): void
     {
-        $lines = (int) ($context->params['lines'] ?? 25);
+        $lines = $this->lines > 0 ? $this->lines : 25;
         for ($i = 1; $i <= $lines; $i++) {
             Log::info("chaos logstorm {$i}/{$lines}", ['step' => 'logstorm', 'i' => $i]);
         }
 
-        $this->mark($marker, 'logstorm', $context);
+        $this->mark('logstorm', $context);
     }
 
-    private function artifact(JobContext $context, string $marker): void
+    private function artifact(JobContext $context): void
     {
         $context->artifact('report', 'chaos-summary', [
             'meta' => [
                 'attempt' => $context->attemptNumber,
-                'payload' => str_repeat('x', (int) ($context->params['payload_bytes'] ?? 128)),
+                'payload' => str_repeat('x', $this->payload_bytes),
             ],
         ]);
 
-        $this->mark($marker, 'artifact', $context);
+        $this->mark('artifact', $context);
     }
 
-    private function stderr(JobContext $context, string $marker): void
+    private function stderr(JobContext $context): void
     {
-        $lines = (int) ($context->params['lines'] ?? 8);
+        // php://stderr, NOT the STDERR constant: prefork children close the
+        // constants to reclaim fd 2 into the attempt log (docs/JOB-AUTHORING.md).
+        $lines = $this->lines > 0 ? $this->lines : 8;
         for ($i = 1; $i <= $lines; $i++) {
-            fwrite(STDERR, "CHAOS-STDERR {$context->jobId} {$context->attemptId} {$i}/{$lines}\n");
+            file_put_contents('php://stderr', "CHAOS-STDERR {$context->jobId} {$context->attemptId} {$i}/{$lines}\n");
         }
 
-        $this->mark($marker, 'stderr', $context);
+        $this->mark('stderr', $context);
     }
 
     private function throw(JobContext $context): void
@@ -92,35 +102,34 @@ final class ChaosMonkeyJob implements JobWardenJob
 
     private function crash(JobContext $context): void
     {
-        fwrite(STDERR, "CHAOS-SIGKILL {$context->jobId} {$context->attemptId}\n");
+        file_put_contents('php://stderr', "CHAOS-SIGKILL {$context->jobId} {$context->attemptId}\n");
         posix_kill((int) getmypid(), 9);
         sleep(30);
     }
 
-    private function stubborn(JobContext $context, string $marker): void
+    private function stubborn(JobContext $context): void
     {
         if (function_exists('pcntl_async_signals')) {
             pcntl_async_signals(true);
             pcntl_signal(SIGTERM, static function (): void {
-                fwrite(STDERR, "CHAOS-IGNORED-SIGTERM\n");
+                file_put_contents('php://stderr', "CHAOS-IGNORED-SIGTERM\n");
             });
         }
 
-        $seconds = (int) ($context->params['seconds'] ?? 20);
-        $until = microtime(true) + $seconds;
+        $until = microtime(true) + $this->seconds;
         while (microtime(true) < $until) {
             @time_nanosleep(0, 200_000_000);
         }
 
-        $this->mark($marker, 'stubborn-finished', $context);
+        $this->mark('stubborn-finished', $context);
     }
 
-    private function mark(string $marker, string $status, JobContext $context): void
+    private function mark(string $status, JobContext $context): void
     {
-        if ($marker === '') {
+        if ($this->marker === '') {
             return;
         }
 
-        file_put_contents($marker, "{$status}:{$context->jobId}:{$context->attemptId}\n", FILE_APPEND);
+        file_put_contents($this->marker, "{$status}:{$context->jobId}:{$context->attemptId}\n", FILE_APPEND);
     }
 }

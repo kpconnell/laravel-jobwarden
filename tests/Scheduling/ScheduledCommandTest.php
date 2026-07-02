@@ -86,9 +86,9 @@ final class ScheduledCommandTest extends TestCase
 
     public function test_run_artisan_command_succeeds_on_exit_zero(): void
     {
-        $ctx = new JobContext('j', 'a', 1, ['command' => 'demo:exit', 'arguments' => ['--code' => 0]]);
+        $ctx = new JobContext('j', 'a', 1);
 
-        (new RunArtisanCommand)->handle($ctx); // must not throw
+        (new RunArtisanCommand('demo:exit', ['--code' => 0]))->handle($ctx); // must not throw
 
         $this->assertTrue(true);
     }
@@ -98,8 +98,8 @@ final class ScheduledCommandTest extends TestCase
         $this->expectException(RuntimeException::class);
         $this->expectExceptionMessage('exited with code 3');
 
-        $ctx = new JobContext('j', 'a', 1, ['command' => 'demo:exit', 'arguments' => ['--code' => 3]]);
-        (new RunArtisanCommand)->handle($ctx);
+        $ctx = new JobContext('j', 'a', 1);
+        (new RunArtisanCommand('demo:exit', ['--code' => 3]))->handle($ctx);
     }
 
     // -- idempotency declaration drives host-loss recovery -----------------

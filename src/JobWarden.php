@@ -153,9 +153,10 @@ class JobWarden
      *
      * @param  array<string,mixed>  $params
      * @param  array<string,mixed>  $options  idempotent, max_attempts, priority,
-     *                                         available_at, backoff_strategy,
-     *                                         max_runtime_sec, name, idempotency_key,
-     *                                         tags, batch_id, created_by
+     *                                         delay (seconds), available_at,
+     *                                         backoff_strategy, max_runtime_sec,
+     *                                         name, idempotency_key, tags,
+     *                                         batch_id, created_by
      */
     public function dispatch(string $jobClass, array $params = [], array $options = []): Job
     {
@@ -163,11 +164,14 @@ class JobWarden
 
         // Delay is measured against the DB clock, so available_at lands in the DB's
         // timezone frame regardless of app.timezone — the claim/admit compare it against
-        // CURRENT_TIMESTAMP. A user-supplied available_at is an absolute instant, so its
-        // offset from "now" is timezone-agnostic.
-        $delaySeconds = isset($options['available_at'])
-            ? (int) ceil(SqlTime::now($conn)->diffInSeconds(Carbon::parse($options['available_at']), false))
-            : 0;
+        // CURRENT_TIMESTAMP. A 'delay' in seconds is already an offset from "now" and
+        // feeds nowPlus() directly, no clock read needed; a user-supplied available_at
+        // is an absolute instant, so its offset from "now" is timezone-agnostic.
+        $delaySeconds = match (true) {
+            isset($options['delay']) => (int) $options['delay'],
+            isset($options['available_at']) => (int) ceil(SqlTime::now($conn)->diffInSeconds(Carbon::parse($options['available_at']), false)),
+            default => 0,
+        };
         $eligible = $delaySeconds <= 0;
 
         return $conn->transaction(function () use ($conn, $jobClass, $params, $options, $eligible, $delaySeconds): Job {

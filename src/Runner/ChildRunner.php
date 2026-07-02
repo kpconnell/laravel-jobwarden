@@ -5,7 +5,6 @@ declare(strict_types=1);
 namespace JobWarden\Runner;
 
 use JobWarden\Contracts\JobWardenJob;
-use JobWarden\Contracts\Terminable;
 use JobWarden\Logging\JobLogCapture;
 use JobWarden\Models\JobAttempt;
 use JobWarden\Process\Contracts\ProcessProbe;
@@ -33,6 +32,9 @@ final class ChildRunner
 {
     /** Head cap on the stored trace string — keeps the throw site, bounds bloat. */
     private const MAX_TRACE_CHARS = 8000;
+
+    /** Set by the SIGTERM handler; handlers observe it via JobContext::stopRequested(). */
+    private bool $stopRequested = false;
 
     public function __construct(
         private readonly StateMachine $stateMachine,
@@ -119,11 +121,15 @@ final class ChildRunner
                 (string) $job->id,
                 $attemptId,
                 (int) $attempt->attempt_number,
-                (array) ($job->params ?? []),
+                fn (): bool => $this->stopRequested,
             );
 
+            // handle() is invoked THROUGH the container: class-typed parameters
+            // beyond JobContext are method-injected per-run (constructors are
+            // data-only — see HandlerFactory). Keyed by class, not name, since
+            // the interface doesn't pin the parameter's variable name.
             $handlerStart = microtime(true);
-            $handler->handle($context);
+            app()->call([$handler, 'handle'], [JobContext::class => $context]);
             $handlerWallMs = (microtime(true) - $handlerStart) * 1000.0;
         } catch (\Throwable $e) {
             Log::error('Job failed: '.$e->getMessage(), ['step' => 'failed', 'exception' => $e::class]);
@@ -286,10 +292,12 @@ final class ChildRunner
 
         pcntl_async_signals(true);
         // The supervisor escalates SIGTERM → SIGKILL; a non-cooperative handler is
-        // killed and recorded `stopped` by the supervisor. Terminable jobs that
-        // poll for a stop can checkpoint within the grace window.
-        pcntl_signal(SIGTERM, static function (): void {
-            // Flag-only; cooperative handlers observe via their own loop.
+        // killed and recorded `stopped` by the supervisor. Cooperative handlers
+        // poll JobContext::stopRequested() and can checkpoint within the grace
+        // window. Flag-only on purpose: invoking handler code from an async
+        // signal frame would re-enter it mid-operation (mid-transaction, even).
+        pcntl_signal(SIGTERM, function (): void {
+            $this->stopRequested = true;
         });
     }
 }

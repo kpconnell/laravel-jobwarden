@@ -11,13 +11,13 @@ use JobWarden\Runner\JobContext;
 use JobWarden\Tests\TestCase;
 use Carbon\CarbonImmutable;
 use Illuminate\Contracts\Config\Repository;
-use Illuminate\Contracts\Container\BindingResolutionException;
 
 /**
  * Constructor param binding: params (JSON) matched to constructor parameters by
- * exact name, enums/date-times coerced, services container-resolved — and the
- * silent-wrong container fallbacks (empty Model, Carbon "now") turned into loud
- * failures.
+ * exact name, enums/date-times coerced. Constructors are DATA-ONLY — a
+ * service-typed parameter is refused (services are method-injected into
+ * handle()), and the silent-wrong container fallbacks (empty Model, Carbon
+ * "now") are loud failures.
  */
 final class HandlerFactoryTest extends TestCase
 {
@@ -26,20 +26,29 @@ final class HandlerFactoryTest extends TestCase
         return new HandlerFactory;
     }
 
-    public function test_binds_scalars_and_arrays_by_name_and_resolves_services(): void
+    public function test_binds_scalars_and_arrays_by_name(): void
     {
         $job = $this->factory()->make(ScalarParamsJob::class, [
             'name' => 'catalog',
             'count' => 3,
             'tags' => ['a', 'b'],
-            'unrelated' => 'ignored, stays in JobContext::$params',
+            'unrelated' => 'ignored by binding (schedule/API metadata may ride along)',
         ]);
 
         \assert($job instanceof ScalarParamsJob);
         $this->assertSame('catalog', $job->name);
         $this->assertSame(3, $job->count);
         $this->assertSame(['a', 'b'], $job->tags);
-        $this->assertInstanceOf(Repository::class, $job->config);
+    }
+
+    public function test_service_typed_constructor_param_is_refused(): void
+    {
+        // Constructors are data-only: services belong in handle(), where the
+        // container method-injects them per-run.
+        $this->expectException(\RuntimeException::class);
+        $this->expectExceptionMessage('is a service');
+
+        $this->factory()->make(ServiceParamJob::class, ['name' => 'n']);
     }
 
     public function test_numeric_string_binds_to_int_param_via_weak_coercion(): void
@@ -63,7 +72,8 @@ final class HandlerFactoryTest extends TestCase
 
     public function test_missing_required_scalar_fails_loud(): void
     {
-        $this->expectException(BindingResolutionException::class);
+        $this->expectException(\RuntimeException::class);
+        $this->expectExceptionMessage('has no matching params key');
 
         $this->factory()->make(ScalarParamsJob::class, ['count' => 1]); // no 'name'
     }
@@ -156,7 +166,7 @@ final class HandlerFactoryTest extends TestCase
     public function test_unbound_required_date_is_refused_not_resolved_to_now(): void
     {
         $this->expectException(\RuntimeException::class);
-        $this->expectExceptionMessage('is data, not a service');
+        $this->expectExceptionMessage('has no matching params key');
 
         $this->factory()->make(DateParamsJob::class, [
             'plain' => '2026-07-01T00:00:00Z',
@@ -175,7 +185,7 @@ final class HandlerFactoryTest extends TestCase
     public function test_unbound_model_param_is_refused_not_resolved_to_an_empty_instance(): void
     {
         $this->expectException(\RuntimeException::class);
-        $this->expectExceptionMessage('is data, not a service');
+        $this->expectExceptionMessage('model hydration is not supported');
 
         $this->factory()->make(ModelParamJob::class, []);
     }
@@ -231,10 +241,18 @@ abstract class FixtureJob implements JobWardenJob
 final class ScalarParamsJob extends FixtureJob
 {
     public function __construct(
-        public readonly Repository $config,
         public readonly string $name,
         public readonly int $count,
         public readonly array $tags = [],
+    ) {
+    }
+}
+
+final class ServiceParamJob extends FixtureJob
+{
+    public function __construct(
+        public readonly Repository $config,
+        public readonly string $name,
     ) {
     }
 }

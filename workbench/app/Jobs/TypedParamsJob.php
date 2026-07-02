@@ -10,15 +10,14 @@ use Carbon\CarbonImmutable;
 use Illuminate\Contracts\Config\Repository;
 
 /**
- * Exercises constructor param binding: promoted data params (scalar, enum,
- * optional date-time) bound by name from the params JSON, alongside a service
- * resolved by the container. Writes what it received to `marker` so tests can
- * assert the binding end-to-end.
+ * Exercises the two halves of handler DI end-to-end: a data-only constructor
+ * (scalar, enum, optional date-time) bound by name from the params JSON, and a
+ * service method-injected into handle() by the container. Writes what it
+ * received to `marker` so tests can assert both bindings.
  */
 final class TypedParamsJob implements JobWardenJob
 {
     public function __construct(
-        private readonly Repository $config,            // service: container DI
         private readonly string $marker,                // data: required param
         private readonly ImportMode $mode,              // data: enum, coerced from "full"
         private readonly int $limit = 10,               // data: optional, JSON default
@@ -26,14 +25,14 @@ final class TypedParamsJob implements JobWardenJob
     ) {
     }
 
-    public function handle(JobContext $context): void
+    public function handle(JobContext $context, ?Repository $config = null): void
     {
         file_put_contents($this->marker, json_encode([
             'mode' => $this->mode->value,
             'limit' => $this->limit,
             'as_of' => $this->asOf?->toIso8601String(),
-            'service_resolved' => $this->config instanceof Repository,
-            'context_params' => $context->params, // the full array still flows
+            'service_resolved' => $config instanceof Repository, // handle() method injection
+            'attempt' => $context->attemptNumber,
         ]));
     }
 

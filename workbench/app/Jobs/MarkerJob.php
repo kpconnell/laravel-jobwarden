@@ -13,15 +13,20 @@ use JobWarden\Runner\JobContext;
  */
 final class MarkerJob implements JobWardenJob
 {
+    public function __construct(
+        private readonly int $sleep = 0,
+        private readonly string $marker = '',
+    ) {
+    }
+
     public function handle(JobContext $context): void
     {
-        $sleep = (int) ($context->params['sleep'] ?? 0);
-        if ($sleep > 0) {
-            sleep($sleep);
+        if ($this->sleep > 0) {
+            sleep($this->sleep);
         }
 
-        if (! empty($context->params['marker'])) {
-            file_put_contents((string) $context->params['marker'], 'done:'.$context->attemptId);
+        if ($this->marker !== '') {
+            file_put_contents($this->marker, 'done:'.$context->attemptId);
         }
     }
 

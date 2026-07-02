@@ -14,15 +14,20 @@ use JobWarden\Runner\JobContext;
  */
 final class CrashJob implements JobWardenJob
 {
+    public function __construct(private readonly string $marker = '')
+    {
+    }
+
     public function handle(JobContext $context): void
     {
-        if (! empty($context->params['marker'])) {
-            file_put_contents((string) $context->params['marker'], 'reached');
+        if ($this->marker !== '') {
+            file_put_contents($this->marker, 'reached');
         }
 
         // Raw output that bypasses the Log facade — the kind of "dying words"
-        // the supervisor must drain into job_logs on reap.
-        fwrite(STDERR, "JOBWARDEN-DYING-WORDS: about to be SIGKILLed\n");
+        // the supervisor must drain into job_logs on reap. Via php://stderr, NOT
+        // the STDERR constant, which prefork children close (docs/JOB-AUTHORING.md).
+        file_put_contents('php://stderr', "JOBWARDEN-DYING-WORDS: about to be SIGKILLed\n");
 
         posix_kill((int) getmypid(), 9); // SIGKILL self
         sleep(30); // never reached

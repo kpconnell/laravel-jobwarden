@@ -26,18 +26,24 @@ use Symfony\Component\Console\Output\BufferedOutput;
  */
 final class RunArtisanCommand implements JobWardenJob
 {
+    public function __construct(
+        private readonly string $command,
+        private readonly array $arguments = [],
+    ) {
+    }
+
     public function handle(JobContext $context): void
     {
-        $command = (string) ($context->params['command'] ?? '');
-        if ($command === '') {
-            throw new RuntimeException('RunArtisanCommand requires a "command" param.');
+        // A missing 'command' key already failed loud at constructor binding;
+        // this guards an explicitly-empty one.
+        if ($this->command === '') {
+            throw new RuntimeException('RunArtisanCommand requires a non-empty "command" param.');
         }
-        $arguments = (array) ($context->params['arguments'] ?? []);
 
-        Log::info("running artisan command: {$command}", ['step' => 'command', 'arguments' => $arguments]);
+        Log::info("running artisan command: {$this->command}", ['step' => 'command', 'arguments' => $this->arguments]);
 
         $output = new BufferedOutput;
-        $exitCode = Artisan::call($command, $arguments, $output);
+        $exitCode = Artisan::call($this->command, $this->arguments, $output);
 
         // Surface the command's own output into the job log, line by line, so it
         // shows up in `jobwarden:logs` instead of being swallowed.
@@ -48,10 +54,10 @@ final class RunArtisanCommand implements JobWardenJob
         }
 
         if ($exitCode !== 0) {
-            throw new RuntimeException("artisan command [{$command}] exited with code {$exitCode}");
+            throw new RuntimeException("artisan command [{$this->command}] exited with code {$exitCode}");
         }
 
-        Log::info("artisan command [{$command}] succeeded", ['step' => 'command']);
+        Log::info("artisan command [{$this->command}] succeeded", ['step' => 'command']);
     }
 
     public function idempotent(): bool

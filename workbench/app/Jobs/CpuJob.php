@@ -16,15 +16,18 @@ use RuntimeException;
  */
 final class CpuJob implements JobWardenJob
 {
+    public function __construct(private readonly int $cpu = 200_000)
+    {
+    }
+
     public function handle(JobContext $context): void
     {
         if (random_int(1, 100) === 1) {
             $this->misbehave();
         }
 
-        $iterations = (int) ($context->params['cpu'] ?? 200_000);
         $h = 'jobwarden';
-        for ($i = 0; $i < $iterations; $i++) {
+        for ($i = 0; $i < $this->cpu; $i++) {
             $h = hash('sha256', $h.$i);
         }
         if ($h === '') {

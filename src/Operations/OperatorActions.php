@@ -81,10 +81,12 @@ final class OperatorActions
         // transition never leaves the flags mutated without the re-queue.
         $this->connection()->transaction(function () use ($job, $reason, $actorId): void {
             $this->connection()->table($this->tbl('jobs'))->where('id', $job->id)->update([
-                'available_at' => Carbon::now(),
+                // DB clock (not Carbon::now()) so the re-queued job's eligibility, checked
+                // against CURRENT_TIMESTAMP in the claim, is timezone-agnostic.
+                'available_at' => $this->connection()->raw('CURRENT_TIMESTAMP'),
                 'cancel_requested' => false,
                 'cancel_mode' => null,
-                'updated_at' => Carbon::now(),
+                'updated_at' => $this->connection()->raw('CURRENT_TIMESTAMP'),
             ]);
             $job->refresh();
 

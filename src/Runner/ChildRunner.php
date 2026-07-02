@@ -19,7 +19,6 @@ use JobWarden\StateMachine\TransitionContext;
 use JobWarden\States\ActorType;
 use JobWarden\States\AttemptState;
 use JobWarden\States\JobState;
-use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 
@@ -226,7 +225,8 @@ final class ChildRunner
 
         $attempt->forceFill([
             'error' => $error,
-            'finished_at' => Carbon::now(),
+            // finished_at is stamped by the terminal StateMachine transition (DB clock);
+            // never here on the app clock — the reconcile sweep compares it DB-side.
         ])->save();
 
         $job->forceFill(['last_error' => $error])->saveQuietly();

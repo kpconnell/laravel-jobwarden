@@ -11,7 +11,7 @@ use JobWarden\StateMachine\StateMachine;
 use JobWarden\StateMachine\TransitionContext;
 use JobWarden\States\ActorType;
 use JobWarden\States\JobState;
-use Illuminate\Support\Carbon;
+use JobWarden\Support\SqlTime;
 
 /**
  * The admit pass (spec §5.4 recovery / §3.3): promotes jobs that have become
@@ -32,11 +32,15 @@ final class Admitter
 
     private function promote(JobState $from, int $limit): int
     {
-        $now = Carbon::now();
+        // Eligibility is evaluated against the DB clock, not the app clock — available_at is
+        // stored in the DB's timezone frame (see JobWarden::dispatch / scheduleRetry), so an
+        // app-clock comparison would drift under any TZ mismatch. nowExpr honors
+        // Carbon::setTestNow() so time-travel tests still exercise the delay.
+        $now = SqlTime::nowExpr(Job::query()->getConnection());
 
         $jobs = Job::query()
             ->where('state', $from->value)
-            ->where(fn ($q) => $q->whereNull('available_at')->orWhere('available_at', '<=', $now))
+            ->where(fn ($q) => $q->whereNull('available_at')->orWhereRaw("available_at <= {$now}"))
             ->orderBy('available_at')
             ->limit($limit)
             ->get();

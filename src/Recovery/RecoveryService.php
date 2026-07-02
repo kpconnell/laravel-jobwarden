@@ -11,7 +11,7 @@ use JobWarden\StateMachine\StateMachine;
 use JobWarden\StateMachine\TransitionContext;
 use JobWarden\States\ActorType;
 use JobWarden\States\JobState;
-use Illuminate\Support\Carbon;
+use JobWarden\Support\SqlTime;
 use Illuminate\Support\Facades\DB;
 
 /**
@@ -129,7 +129,7 @@ class RecoveryService
     public function scheduleRetry(Job $job, JobState $from, ActorType $actor, string $reason): void
     {
         $backoff = Backoff::fromConfig((int) $job->attempt_count, $job->backoff_strategy);
-        $this->setAvailableAt($job, Carbon::now()->addSeconds($backoff));
+        $this->setAvailableAt($job, $backoff);
 
         $this->stateMachine->applyJobTransition(
             $job,
@@ -138,13 +138,17 @@ class RecoveryService
         );
     }
 
-    private function setAvailableAt(Job $job, Carbon $when): void
+    private function setAvailableAt(Job $job, int $delaySeconds): void
     {
-        DB::connection(config('jobwarden.connection'))
-            ->table(((string) config('jobwarden.table_prefix')).'jobs')
-            ->where('id', $job->id)
-            ->update(['available_at' => $when, 'updated_at' => Carbon::now()]);
+        $conn = DB::connection(config('jobwarden.connection'));
 
-        $job->available_at = $when; // keep the in-memory model honest (not a state change)
+        // DB-clock: available_at = the DB's now + backoff, so the retry's eligibility
+        // (checked by the admit/claim against CURRENT_TIMESTAMP) is timezone-agnostic.
+        $conn->table(((string) config('jobwarden.table_prefix')).'jobs')
+            ->where('id', $job->id)
+            ->update([
+                'available_at' => $conn->raw(SqlTime::nowPlus($conn, $delaySeconds)),
+                'updated_at' => $conn->raw('CURRENT_TIMESTAMP'),
+            ]);
     }
 }

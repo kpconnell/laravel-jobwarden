@@ -11,8 +11,10 @@ use JobWarden\Models\Batch;
 use JobWarden\Models\Job;
 use JobWarden\Models\Schedule;
 use JobWarden\States\JobState;
+use JobWarden\Support\SqlTime;
 use Closure;
 use Illuminate\Support\Carbon;
+use Illuminate\Support\Facades\DB;
 
 /**
  * The entry-point service for putting work into JobWarden. It does NOT hijack
@@ -157,28 +159,49 @@ class JobWarden
      */
     public function dispatch(string $jobClass, array $params = [], array $options = []): Job
     {
-        $availableAt = $options['available_at'] ?? Carbon::now();
-        $eligible = Carbon::parse($availableAt)->lessThanOrEqualTo(Carbon::now());
+        $conn = DB::connection(config('jobwarden.connection'));
 
-        return Job::create([
-            'job_class' => $jobClass,
-            'name' => $options['name'] ?? null,
-            'lane' => $options['lane'] ?? 'default',
-            'params' => $params,
-            'idempotent' => (bool) ($options['idempotent'] ?? false),
-            'idempotency_key' => $options['idempotency_key'] ?? null,
-            'priority' => (int) ($options['priority'] ?? 0),
-            'state' => $eligible ? JobState::Queued : JobState::Pending,
-            'available_at' => $availableAt,
-            'max_attempts' => (int) ($options['max_attempts'] ?? config('jobwarden.retry.max_attempts', 1)),
-            'attempt_count' => 0,
-            'max_runtime_sec' => $options['max_runtime_sec'] ?? config('jobwarden.stuck.max_runtime_sec'),
-            'backoff_strategy' => $options['backoff_strategy'] ?? config('jobwarden.retry.backoff.strategy'),
-            'tags' => $options['tags'] ?? null,
-            'batch_id' => $options['batch_id'] ?? null,
-            'schedule_id' => $options['schedule_id'] ?? null,
-            'created_by' => $options['created_by'] ?? null,
-            'queued_at' => $eligible ? Carbon::now() : null,
-        ]);
+        // Delay is measured against the DB clock, so available_at lands in the DB's
+        // timezone frame regardless of app.timezone — the claim/admit compare it against
+        // CURRENT_TIMESTAMP. A user-supplied available_at is an absolute instant, so its
+        // offset from "now" is timezone-agnostic.
+        $delaySeconds = isset($options['available_at'])
+            ? (int) ceil(SqlTime::now($conn)->diffInSeconds(Carbon::parse($options['available_at']), false))
+            : 0;
+        $eligible = $delaySeconds <= 0;
+
+        return $conn->transaction(function () use ($conn, $jobClass, $params, $options, $eligible, $delaySeconds): Job {
+            $job = Job::create([
+                'job_class' => $jobClass,
+                'name' => $options['name'] ?? null,
+                'lane' => $options['lane'] ?? 'default',
+                'params' => $params,
+                'idempotent' => (bool) ($options['idempotent'] ?? false),
+                'idempotency_key' => $options['idempotency_key'] ?? null,
+                'priority' => (int) ($options['priority'] ?? 0),
+                'state' => $eligible ? JobState::Queued : JobState::Pending,
+                'max_attempts' => (int) ($options['max_attempts'] ?? config('jobwarden.retry.max_attempts', 1)),
+                'attempt_count' => 0,
+                'max_runtime_sec' => $options['max_runtime_sec'] ?? config('jobwarden.stuck.max_runtime_sec'),
+                'backoff_strategy' => $options['backoff_strategy'] ?? config('jobwarden.retry.backoff.strategy'),
+                'tags' => $options['tags'] ?? null,
+                'batch_id' => $options['batch_id'] ?? null,
+                'schedule_id' => $options['schedule_id'] ?? null,
+                'created_by' => $options['created_by'] ?? null,
+            ]);
+
+            // Stamp the DB-clock timestamps via the query builder (Eloquent's datetime cast
+            // rejects a raw CURRENT_TIMESTAMP, and a stored Carbon would be re-serialized in
+            // the app timezone). available_at = now (or now + delay); queued_at = now if it
+            // went straight to the queue.
+            $conn->table($job->getTable())
+                ->where($job->getKeyName(), $job->getKey())
+                ->update([
+                    'available_at' => $conn->raw($eligible ? SqlTime::nowExpr($conn) : SqlTime::nowPlus($conn, $delaySeconds)),
+                    'queued_at' => $eligible ? $conn->raw(SqlTime::nowExpr($conn)) : null,
+                ]);
+
+            return $job->refresh();
+        });
     }
 }

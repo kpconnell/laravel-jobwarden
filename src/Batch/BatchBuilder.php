@@ -8,6 +8,7 @@ use JobWarden\Models\Batch;
 use JobWarden\Models\Job;
 use JobWarden\States\BatchState;
 use JobWarden\States\JobState;
+use JobWarden\Support\SqlTime;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
 use RuntimeException;
@@ -66,6 +67,7 @@ final class BatchBuilder
             ]);
 
             $ids = [];
+            $dbNow = SqlTime::now($conn); // the DB clock, once, for eligibility math
             foreach ($this->specs as $key => $spec) {
                 // A member is claimable immediately only if it has no deps AND its
                 // available_at is due. A future available_at (per-member delay /
@@ -73,8 +75,12 @@ final class BatchBuilder
                 // API) starts it `pending`; the admit pass promotes it once due —
                 // the same rule JobWarden::dispatch() applies. Pending/Queued share
                 // the pending_count bucket, so the starting state is counter-neutral.
-                $availableAt = Carbon::parse($spec['options']['available_at'] ?? Carbon::now());
-                $eligible = $spec['dependsOn'] === [] && $availableAt->lessThanOrEqualTo(Carbon::now());
+                // Delay is measured against the DB clock so available_at lands in the DB
+                // timezone frame (the claim/admit compare it against CURRENT_TIMESTAMP).
+                $delaySeconds = isset($spec['options']['available_at'])
+                    ? (int) ceil($dbNow->diffInSeconds(Carbon::parse($spec['options']['available_at']), false))
+                    : 0;
+                $eligible = $spec['dependsOn'] === [] && $delaySeconds <= 0;
                 $job = Job::create([
                     'batch_id' => $batch->id,
                     'job_class' => $spec['jobClass'],
@@ -83,12 +89,17 @@ final class BatchBuilder
                     'idempotent' => (bool) ($spec['options']['idempotent'] ?? false),
                     'priority' => (int) ($spec['options']['priority'] ?? 0),
                     'state' => $eligible ? JobState::Queued : JobState::Pending,
-                    'available_at' => $availableAt,
                     'max_attempts' => (int) ($spec['options']['max_attempts'] ?? config('jobwarden.retry.max_attempts', 1)),
                     'attempt_count' => 0,
                     'backoff_strategy' => $spec['options']['backoff_strategy'] ?? config('jobwarden.retry.backoff.strategy'),
-                    'queued_at' => $eligible ? Carbon::now() : null,
                 ]);
+                // available_at/queued_at from the DB clock (see JobWarden::dispatch()).
+                $conn->table($job->getTable())
+                    ->where($job->getKeyName(), $job->getKey())
+                    ->update([
+                        'available_at' => $conn->raw($delaySeconds > 0 ? SqlTime::nowPlus($conn, $delaySeconds) : SqlTime::nowExpr($conn)),
+                        'queued_at' => $eligible ? $conn->raw(SqlTime::nowExpr($conn)) : null,
+                    ]);
                 $ids[$key] = $job->id;
             }
 

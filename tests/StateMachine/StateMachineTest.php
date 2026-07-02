@@ -114,6 +114,15 @@ final class StateMachineTest extends TestCase
         $this->assertSame(JobState::Retrying, Job::find($job->id)->state);
     }
 
+    public function test_operator_can_restart_a_stopped_job(): void
+    {
+        $job = Job::create(['job_class' => 'X', 'state' => JobState::Stopped]);
+
+        $this->sm->applyJobTransition($job, JobState::Queued, TransitionContext::for(ActorType::Operator, 'op-1'));
+
+        $this->assertSame(JobState::Queued, Job::find($job->id)->state);
+    }
+
     public function test_attempt_terminal_report_requires_the_fencing_token(): void
     {
         [$job, $attempt] = $this->runningAttempt();

@@ -13,9 +13,9 @@ final class RestartCommand extends Command
 {
     use ResolvesJob;
 
-    protected $signature = 'jobwarden:restart {job : id or prefix} {--reason=operator restart} {--force : restart a non-idempotent parked orphan}';
+    protected $signature = 'jobwarden:restart {job : id or prefix} {--reason=operator restart} {--force : restart a non-idempotent job}';
 
-    protected $description = 'Restart a parked orphaned job (explicit, audited override).';
+    protected $description = 'Restart a parked orphaned or stopped job (explicit, audited override).';
 
     public function handle(OperatorActions $ops): int
     {
@@ -26,14 +26,14 @@ final class RestartCommand extends Command
             return self::FAILURE;
         }
 
-        if ($job->state !== JobState::Orphaned) {
-            $this->error("job is {$job->state->value}, not orphaned");
+        if (! in_array($job->state, [JobState::Orphaned, JobState::Stopped], true)) {
+            $this->error("job is {$job->state->value}, not orphaned or stopped");
 
             return self::FAILURE;
         }
 
         if (! $job->idempotent && ! $this->option('force')) {
-            $this->warn('job is NOT idempotent and the prior attempt is indeterminate — re-running may double side effects. Pass --force.');
+            $this->warn('job is NOT idempotent — re-running may double side effects. Pass --force.');
 
             return self::FAILURE;
         }

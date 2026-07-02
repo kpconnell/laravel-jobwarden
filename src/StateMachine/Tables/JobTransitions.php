@@ -56,6 +56,7 @@ final class JobTransitions implements TransitionTable
 
             // operator overrides (audited) — spec §10.1
             new Transition(S::Orphaned, S::Queued, [A::Operator]),  // restart a parked orphan
+            new Transition(S::Stopped, S::Queued, [A::Operator]),   // restart stopped work
             new Transition(S::Failed, S::Queued, [A::Operator]),    // retry a failed job
         ];
 

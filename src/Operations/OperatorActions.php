@@ -42,12 +42,14 @@ final class OperatorActions
     /** Operator retry of a FAILED job → re-queue, minting a fresh attempt. */
     public function retry(Job $job, string $reason, ?string $actorId = null): void
     {
+        $this->assertState($job, [JobState::Failed], 'retry');
         $this->requeue($job, $reason, $actorId);
     }
 
-    /** Operator restart of a parked ORPHAN → re-queue (override, even non-idempotent). */
+    /** Operator restart of a parked ORPHAN or STOPPED job → re-queue. */
     public function restart(Job $job, string $reason, ?string $actorId = null): void
     {
+        $this->assertState($job, [JobState::Orphaned, JobState::Stopped], 'restart');
         $this->requeue($job, $reason, $actorId);
     }
 
@@ -107,6 +109,17 @@ final class OperatorActions
             'cancel_requested_at' => Carbon::now(),
             'updated_at' => Carbon::now(),
         ]);
+    }
+
+    /** @param list<JobState> $allowed */
+    private function assertState(Job $job, array $allowed, string $action): void
+    {
+        if (in_array($job->state, $allowed, true)) {
+            return;
+        }
+
+        $states = implode(' or ', array_map(static fn (JobState $state): string => $state->value, $allowed));
+        throw new \InvalidArgumentException("Cannot {$action} a {$job->state->value} job; expected {$states}.");
     }
 
     private function connection(): \Illuminate\Database\Connection

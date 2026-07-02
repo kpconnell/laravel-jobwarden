@@ -105,6 +105,17 @@ final class OperatorApiTest extends TestCase
         $this->assertSame(JobState::Canceled, $job->refresh()->state);
     }
 
+    public function test_restart_action_requeues_a_stopped_job(): void
+    {
+        $job = Job::create(['job_class' => 'X', 'state' => JobState::Stopped]);
+
+        $this->postJson("jobwarden/api/jobs/{$job->id}/restart", ['reason' => 'run it again'])
+            ->assertOk()
+            ->assertJsonPath('state', JobState::Queued->value);
+
+        $this->assertSame(JobState::Queued, $job->refresh()->state);
+    }
+
     public function test_create_a_command_schedule(): void
     {
         $payload = [

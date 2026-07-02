@@ -83,6 +83,18 @@ final class DashboardTest extends TestCase
         $this->assertSame(JobState::Canceled, $job->refresh()->state);
     }
 
+    public function test_job_detail_restart_action_requeues_a_stopped_job(): void
+    {
+        $job = Job::create(['job_class' => 'X', 'state' => JobState::Stopped]);
+
+        Livewire::test(JobShow::class, ['job' => $job->id])
+            ->assertOk()
+            ->call('restart')
+            ->assertSee('restarted');
+
+        $this->assertSame(JobState::Queued, $job->refresh()->state);
+    }
+
     public function test_job_detail_view_all_logs_dialog(): void
     {
         $job = Job::create(['job_class' => 'X', 'state' => JobState::Failed]);

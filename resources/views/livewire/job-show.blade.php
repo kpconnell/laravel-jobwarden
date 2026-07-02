@@ -5,8 +5,8 @@
     @if ($flash)<div class="flash">{{ $flash }}</div>@endif
 
     @php($active = in_array($job->state->value, ['pending','queued','running','retrying','orphaned']))
-    @php($failed = in_array($job->state->value, ['failed','orphaned']))
-    @php($terminal = in_array($job->state->value, ['succeeded','failed','canceled','stopped']))
+    @php($failed = $job->state->value === 'failed')
+    @php($restartable = in_array($job->state->value, ['orphaned','stopped']))
     <div class="btn-row" style="margin-bottom:16px">
         @if ($active)
             <button class="btn danger" wire:click="cancel" wire:confirm="Cancel this job?">Cancel</button>
@@ -15,7 +15,7 @@
         @if ($failed)
             <button class="btn" wire:click="retry">Retry</button>
         @endif
-        @if ($terminal)
+        @if ($restartable)
             <button class="btn" wire:click="restart" wire:confirm="Restart a fresh run?">Restart</button>
         @endif
     </div>

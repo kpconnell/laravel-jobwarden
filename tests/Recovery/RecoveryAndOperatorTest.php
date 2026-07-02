@@ -136,6 +136,19 @@ final class RecoveryAndOperatorTest extends TestCase
         $this->assertSame(JobState::Queued, Job::find($job->id)->state);
     }
 
+    public function test_restart_re_queues_a_stopped_job(): void
+    {
+        $job = $this->seedJob(JobState::Stopped);
+        $job->forceFill(['cancel_requested' => true, 'cancel_mode' => 'stop'])->save();
+
+        $this->ops()->restart($job, 'run it again', 'op-1');
+
+        $job = Job::find($job->id);
+        $this->assertSame(JobState::Queued, $job->state);
+        $this->assertFalse((bool) $job->cancel_requested);
+        $this->assertNull($job->cancel_mode);
+    }
+
     // -- helpers -----------------------------------------------------------
 
     private function seedJob(JobState $state, bool $idempotent = true): Job

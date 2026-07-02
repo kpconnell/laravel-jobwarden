@@ -53,6 +53,12 @@ final class Supervisor
 
     private int $forkCount = 0;
 
+    /** Consecutive full-capacity claims — hysteresis for ramping the poll to the floor. */
+    private int $fullStreak = 0;
+
+    /** The adaptive loop sleep (ms) computed each tick from claim demand; used by run(). */
+    private int $nextPollMs = 500;
+
     public function __construct(
         private readonly ClaimDriverFactory $claimFactory,
         private readonly Admitter $admitter,
@@ -140,7 +146,7 @@ final class Supervisor
                 }
             }
 
-            usleep(((int) config('jobwarden.supervisor.poll_interval_ms', 500)) * 1000);
+            usleep(max(1, $this->nextPollMs) * 1000);
         }
 
         $this->shutdown();
@@ -183,11 +189,14 @@ final class Supervisor
                 ]);
             }
 
+            $this->nextPollMs = (int) config('jobwarden.supervisor.poll_min_ms', 50); // drain briskly
+
             return;
         }
 
         $this->admitter->admit();
-        $this->claimAndSpawn();
+        [$free, $claimed] = $this->claimAndSpawn();
+        $this->nextPollMs = $this->adaptivePollMs($free, $claimed);
     }
 
     public function drain(): void
@@ -207,17 +216,59 @@ final class Supervisor
 
     // -- internals ---------------------------------------------------------
 
-    private function claimAndSpawn(): void
+    /**
+     * @return array{0:int,1:int} [free slots we tried to fill, jobs actually claimed]
+     */
+    private function claimAndSpawn(): array
     {
         $free = $this->capacity - $this->children->count();
         if ($free < 1) {
-            return;
+            return [0, 0];
         }
 
+        $got = 0;
         $driver = $this->claimFactory->make();
         foreach ($driver->claim($this->context, $free) as $claimed) {
             $this->spawn($claimed->attemptId, $claimed->jobId, $claimed->fencingToken);
+            $got++;
         }
+
+        return [$free, $got];
+    }
+
+    /**
+     * Adaptive poll cadence — the loop sleep tracks demand, sensed from the last claim's
+     * fill ratio, so the supervisor stays responsive under load without hammering the DB
+     * when idle:
+     *   - all slots busy  -> floor (reap + refill promptly; there IS work in flight)
+     *   - asked, got none -> idle (the queue is dry, back all the way off)
+     *   - partial fill    -> a middle rung
+     *   - full fill        -> speed up; a SECOND consecutive full fill drops to the floor
+     *     (hysteresis, so one burst doesn't pin us hot).
+     * Rungs: poll_min_ms (floor) / poll_interval_ms (one full fill) / poll_idle_ms (idle),
+     * with the partial rung derived as half the idle ceiling.
+     */
+    private function adaptivePollMs(int $free, int $claimed): int
+    {
+        $min = (int) config('jobwarden.supervisor.poll_min_ms', 50);
+        $full = (int) config('jobwarden.supervisor.poll_interval_ms', 500);
+        $idle = (int) config('jobwarden.supervisor.poll_idle_ms', 5000);
+        $partial = max($full, intdiv($idle, 2));
+
+        if ($free === 0) {
+            return $min;              // saturated — reap + refill fast
+        }
+        if ($claimed === 0) {
+            $this->fullStreak = 0;
+            return $idle;             // dry queue — back off
+        }
+        if ($claimed < $free) {
+            $this->fullStreak = 0;
+            return $partial;          // partial demand
+        }
+
+        $this->fullStreak++;          // full fill
+        return $this->fullStreak >= 2 ? $min : $full;
     }
 
     private function spawn(string $attemptId, string $jobId, int $token): void

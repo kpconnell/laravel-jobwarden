@@ -99,6 +99,13 @@ return [
         'execution_mode' => env('JOBWARDEN_EXECUTION_MODE', 'child'),
         'graceful_timeout' => (int) env('JOBWARDEN_GRACEFUL_TIMEOUT', 10),
         'poll_interval_ms' => (int) env('JOBWARDEN_POLL_INTERVAL_MS', 500),
+        // Adaptive poll cadence: the supervisor senses demand from each claim's fill ratio
+        // (how many of its free slots it actually filled) and adjusts the loop sleep between
+        // poll_min_ms (sustained full demand — reap + refill hot) and poll_idle_ms (nothing
+        // to claim — quiet, so an idle fleet does not hammer the DB with poll queries).
+        // poll_interval_ms above is the "one full fill" rung; the partial rung is derived.
+        'poll_min_ms' => (int) env('JOBWARDEN_POLL_MIN_MS', 50),
+        'poll_idle_ms' => (int) env('JOBWARDEN_POLL_IDLE_MS', 5000),
         // PREFORK only: recycle the long-lived master after this many forks — it drains
         // its in-flight forks, exits, and the launcher restarts it with a fresh, pristine
         // COW baseline. This bounds any slow master-side memory growth that would

@@ -48,14 +48,9 @@ x-host: &host
     # proc_open'ing a fresh `php artisan jobwarden:run` (which cold-boots the framework
     # ~144ms per job). Same per-job PID isolation, minus the boot. See config/jobwarden.php.
     JOBWARDEN_EXECUTION_MODE: "prefork"
-    # EXPERIMENT: the supervisor sleeps this long between loop iterations, so with
-    # the default 500ms a freed slot stays empty until the next tick -> the fleet
-    # runs in waves of `capacity` (period ~= poll interval) and averages
-    # ~capacity/poll = 20/s. Dropping it to 50ms refills slots ~10x sooner to test
-    # whether the waves flatten. If confirmed, replace with adaptive cadence in the
-    # Supervisor (fast under load, back off when idle) so idle fleets don't hammer
-    # the DB at 20 polls/sec.
-    JOBWARDEN_POLL_INTERVAL_MS: "50"
+    # Poll cadence is adaptive (see config/jobwarden.php): the supervisor ramps between
+    # poll_min_ms under sustained load and poll_idle_ms when the queue is dry, so no fixed
+    # JOBWARDEN_POLL_INTERVAL_MS override is needed — the defaults handle both regimes.
   restart: unless-stopped
 
 services:

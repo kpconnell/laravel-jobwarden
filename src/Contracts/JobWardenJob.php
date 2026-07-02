@@ -8,7 +8,10 @@ use JobWarden\Runner\JobContext;
 
 /**
  * The opt-in contract a JobWarden job handler implements. Resolved from the
- * container by `jobs.job_class` and executed in the dedicated child process.
+ * container by `jobs.job_class` and executed in the dedicated child process —
+ * the job's stored params (JSON) bind to constructor parameters BY NAME, with
+ * services container-resolved as usual (see Runner\HandlerFactory and
+ * docs/JOB-AUTHORING.md).
  *
  * JobWarden coexists with Laravel's Bus/Queue — it does not hijack dispatch().
  */

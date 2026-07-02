@@ -90,7 +90,9 @@ publish the config to tune it; see **[docs/CONFIGURATION.md](docs/CONFIGURATION.
 ## Defining a job
 
 A JobWarden job implements one small contract — it receives plain, JSON-serializable `params` (not a serialized
-object graph), and declares whether it is safe to auto-retry:
+object graph), and declares whether it is safe to auto-retry. Params are **bound to constructor parameters by
+name** (services resolve from the container as usual), so handlers get typed, promoted properties instead of
+array digging:
 
 ```php
 use JobWarden\Contracts\JobWardenJob;
@@ -98,9 +100,15 @@ use JobWarden\Runner\JobContext;
 
 final class ImportCatalog implements JobWardenJob
 {
+    public function __construct(
+        private readonly CatalogClient $client,   // service — container DI
+        private readonly string $storeId,         // data — bound from params by name
+        private readonly bool $fullSync = false,  // data — optional param
+    ) {
+    }
+
     public function handle(JobContext $context): void
     {
-        $storeId = $context->params['store_id'];
         // ... do the work; throwing = failure, returning = success ...
     }
 
@@ -111,12 +119,17 @@ final class ImportCatalog implements JobWardenJob
 }
 ```
 
+Backed enums and date-times coerce from their JSON representations; Eloquent models are deliberately not
+hydrated (pass the key, fetch in `handle()`); the full params array also remains available as
+`$context->params`. See **[docs/JOB-AUTHORING.md](docs/JOB-AUTHORING.md)** for the binding rules, supported
+types, and everything available inside a run.
+
 ## Dispatching
 
 ```php
 use JobWarden\JobWarden;
 
-app(JobWarden::class)->dispatch(ImportCatalog::class, ['store_id' => 42], [
+app(JobWarden::class)->dispatch(ImportCatalog::class, ['storeId' => 'store-42'], [
     'idempotent'   => true,
     'max_attempts' => 3,
     'priority'     => 10,

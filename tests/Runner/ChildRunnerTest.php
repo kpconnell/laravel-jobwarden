@@ -14,6 +14,7 @@ use JobWarden\Tests\Concerns\RefreshesJobWardenSchema;
 use JobWarden\Tests\TestCase;
 use Workbench\App\Jobs\FailingJob;
 use Workbench\App\Jobs\MarkerJob;
+use Workbench\App\Jobs\TypedParamsJob;
 
 /**
  * The child's logic, run in-process (no subprocess): token verification,
@@ -88,6 +89,46 @@ final class ChildRunnerTest extends TestCase
         $job = Job::find($job->id);
         $this->assertSame(JobState::Retrying, $job->state);
         $this->assertTrue($job->available_at->isFuture(), 'retry should be delayed by backoff');
+    }
+
+    public function test_constructor_params_bind_by_name_with_enum_and_date_coercion(): void
+    {
+        $marker = $this->runtime.'/typed.json';
+        [$job, $attempt] = $this->dispatched(TypedParamsJob::class, [
+            'marker' => $marker,
+            'mode' => 'full',                       // → ImportMode::Full
+            'limit' => 25,
+            'asOf' => '2026-07-01T09:00:00Z',       // → CarbonImmutable
+            'extra' => 'not-a-constructor-param',   // ignored by binding, kept in context
+        ], idempotent: true);
+
+        $code = $this->runner()->run($attempt->id, 1, 'n');
+
+        $this->assertSame(ExitCode::SUCCESS, $code);
+        $this->assertSame(JobState::Succeeded, Job::find($job->id)->state);
+
+        $seen = json_decode((string) file_get_contents($marker), true);
+        $this->assertSame('full', $seen['mode']);
+        $this->assertSame(25, $seen['limit']);
+        $this->assertSame('2026-07-01T09:00:00+00:00', $seen['as_of']);
+        $this->assertTrue($seen['service_resolved'], 'unbound service params still come from the container');
+        $this->assertSame('not-a-constructor-param', $seen['context_params']['extra'], 'the full params array still reaches JobContext');
+    }
+
+    public function test_missing_required_constructor_param_fails_the_attempt_loud(): void
+    {
+        // `mode` (a backed enum: data, no default) is absent → the handler never
+        // runs and the attempt fails with the binding error recorded.
+        [$job, $attempt] = $this->dispatched(TypedParamsJob::class, [
+            'marker' => $this->runtime.'/never-written.json',
+        ], idempotent: false, maxAttempts: 1);
+
+        $code = $this->runner()->run($attempt->id, 1, 'n');
+
+        $this->assertSame(ExitCode::FAILURE, $code);
+        $this->assertSame(JobState::Failed, Job::find($job->id)->state);
+        $this->assertStringContainsString('$mode', JobAttempt::find($attempt->id)->error['message']);
+        $this->assertFileDoesNotExist($this->runtime.'/never-written.json');
     }
 
     public function test_stale_token_is_refused_and_writes_nothing(): void

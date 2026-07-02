@@ -41,6 +41,7 @@ final class ChildRunner
         private readonly Pidfile $pidfile,
         private readonly ProcessTitle $title,
         private readonly JobLogCapture $logs,
+        private readonly HandlerFactory $handlers,
     ) {
     }
 
@@ -108,10 +109,11 @@ final class ChildRunner
         Log::info("Starting job {$job->job_class}", ['step' => 'starting', 'attempt' => (int) $attempt->attempt_number]);
 
         try {
-            $handler = app($job->job_class);
-            if (! $handler instanceof JobWardenJob) {
-                throw new \RuntimeException("{$job->job_class} must implement ".JobWardenJob::class);
-            }
+            // Constructor param binding: stored params (JSON) are matched to
+            // constructor parameters by name; the container resolves the rest.
+            // A binding failure (missing/invalid param) throws here and is
+            // recorded as a normal handler failure — loud, with the throw site.
+            $handler = $this->handlers->make($job->job_class, (array) ($job->params ?? []));
 
             $handlerStart = microtime(true);
             $handler->handle(new JobContext(

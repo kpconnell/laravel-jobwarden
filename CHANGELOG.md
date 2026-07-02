@@ -6,6 +6,20 @@ All notable changes to `laravel-jobwarden` are documented here. The format follo
 
 ## [Unreleased]
 
+### Added
+- **Constructor param binding for job handlers.** The stored params (JSON) now bind to
+  handler constructor parameters **by exact name** — services keep resolving from the
+  container — so handlers declare typed, promoted properties instead of digging through
+  `$context->params`. Backed enums coerce from their backing value and date-times from
+  ISO-8601 strings; the full params array still reaches `JobContext`, so existing
+  handlers are unaffected. Data-shaped parameters (models, date-times, enums) with no
+  matching params key are **refused loudly** instead of falling through to the container,
+  which would silently construct an empty model or a date of "now". Eloquent models are
+  deliberately never hydrated — pass the key, fetch in `handle()`, own the missing-row
+  policy. The contract check now also runs **before** construction, so a non-JobWardenJob
+  class can no longer execute constructor side effects. See the new
+  **docs/JOB-AUTHORING.md** for the binding rules and supported types.
+
 ### Fixed
 - **Aggregate atomicity: a terminal attempt can no longer strand its job in `running`.**
   A worker completing/failing an attempt, and a reaper orphaning one, now move the

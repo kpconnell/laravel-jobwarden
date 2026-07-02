@@ -42,6 +42,36 @@ final class SqlTime
         return Carbon::createFromTimestamp((int) ($row->epoch ?? 0));
     }
 
+    /**
+     * A SQL fragment yielding a datetime column as Unix epoch MILLISECONDS, for handing an
+     * absolute instant to the browser to render in the viewer's own timezone. The named
+     * branches are timezone-safe for our tz-aware columns (the epoch MariaDB/Postgres return
+     * is invariant to the session/global tz — see SqlTimeTimezoneGauntletTest).
+     *
+     * The ANSI default reconstructs the epoch from a day-time interval so an unhandled engine
+     * still RUNS instead of erroring on a driver-specific function. It is session-tz-skewed
+     * for tz-aware columns (subtracting a WITHOUT-TIME-ZONE literal coerces at the session
+     * zone) — acceptable drift on an unsupported platform, never silent breakage. $col is a
+     * trusted column identifier (a model's declared display-time list), never user input.
+     */
+    public static function epochMsExpr(Connection $conn, string $col): string
+    {
+        $delta = "({$col} - TIMESTAMP '1970-01-01 00:00:00')";
+
+        return match ($conn->getDriverName()) {
+            'mysql', 'mariadb' => "UNIX_TIMESTAMP({$col}) * 1000",
+            'pgsql' => "EXTRACT(EPOCH FROM {$col}) * 1000",
+            'sqlite' => "CAST(strftime('%s', {$col}) AS INTEGER) * 1000",
+            'sqlsrv' => "DATEDIFF_BIG(millisecond, '1970-01-01', {$col})",
+            default => "1000 * ("
+                ."EXTRACT(DAY FROM {$delta}) * 86400 "
+                ."+ EXTRACT(HOUR FROM {$delta}) * 3600 "
+                ."+ EXTRACT(MINUTE FROM {$delta}) * 60 "
+                ."+ FLOOR(EXTRACT(SECOND FROM {$delta}))"
+                .")",
+        };
+    }
+
     /** A SQL fragment for the DB clock's "now" — a literal in the frozen frame under setTestNow. */
     public static function nowExpr(Connection $conn): string
     {

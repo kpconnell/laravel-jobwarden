@@ -11,3 +11,6 @@ composer.lock
 .env
 .DS_Store
 *.pid
+CLAUDE.md
+AGENTS.md
+

@@ -27,11 +27,19 @@ abstract class TestCase extends Orchestra
     {
         $config = $app['config'];
 
+        // Static test-only key (same as testbench.yaml); Livewire dashboard
+        // tests hit the encrypter and die without one.
+        $config->set('app.key', 'base64:8Rq+outCgIfRIVw5Tv2OeQSMA59iUC2gg9YRf5+Qvog=');
+
         // JobWarden runs on its own dedicated connection (spec §2). Wire it from
         // line one; the whole engine resolves DB handles via this name.
         $config->set('jobwarden.connection', 'jobwarden');
 
         $config->set('database.connections.jobwarden', $this->jobwardenConnectionConfig());
+
+        // Real /proc probing only exists on Linux; everywhere else the suite
+        // runs against FakeProbe. CI (ubuntu-latest) keeps the real probe.
+        $config->set('jobwarden.process.probe', PHP_OS_FAMILY === 'Linux' ? 'auto' : 'fake');
 
         // A file-less default log channel: Log:: calls fire MessageLogged (so the
         // job-log capture works) but discard output, never touching the disk.

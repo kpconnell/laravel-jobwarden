@@ -17,7 +17,7 @@ final class Workers extends Component
     {
         $workers = Worker::query()
             ->when(! $this->all, fn ($q) => $q->whereIn('state', ['starting', 'active', 'draining']))
-            ->orderBy('role')->orderByDesc('heartbeat_at')->get();
+            ->orderBy('role')->orderByDesc('heartbeat_at')->withDisplayEpochs()->get();
 
         return view('jobwarden::livewire.workers', ['workers' => $workers]);
     }

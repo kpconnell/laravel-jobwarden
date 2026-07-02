@@ -16,6 +16,9 @@ class JobLog extends JobWardenModel
 
     protected $guarded = [];
 
+    /** @var list<string> */
+    protected array $displayTimes = ['ts'];
+
     public $timestamps = false;
 
     protected function casts(): array

@@ -76,7 +76,7 @@ final class Schedules extends Component
     public function render()
     {
         return view('jobwarden::livewire.schedules', [
-            'schedules' => Schedule::query()->orderBy('name')->get(),
+            'schedules' => Schedule::query()->orderBy('name')->withDisplayEpochs()->get(),
         ]);
     }
 }

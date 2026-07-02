@@ -16,7 +16,7 @@
                     <td class="muted">{{ $w->pid ?? '—' }}</td>
                     <td class="muted">{{ data_get($w->meta, 'lane', '—') }}</td>
                     <td class="muted">{{ $w->current_load }}/{{ $w->capacity ?? '∞' }}</td>
-                    <td class="muted">{{ $w->heartbeat_at ? (int) round(abs(now()->diffInSeconds($w->heartbeat_at))).'s ago' : '—' }}</td>
+                    <td class="muted">@include('jobwarden::partials.time', ['ms' => $w->heartbeat_at_ms, 'mode' => 'relative'])</td>
                 </tr>
             @empty
                 <tr><td colspan="8" class="muted">no workers</td></tr>

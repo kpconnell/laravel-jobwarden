@@ -11,7 +11,7 @@
                     <td><span class="badge state-{{ $b->state->value }}">{{ $b->state->value }}</span></td>
                     <td class="muted">{{ $b->succeeded_count }}✓ {{ $b->failed_count }}✗ {{ $b->canceled_count }}⊘ / {{ $b->total_jobs }}</td>
                     <td class="muted">{{ $b->failure_policy }}</td>
-                    <td class="muted">{{ optional($b->created_at)->diffForHumans() }}</td>
+                    <td class="muted">@include('jobwarden::partials.time', ['ms' => $b->created_at_ms, 'mode' => 'relative'])</td>
                     <td>
                         @if ($b->state->value === 'running')
                             <button class="btn danger" wire:click="cancel('{{ $b->id }}')" wire:confirm="Cancel this batch and all its members?">cancel</button>

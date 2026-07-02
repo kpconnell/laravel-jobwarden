@@ -18,6 +18,9 @@ class Worker extends JobWardenModel
 
     protected $guarded = [];
 
+    /** @var list<string> */
+    protected array $displayTimes = ['heartbeat_at'];
+
     public $timestamps = false;
 
     protected function casts(): array

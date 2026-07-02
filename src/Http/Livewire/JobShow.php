@@ -84,7 +84,8 @@ final class JobShow extends Component
 
     public function render()
     {
-        $job = Job::with(['attempts' => fn ($q) => $q->orderBy('attempt_number'), 'events' => fn ($q) => $q->orderBy('id')])
+        $job = Job::with(['attempts' => fn ($q) => $q->orderBy('attempt_number'), 'events' => fn ($q) => $q->orderBy('id')->withDisplayEpochs()])
+            ->withDisplayEpochs()
             ->findOrFail($this->jobId);
 
         $logs = $this->loadLogs(self::PREVIEW_LOG_CAP);
@@ -113,9 +114,9 @@ final class JobShow extends Component
         $sink = app(LogBodySink::class);
 
         return JobLog::query()->where('job_id', $this->jobId)
-            ->orderBy('ts')->orderBy('id')->limit($limit)->get()
+            ->orderBy('ts')->orderBy('id')->limit($limit)->withDisplayEpochs()->get()
             ->map(fn (JobLog $l) => (object) [
-                'ts' => $l->ts, 'level' => $l->level, 'step' => $l->step,
+                'ts' => $l->ts, 'ts_ms' => $l->ts_ms, 'level' => $l->level, 'step' => $l->step,
                 'body' => $sink->resolve((string) $l->body_ref),
             ]);
     }

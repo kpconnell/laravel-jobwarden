@@ -102,5 +102,38 @@
         {{ $slot }}
     </main>
     @livewireScripts
+    <script>
+        // Render every <time data-jw-epoch> in the viewer's own timezone. The epoch is the
+        // true instant (computed in SQL), so this is correct regardless of the app or DB
+        // timezone. Re-runs after each Livewire morph because wire:poll replaces the nodes.
+        (function () {
+            var timeFmt = new Intl.DateTimeFormat([], { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
+
+            function ago(ms) {
+                var s = Math.round((Date.now() - ms) / 1000), a = Math.abs(s), future = s < 0;
+                function u(n, unit) { return n + ' ' + unit + (n === 1 ? '' : 's') + (future ? ' from now' : ' ago'); }
+                if (a < 45) return future ? 'in a few seconds' : 'just now';
+                if (a < 5400) return u(Math.max(1, Math.round(a / 60)), 'min');
+                if (a < 129600) return u(Math.round(a / 3600), 'hour');
+                return u(Math.round(a / 86400), 'day');
+            }
+
+            function render(root) {
+                (root || document).querySelectorAll('time[data-jw-epoch]').forEach(function (el) {
+                    var ms = Number(el.getAttribute('data-jw-epoch'));
+                    if (!ms) return;
+                    var d = new Date(ms);
+                    el.title = d.toLocaleString();
+                    el.textContent = el.getAttribute('data-jw-time') === 'time' ? timeFmt.format(d) : ago(ms);
+                });
+            }
+
+            document.addEventListener('DOMContentLoaded', function () { render(); });
+            document.addEventListener('livewire:initialized', function () {
+                render();
+                Livewire.hook('morphed', function (payload) { render(payload.el); });
+            });
+        })();
+    </script>
 </body>
 </html>

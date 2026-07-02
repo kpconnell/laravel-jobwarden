@@ -1,3 +1,8 @@
+env:
+  # Test-only key so workbench artisan/dashboard calls don't die on
+  # "No application encryption key". Safe to commit.
+  APP_KEY: "base64:8Rq+outCgIfRIVw5Tv2OeQSMA59iUC2gg9YRf5+Qvog="
+
 providers:
   - Livewire\LivewireServiceProvider
   - JobWarden\JobWardenServiceProvider

@@ -7,6 +7,18 @@ All notable changes to `laravel-jobwarden` are documented here. The format follo
 ## [Unreleased]
 
 ### Added
+- **Dashboard timestamps render in the viewer's timezone.** Every `*_at` shown in the
+  dashboard (created/started/finished, worker heartbeat, next-due, and log/event times) is
+  now emitted as an absolute Unix-epoch value computed **in SQL** — `UNIX_TIMESTAMP()` /
+  `EXTRACT(EPOCH …)`, invariant to both the app **and** the DB session timezone — and
+  formatted **client-side** into the browser's own locale and zone. This fixes log/event
+  stamps that previously showed the server's wall clock (UTC regardless of who was looking),
+  and gives the relative "x ago" chips an exact local-time tooltip on hover. The Eloquent
+  Carbon is deliberately never trusted for display, since a host whose `app.timezone` differs
+  from the DB session zone mis-tags it. Backed by a new `SqlTime::epochMsExpr()` (explicit
+  MariaDB/MySQL, Postgres, SQLite, SQL Server branches, plus an ANSI-interval fallback that
+  runs — with accepted tz drift — on any other engine) and a `withDisplayEpochs()` model
+  scope; the conversion re-applies after each Livewire poll so `wire:poll` can't revert it.
 - **Constructor param binding for job handlers.** The stored params (JSON) now bind to
   handler constructor parameters **by exact name** — services keep resolving from the
   container — so handlers declare typed, promoted properties instead of digging through

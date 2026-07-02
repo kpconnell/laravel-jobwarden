@@ -22,6 +22,9 @@ class Job extends JobWardenModel
 
     protected $guarded = [];
 
+    /** @var list<string> */
+    protected array $displayTimes = ['created_at', 'started_at', 'finished_at'];
+
     const CREATED_AT = 'created_at';
     const UPDATED_AT = 'updated_at';
 

@@ -45,7 +45,7 @@
                     <td>{{ class_basename($job->job_class) }}</td>
                     <td class="muted">{{ $job->lane }}</td>
                     <td><span class="badge state-{{ $job->state->value }}">{{ $job->state->value }}</span></td>
-                    <td class="muted">{{ optional($job->created_at)->diffForHumans() }}</td>
+                    <td class="muted">@include('jobwarden::partials.time', ['ms' => $job->created_at_ms, 'mode' => 'relative'])</td>
                 </tr>
             @empty
                 <tr><td colspan="5" class="muted">no jobs yet</td></tr>

@@ -27,8 +27,8 @@
         <div class="k">attempts</div><div>{{ $job->attempt_count }} / {{ $job->max_attempts }}</div>
         @if ($job->batch_id)<div class="k">batch</div><div><a href="{{ route('jobwarden.batches') }}">{{ \Illuminate\Support\Str::substr($job->batch_id,0,8) }}</a></div>@endif
         @if ($job->schedule_id)<div class="k">schedule</div><div><a href="{{ route('jobwarden.schedules') }}">{{ \Illuminate\Support\Str::substr($job->schedule_id,0,8) }}</a></div>@endif
-        <div class="k">started</div><div class="muted">{{ optional($job->started_at)->diffForHumans() ?? '—' }}</div>
-        <div class="k">finished</div><div class="muted">{{ optional($job->finished_at)->diffForHumans() ?? '—' }}</div>
+        <div class="k">started</div><div class="muted">@include('jobwarden::partials.time', ['ms' => $job->started_at_ms, 'mode' => 'relative'])</div>
+        <div class="k">finished</div><div class="muted">@include('jobwarden::partials.time', ['ms' => $job->finished_at_ms, 'mode' => 'relative'])</div>
     </div>
 
     @if ($job->params)
@@ -78,7 +78,7 @@
     </div>
     <div class="logs">
         @forelse ($logs as $l)
-            <div class="ln lvl-{{ $l->level }}"><span class="muted">{{ optional($l->ts)->format('H:i:s') }}</span> {{ $l->step ? '['.$l->step.'] ' : '' }}{{ $l->body }}</div>
+            <div class="ln lvl-{{ $l->level }}"><span class="muted">@include('jobwarden::partials.time', ['ms' => $l->ts_ms, 'mode' => 'time'])</span> {{ $l->step ? '['.$l->step.'] ' : '' }}{{ $l->body }}</div>
         @empty
             <div class="muted">no logs</div>
         @endforelse
@@ -94,7 +94,7 @@
                     <td><span class="muted">{{ $e->from_state ?? '∅' }}</span> → <span class="badge state-{{ $e->to_state }}">{{ $e->to_state }}</span></td>
                     <td class="muted">{{ $e->actor_type }}</td>
                     <td class="muted">{{ $e->reason }}</td>
-                    <td class="muted">{{ optional($e->created_at)->format('H:i:s') }}</td>
+                    <td class="muted">@include('jobwarden::partials.time', ['ms' => $e->created_at_ms, 'mode' => 'time'])</td>
                 </tr>
             @endforeach
         </tbody>
@@ -112,7 +112,7 @@
                 @endif
                 <div class="logs modal-logs">
                     @forelse ($allLogs as $l)
-                        <div class="ln lvl-{{ $l->level }}"><span class="muted">{{ optional($l->ts)->format('H:i:s') }}</span> {{ $l->step ? '['.$l->step.'] ' : '' }}{{ $l->body }}</div>
+                        <div class="ln lvl-{{ $l->level }}"><span class="muted">@include('jobwarden::partials.time', ['ms' => $l->ts_ms, 'mode' => 'time'])</span> {{ $l->step ? '['.$l->step.'] ' : '' }}{{ $l->body }}</div>
                     @empty
                         <div class="muted">no logs</div>
                     @endforelse

@@ -46,7 +46,7 @@
                     </td>
                     <td><span class="badge state-{{ $s->enabled ? 'running' : 'stopped' }}">{{ $s->enabled ? 'on' : 'off' }}</span></td>
                     <td class="muted">{{ $s->idempotent ? 'yes' : 'no' }}</td>
-                    <td class="muted">{{ optional($s->next_due_at)->diffForHumans() ?? '—' }}</td>
+                    <td class="muted">@include('jobwarden::partials.time', ['ms' => $s->next_due_at_ms, 'mode' => 'relative'])</td>
                     <td>
                         <div class="btn-row">
                             <button class="btn" wire:click="runNow('{{ $s->id }}')">run now</button>

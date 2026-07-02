@@ -25,7 +25,7 @@ final class Overview extends Component
                 ->groupBy('role')->selectRaw('role, count(*) as c')->pluck('c', 'role'),
             'batches' => Batch::query()->whereIn('state', ['running'])->count(),
             'schedules' => Schedule::query()->where('enabled', true)->count(),
-            'recent' => Job::query()->orderByDesc('created_at')->limit(10)->get(),
+            'recent' => Job::query()->orderByDesc('created_at')->limit(10)->withDisplayEpochs()->get(),
             'attention' => (int) ($byState['orphaned'] ?? 0) + (int) ($byState['failed'] ?? 0),
         ]);
     }

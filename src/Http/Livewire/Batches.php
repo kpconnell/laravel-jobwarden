@@ -28,7 +28,7 @@ final class Batches extends Component
     public function render()
     {
         return view('jobwarden::livewire.batches', [
-            'batches' => Batch::query()->orderByDesc('created_at')->limit(50)->get(),
+            'batches' => Batch::query()->orderByDesc('created_at')->limit(50)->withDisplayEpochs()->get(),
         ]);
     }
 }

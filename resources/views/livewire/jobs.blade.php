@@ -31,8 +31,8 @@
                     <td class="muted">{{ $job->lane }}</td>
                     <td><span class="badge state-{{ $job->state->value }}">{{ $job->state->value }}</span></td>
                     <td class="muted">{{ $job->attempt_count }}/{{ $job->max_attempts }}</td>
-                    <td class="muted">{{ optional($job->created_at)->diffForHumans() }}</td>
-                    <td class="muted">{{ optional($job->started_at)->diffForHumans() ?? '—' }}</td>
+                    <td class="muted">@include('jobwarden::partials.time', ['ms' => $job->created_at_ms, 'mode' => 'relative'])</td>
+                    <td class="muted">@include('jobwarden::partials.time', ['ms' => $job->started_at_ms, 'mode' => 'relative'])</td>
                 </tr>
             @empty
                 <tr><td colspan="8" class="muted">no jobs match</td></tr>

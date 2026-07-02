@@ -16,6 +16,9 @@ class JobEvent extends JobWardenModel
 
     protected $guarded = [];
 
+    /** @var list<string> */
+    protected array $displayTimes = ['created_at'];
+
     public $timestamps = false;
 
     protected function casts(): array

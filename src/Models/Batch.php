@@ -16,6 +16,9 @@ class Batch extends JobWardenModel
 
     protected $guarded = [];
 
+    /** @var list<string> */
+    protected array $displayTimes = ['created_at'];
+
     const UPDATED_AT = 'updated_at';
     const CREATED_AT = 'created_at';
 

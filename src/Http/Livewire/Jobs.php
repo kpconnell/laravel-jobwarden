@@ -39,6 +39,7 @@ final class Jobs extends Component
             ->when($this->batch_id !== '', fn ($x) => $x->where('batch_id', $this->batch_id))
             ->when($this->q !== '', fn ($x) => $x->where('job_class', 'like', '%'.$this->q.'%'))
             ->orderByDesc('created_at')
+            ->withDisplayEpochs()
             ->paginate(25);
 
         return view('jobwarden::livewire.jobs', ['jobs' => $jobs]);

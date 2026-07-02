@@ -58,6 +58,19 @@ final class DashboardTest extends TestCase
             ->assertDontSee('Alpha');
     }
 
+    public function test_jobs_list_emits_a_browser_renderable_epoch(): void
+    {
+        // The dashboard hands the browser the absolute instant as epoch-ms (rendered into the
+        // viewer's timezone client-side), never an app-timezone-formatted string. Guard that the
+        // <time data-jw-epoch> carries the true epoch of the stored row.
+        $at = \Illuminate\Support\Carbon::create(2026, 7, 2, 18, 0, 0, 'UTC');
+        Job::create(['job_class' => 'Epochy', 'state' => JobState::Queued, 'created_at' => $at]);
+
+        Livewire::test(Jobs::class)
+            ->assertSee('Epochy')
+            ->assertSee('data-jw-epoch="'.($at->getTimestamp() * 1000).'"', false);
+    }
+
     public function test_job_detail_cancel_action(): void
     {
         $job = Job::create(['job_class' => 'X', 'state' => JobState::Queued]);

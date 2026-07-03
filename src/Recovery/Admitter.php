@@ -38,12 +38,28 @@ final class Admitter
         // Carbon::setTestNow() so time-travel tests still exercise the delay.
         $now = SqlTime::nowExpr(Job::query()->getConnection());
 
-        $jobs = Job::query()
+        $query = Job::query()
             ->where('state', $from->value)
             ->where(fn ($q) => $q->whereNull('available_at')->orWhereRaw("available_at <= {$now}"))
             ->orderBy('available_at')
-            ->limit($limit)
-            ->get();
+            ->limit($limit);
+
+        // The window must contain only admissible rows. Selecting dep-blocked
+        // pending jobs would let a chained backlog whose earliest-available
+        // members all fail DepsSatisfiedGuard monopolize the LIMIT and starve
+        // eligible successors sorted past it (a 20-chain backfill advanced ~2
+        // chains at a time). Pending only: Retrying → Queued is not dep-guarded
+        // (deps already succeeded before the first run), see JobTransitions.
+        if ($from === JobState::Pending) {
+            $prefix = (string) config('jobwarden.table_prefix');
+            $query->whereNotExists(fn ($q) => $q
+                ->from($prefix.'job_dependencies as d')
+                ->join($prefix.'jobs as dep', 'dep.id', '=', 'd.depends_on_job_id')
+                ->whereColumn('d.job_id', $prefix.'jobs.id')
+                ->where('dep.state', '!=', JobState::Succeeded->value));
+        }
+
+        $jobs = $query->get();
 
         $promoted = 0;
         foreach ($jobs as $job) {

@@ -197,6 +197,47 @@ final class BatchTest extends TestCase
         }
     }
 
+    public function test_admit_window_is_not_starved_by_a_dependency_blocked_backlog(): void
+    {
+        // Regression: the admit pass takes the LIMIT earliest-available pending
+        // rows. Without a dependency filter in that window query, a long chain's
+        // blocked members (earliest available_at) filled the whole window and a
+        // later chain's dep-satisfied successor was never evaluated — production
+        // ran a 20-chain backfill ~2 chains at a time.
+        $t0 = Carbon::parse('2026-06-30 12:00:00');
+
+        try {
+            Carbon::setTestNow($t0);
+            $long = $this->jobwarden()->batch('long-chain')
+                ->add('a0', 'JobA0')
+                ->add('a1', 'JobA1', dependsOn: ['a0'])
+                ->add('a2', 'JobA2', dependsOn: ['a1'])
+                ->add('a3', 'JobA3', dependsOn: ['a2'])
+                ->add('a4', 'JobA4', dependsOn: ['a3'])
+                ->add('a5', 'JobA5', dependsOn: ['a4'])
+                ->dispatch();
+
+            Carbon::setTestNow($t0->copy()->addSeconds(10));
+            $late = $this->jobwarden()->batch('late-chain')
+                ->add('b0', 'JobB0')
+                ->add('b1', 'JobB1', dependsOn: ['b0'])
+                ->dispatch();
+
+            $this->complete($this->member($long, 'JobA0'), JobState::Succeeded);
+            $this->complete($this->member($late, 'JobB0'), JobState::Succeeded);
+
+            // limit 5 = exactly the long chain's five pending members; b1 sorts
+            // after every one of them by available_at.
+            $this->app->make(Admitter::class)->admit(limit: 5);
+
+            $this->assertSame(JobState::Queued, $this->member($long, 'JobA1')->state, 'long chain advances');
+            $this->assertSame(JobState::Queued, $this->member($late, 'JobB1')->state, 'late chain is not starved by the blocked backlog');
+            $this->assertSame(JobState::Pending, $this->member($long, 'JobA2')->state, 'still dep-blocked');
+        } finally {
+            Carbon::setTestNow();
+        }
+    }
+
     public function test_a_dependency_cycle_is_rejected(): void
     {
         $this->expectException(RuntimeException::class);

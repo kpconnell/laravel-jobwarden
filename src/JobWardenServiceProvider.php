@@ -89,6 +89,7 @@ class JobWardenServiceProvider extends ServiceProvider
                 \JobWarden\Console\InstallCommand::class,
                 \JobWarden\Console\WorkersCommand::class,
                 \JobWarden\Console\PruneCommand::class,
+                \JobWarden\Console\RetagCommand::class,
                 \JobWarden\Console\ScheduleCommand::class,
             ]);
         }

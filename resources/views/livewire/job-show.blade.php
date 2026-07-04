@@ -31,6 +31,17 @@
         <div class="k">finished</div><div class="muted">@include('jobwarden::partials.time', ['ms' => $job->finished_at_ms, 'mode' => 'relative'])</div>
     </div>
 
+    @if ($job->tags->isNotEmpty())
+        <div class="kv">
+            <div class="k">tags</div>
+            <div>
+                @foreach ($job->tags as $tag)
+                    <a href="{{ route('jobwarden.jobs', ['q' => $tag->name.':'.$tag->value]) }}"><code>{{ $tag->name }}:{{ $tag->value }}</code></a>
+                @endforeach
+            </div>
+        </div>
+    @endif
+
     @if ($job->params)
         <h2>Params</h2>
         <pre class="json">{{ json_encode($job->params, JSON_PRETTY_PRINT|JSON_UNESCAPED_SLASHES) }}</pre>

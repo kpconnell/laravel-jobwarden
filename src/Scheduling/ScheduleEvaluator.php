@@ -6,6 +6,7 @@ namespace JobWarden\Scheduling;
 
 use JobWarden\Models\Job;
 use JobWarden\Models\Schedule;
+use JobWarden\Search\TagWriter;
 use JobWarden\States\JobState;
 use Illuminate\Database\Connection;
 use Illuminate\Support\Carbon;
@@ -147,7 +148,7 @@ final class ScheduleEvaluator
     {
         $params = (array) ($schedule->params ?? []);
 
-        return Job::create([
+        $job = Job::create([
             'schedule_id' => $schedule->id,
             'job_class' => $schedule->job_class,
             'name' => $schedule->name,
@@ -167,6 +168,19 @@ final class ScheduleEvaluator
             'attempt_count' => 0,
             'queued_at' => $now,
         ]);
+
+        // Schedule tags carry to every run it spawns (plus param promotion).
+        // Runtime path: silently keep only valid string=>string entries — a
+        // malformed tag on a schedule row must not stop the scheduler.
+        $tags = array_filter(
+            (array) ($schedule->tags ?? []),
+            static fn ($value, $name): bool => is_string($name) && $name !== '' && mb_strlen($name) <= TagWriter::MAX_NAME
+                && is_string($value) && $value !== '' && mb_strlen($value) <= TagWriter::MAX_VALUE,
+            ARRAY_FILTER_USE_BOTH,
+        );
+        TagWriter::write($job, $tags);
+
+        return $job;
     }
 
     private function linkJob(Schedule $schedule, Carbon $occ, string $jobId): void

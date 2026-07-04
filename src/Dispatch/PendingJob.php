@@ -94,7 +94,13 @@ final class PendingJob
         return $this;
     }
 
-    /** @param array<int|string,mixed> $tags */
+    /**
+     * Searchable tags: an assoc map of name => string value (value ≤ 200 chars).
+     * Validated at dispatch; queryable via ?tag[name]=value and `name:value` in
+     * the dashboard search.
+     *
+     * @param  array<string,string>  $tags
+     */
     public function tags(array $tags): self
     {
         $this->options['tags'] = $tags;

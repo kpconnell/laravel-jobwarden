@@ -9,6 +9,7 @@ use JobWarden\Contracts\JobWardenJob;
 use JobWarden\Models\Job;
 use JobWarden\Models\JobLog;
 use JobWarden\Operations\OperatorActions;
+use JobWarden\Search\TagWriter;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 
@@ -54,6 +55,7 @@ final class JobsController
             'jobs' => "required|array|min:1|max:{$max}",
             'jobs.*.job_class' => ['required', 'string', $this->jobClassRule()],
             'jobs.*.params' => 'array',
+            'jobs.*.tags' => ['nullable', 'array', $this->tagsRule()],
         ]);
 
         $specs = (array) $request->input('jobs');
@@ -83,17 +85,24 @@ final class JobsController
             ->when($request->filled('state'), fn ($q) => $q->whereIn('state', (array) $request->input('state')))
             ->when($request->filled('lane'), fn ($q) => $q->where('lane', $request->input('lane')))
             ->when($request->filled('name'), fn ($q) => $q->where('name', $request->input('name')))
+            ->when($request->filled('job_class'), fn ($q) => $q->where('job_class', $request->input('job_class')))
             ->when($request->filled('created_by'), fn ($q) => $q->where('created_by', $request->input('created_by')))
             ->when($request->filled('batch_id'), fn ($q) => $q->where('batch_id', $request->input('batch_id')))
             ->when($request->filled('schedule_id'), fn ($q) => $q->where('schedule_id', $request->input('schedule_id')))
-            ->when($request->filled('q'), fn ($q) => $q->where('job_class', 'like', '%'.$request->input('q').'%'))
-            ->orderByDesc('created_at')
+            ->when($request->filled('tag'), function ($q) use ($request) {
+                // ?tag[store]=AMAZ&tag[date]=2025-01* — ANDed, trailing * = prefix.
+                foreach ((array) $request->input('tag') as $name => $value) {
+                    $q->whereTag((string) $name, (string) $value);
+                }
+            })
+            ->when($request->filled('q'), fn ($q) => $q->search((string) $request->input('q')))
+            ->orderByDesc('id') // UUIDv7 ⇒ creation order, served by the PK (no filesort)
             ->paginate($this->perPage($request));
     }
 
     public function show(string $job)
     {
-        return Job::with(['attempts', 'events', 'artifacts'])->findOrFail($job);
+        return Job::with(['attempts', 'events', 'artifacts', 'tags'])->findOrFail($job);
     }
 
     /** Tail a job's logs by a monotonic id cursor (?after=N) — drives the live tail. */
@@ -166,7 +175,7 @@ final class JobsController
             'max_attempts' => 'integer|min:1',
             'max_runtime_sec' => 'nullable|integer|min:1',
             'backoff_strategy' => 'nullable|string',
-            'tags' => 'array',
+            'tags' => ['array', $this->tagsRule()],
         ]);
     }
 
@@ -186,6 +195,18 @@ final class JobsController
             'tags' => $data['tags'] ?? null,
             'created_by' => $this->actor($request),
         ], static fn ($value) => $value !== null);
+    }
+
+    /** Surface TagWriter's dispatch-boundary rules as a 422 instead of a 500. */
+    private function tagsRule(): callable
+    {
+        return static function (string $attribute, mixed $value, callable $fail): void {
+            try {
+                TagWriter::assertValid($value);
+            } catch (\InvalidArgumentException $e) {
+                $fail($e->getMessage());
+            }
+        };
     }
 
     private function jobClassRule(): callable

@@ -6,6 +6,7 @@ namespace JobWarden\Batch;
 
 use JobWarden\Models\Batch;
 use JobWarden\Models\Job;
+use JobWarden\Search\TagWriter;
 use JobWarden\States\BatchState;
 use JobWarden\States\JobState;
 use JobWarden\Support\SqlTime;
@@ -37,7 +38,7 @@ final class BatchBuilder
      * @param  string[]  $dependsOn  local keys of jobs that must succeed first
      * @param  array<string,mixed>  $options  idempotent, max_attempts, priority,
      *                                         available_at (delay/stagger), name,
-     *                                         backoff_strategy, …
+     *                                         backoff_strategy, tags, …
      */
     public function add(string $key, string $jobClass, array $params = [], array $dependsOn = [], array $options = []): self
     {
@@ -50,10 +51,17 @@ final class BatchBuilder
     {
         $this->assertAcyclic();
 
+        // Validate every member's explicit tags BEFORE the transaction — a bad
+        // tag fails the whole batch at the dispatch site, creating nothing.
+        $tagsByKey = [];
+        foreach ($this->specs as $key => $spec) {
+            $tagsByKey[$key] = TagWriter::assertValid($spec['options']['tags'] ?? null);
+        }
+
         $conn = DB::connection(config('jobwarden.connection'));
         $prefix = (string) config('jobwarden.table_prefix');
 
-        return $conn->transaction(function () use ($conn, $prefix): Batch {
+        return $conn->transaction(function () use ($conn, $prefix, $tagsByKey): Batch {
             $batch = Batch::create([
                 'name' => $this->name,
                 'type' => $this->type,
@@ -105,6 +113,7 @@ final class BatchBuilder
                         'available_at' => $conn->raw($delaySeconds > 0 ? SqlTime::nowPlus($conn, $delaySeconds) : SqlTime::nowExpr($conn)),
                         'queued_at' => $eligible ? $conn->raw(SqlTime::nowExpr($conn)) : null,
                     ]);
+                TagWriter::write($job, $tagsByKey[$key]);
                 $ids[$key] = $job->id;
             }
 

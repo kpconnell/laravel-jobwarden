@@ -212,6 +212,24 @@ return [
 
     /*
     |--------------------------------------------------------------------------
+    | Search (job tags)
+    |--------------------------------------------------------------------------
+    | Jobs are searchable by tags (name → value pairs, values ≤ 200 chars).
+    | Dispatchers pass tags explicitly; `promoted_params` additionally opts
+    | constructor parameter NAMES in for automatic promotion — when a job's
+    | params contain a listed name with a string value, it becomes a tag of
+    | the same name. Non-string (or over-long) values are simply not promoted.
+    | After changing this list, run `jobwarden:retag` to index existing jobs.
+    */
+    'search' => [
+        'promoted_params' => array_values(array_filter(
+            array_map('trim', explode(',', (string) env('JOBWARDEN_PROMOTED_PARAMS', ''))),
+            static fn (string $name): bool => $name !== '',
+        )),
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
     | Process layer (liveness verification)
     |--------------------------------------------------------------------------
     | probe: auto (detect OS) | linux | fake (tests). The production target is

@@ -77,6 +77,56 @@ final class OperatorApiTest extends TestCase
         ], 'jobwarden');
     }
 
+    public function test_jobs_index_filters_by_tag(): void
+    {
+        config(['jobwarden.search.promoted_params' => ['storeid', 'date']]);
+        $jw = app(JobWarden::class);
+        $match = $jw->dispatch(RunArtisanCommand::class, ['storeid' => 'AMAZ', 'date' => '2025-01-15', 'command' => 'x', 'arguments' => []]);
+        $jw->dispatch(RunArtisanCommand::class, ['storeid' => 'AMAZ', 'date' => '2025-02-01', 'command' => 'x', 'arguments' => []]);
+        $jw->dispatch(RunArtisanCommand::class, ['storeid' => 'WMALL', 'date' => '2025-01-15', 'command' => 'x', 'arguments' => []]);
+
+        // Tag filters AND together; trailing * is a prefix match.
+        $this->getJson('jobwarden/api/jobs?tag[storeid]=AMAZ&tag[date]=2025-01*')
+            ->assertOk()
+            ->assertJsonCount(1, 'data')
+            ->assertJsonPath('data.0.id', $match->id);
+    }
+
+    public function test_jobs_index_q_understands_tag_tokens(): void
+    {
+        config(['jobwarden.search.promoted_params' => ['storeid']]);
+        $match = app(JobWarden::class)->dispatch(RunArtisanCommand::class, ['storeid' => 'AMAZ', 'command' => 'x', 'arguments' => []]);
+        app(JobWarden::class)->dispatch(RunArtisanCommand::class, ['storeid' => 'WMALL', 'command' => 'x', 'arguments' => []]);
+
+        $this->getJson('jobwarden/api/jobs?q='.urlencode('storeid:AMAZ RunArtisan'))
+            ->assertOk()
+            ->assertJsonCount(1, 'data')
+            ->assertJsonPath('data.0.id', $match->id);
+    }
+
+    public function test_dispatch_with_tags_persists_them_and_show_returns_them(): void
+    {
+        $id = $this->postJson('jobwarden/api/jobs', [
+            'job_class' => RunArtisanCommand::class,
+            'params' => ['command' => 'cache:clear'],
+            'tags' => ['team' => 'ops'],
+        ])->assertCreated()->json('id');
+
+        $this->getJson("jobwarden/api/jobs/{$id}")
+            ->assertOk()
+            ->assertJsonPath('tags.0.name', 'team')
+            ->assertJsonPath('tags.0.value', 'ops');
+    }
+
+    public function test_dispatch_rejects_malformed_tags_with_a_422(): void
+    {
+        $this->postJson('jobwarden/api/jobs', [
+            'job_class' => RunArtisanCommand::class,
+            'params' => ['command' => 'cache:clear'],
+            'tags' => ['reports', 'nightly'], // a list, not a name => value map
+        ])->assertUnprocessable()->assertJsonValidationErrors('tags');
+    }
+
     public function test_dispatch_rejects_non_jobwarden_job_classes(): void
     {
         $this->postJson('jobwarden/api/jobs', [

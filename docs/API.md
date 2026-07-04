@@ -47,14 +47,24 @@ Base path below is relative to the configured prefix (`jobwarden/api`).
 | Method & path | Notes |
 |---|---|
 | `GET /stats` | Overview counts: jobs by state, jobs by lane, batches by state, schedule + worker counts. |
-| `GET /jobs` | Paginated. Filters: `state` (repeatable), `lane`, `name`, `created_by`, `batch_id`, `schedule_id`, `q` (job_class substring), `per_page`. |
-| `GET /jobs/{id}` | One job with `attempts`, `events`, `artifacts` loaded. This is the completion-polling endpoint: watch `state`; on `succeeded` the handler's completion payload (if it stored one) is in `result`. |
+| `GET /jobs` | Paginated. Filters: `state` (repeatable), `lane`, `name`, `job_class` (exact), `created_by`, `batch_id`, `schedule_id`, `tag[name]=value` (repeatable, ANDed; trailing `*` = prefix match), `q` (token search, below), `per_page`. |
+| `GET /jobs/{id}` | One job with `attempts`, `events`, `artifacts`, `tags` loaded. This is the completion-polling endpoint: watch `state`; on `succeeded` the handler's completion payload (if it stored one) is in `result`. |
 | `GET /jobs/{id}/logs` | Log lines. `after=<id>` for the live-tail cursor, `limit` (default 200). |
 | `GET /batches` | Paginated. Filter: `state`. |
 | `GET /batches/{id}` | One batch with its member `jobs`. |
 | `GET /schedules` | Paginated. Filter: `enabled`. |
 | `GET /schedules/{id}` | One schedule with `recent_runs` (last 25 occurrences). |
 | `GET /workers` | Registered processes (supervisors, schedulers, reapers). `all=1` to include stopped/dead, `role` to filter. |
+
+**Tag search.** Jobs carry searchable tags (name → value strings, values ≤ 200
+chars), stored in an indexed table so tag lookups never scan the jobs table.
+Tags come from the dispatcher (`tags` map on `POST /jobs`) and from **param
+promotion**: param names listed in `jobwarden.search.promoted_params` whose
+values are strings become tags automatically at dispatch. Filter with
+`?tag[storeid]=AMAZ&tag[date]=2025-01*`, or use `q`, whose whitespace-separated
+tokens AND together: `name:value` matches a tag (trailing `*` = prefix, bare
+`name:` = has-tag), any other token substring-matches the class or job name —
+e.g. `q=storeid:AMAZ date:2025-01* Backfill`.
 
 **Polling contract.** Dispatch returns the job id; poll `GET /jobs/{id}` until
 `state` is terminal (`succeeded` | `failed` | `canceled` | `stopped`). `result`
@@ -67,7 +77,7 @@ their story in `last_error`.
 
 | Method & path | Body / effect |
 |---|---|
-| `POST /jobs` | Dispatch one ad-hoc job. Body: `job_class`, optional `params`, plus dispatch options like `lane`, `idempotent`, `max_attempts`, `priority`, `available_at`, `max_runtime_sec`, `tags`. Returns 201. |
+| `POST /jobs` | Dispatch one ad-hoc job. Body: `job_class`, optional `params`, plus dispatch options like `lane`, `idempotent`, `max_attempts`, `priority`, `available_at`, `max_runtime_sec`, `tags` (a `{name: value}` map of strings, values ≤ 200 chars — 422 otherwise). Returns 201. |
 
 All take an optional `reason` (recorded in the audit trail) and return the fresh job.
 The actor is the authenticated user id, else `api`.

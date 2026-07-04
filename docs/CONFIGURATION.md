@@ -153,6 +153,21 @@ abandoned attempt is still recovered once that worker's heartbeat goes stale
 | `JOBWARDEN_RETENTION_WORKERS_DAYS` | `7` | Prune dead/stopped worker rows older than this. |
 | `JOBWARDEN_RETENTION_SCHEDULE_RUNS_DAYS` | `90` | Prune schedule-run history older than this. |
 
+### Search (job tags)
+
+Jobs are searchable by **tags** — name → value string pairs (values ≤ 200 chars)
+kept in an indexed side table, so tag lookups are B-tree reads, never JSON
+scans. Dispatchers pass tags explicitly (`->tags(['store' => 'AMAZ'])`, the
+`tags` dispatch option, or the API body); `promoted_params` additionally
+promotes opted-in constructor params automatically.
+
+| Env var | Default | Effect |
+|---|---|---|
+| `JOBWARDEN_PROMOTED_PARAMS` | *(empty)* | Comma-separated constructor param names to promote to tags at dispatch (tag name = param name). Only string values promote; anything else is silently skipped — promotion never fails a dispatch. An explicit tag with the same name wins. |
+
+After adding names to the list, run `jobwarden:retag` to promote params on
+**existing** jobs (idempotent; never overwrites an existing tag).
+
 ### Process & runtime
 
 | Env var | Default | Effect |

@@ -41,7 +41,6 @@ class Job extends JobWardenModel
             'cancel_requested' => 'boolean',
             'last_error' => 'array',
             'result' => 'array',
-            'tags' => 'array',
             'available_at' => 'datetime',
             'cancel_requested_at' => 'datetime',
             'created_at' => 'datetime',
@@ -87,6 +86,11 @@ class Job extends JobWardenModel
         return $this->hasMany(JobArtifact::class, 'job_id');
     }
 
+    public function tags(): HasMany
+    {
+        return $this->hasMany(JobTag::class, 'job_id');
+    }
+
     public function dependencies(): HasMany
     {
         return $this->hasMany(JobDependency::class, 'job_id');
@@ -118,6 +122,47 @@ class Job extends JobWardenModel
     public function scopeInBatch($query, string $batchId)
     {
         return $query->where('batch_id', $batchId);
+    }
+
+    /**
+     * Jobs carrying tag `name`: with the given value, a `prefix*` value (prefix
+     * match), or any value when $value is ''. All shapes are served by the
+     * job_tags (name, value) index; matched job_ids come back straight off it.
+     */
+    public function scopeWhereTag($query, string $name, string $value = '')
+    {
+        $tags = JobTag::query()->select('job_id')->where('name', $name);
+
+        if (str_ends_with($value, '*')) {
+            $tags->where('value', 'like', addcslashes(substr($value, 0, -1), '%_\\').'%');
+        } elseif ($value !== '') {
+            $tags->where('value', $value);
+        }
+
+        return $query->whereIn('id', $tags);
+    }
+
+    /**
+     * Free-text operator search. Whitespace-separated tokens AND together:
+     * `name:value` tokens hit the tag index (trailing `*` = prefix match, bare
+     * `name:` = "has this tag"); anything else matches the class or job name.
+     * e.g. `store:AMAZ date:2025-01* Backfill`
+     */
+    public function scopeSearch($query, string $q)
+    {
+        foreach (preg_split('/\s+/', trim($q), -1, PREG_SPLIT_NO_EMPTY) ?: [] as $token) {
+            $colon = strpos($token, ':');
+            if ($colon > 0) {
+                $query->whereTag(substr($token, 0, $colon), substr($token, $colon + 1));
+
+                continue;
+            }
+
+            $like = '%'.addcslashes($token, '%_\\').'%';
+            $query->where(fn ($x) => $x->where('job_class', 'like', $like)->orWhere('name', 'like', $like));
+        }
+
+        return $query;
     }
 
     /**

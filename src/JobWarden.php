@@ -10,6 +10,7 @@ use JobWarden\Jobs\RunArtisanCommand;
 use JobWarden\Models\Batch;
 use JobWarden\Models\Job;
 use JobWarden\Models\Schedule;
+use JobWarden\Search\TagWriter;
 use JobWarden\States\JobState;
 use JobWarden\Support\SqlTime;
 use Closure;
@@ -160,6 +161,10 @@ class JobWarden
      */
     public function dispatch(string $jobClass, array $params = [], array $options = []): Job
     {
+        // Validate explicit tags BEFORE the transaction — a bad tag is the
+        // dispatcher's bug and must fail loudly at the dispatch site.
+        $tags = TagWriter::assertValid($options['tags'] ?? null);
+
         $conn = DB::connection(config('jobwarden.connection'));
 
         // Delay is measured against the DB clock, so available_at lands in the DB's
@@ -174,7 +179,7 @@ class JobWarden
         };
         $eligible = $delaySeconds <= 0;
 
-        return $conn->transaction(function () use ($conn, $jobClass, $params, $options, $eligible, $delaySeconds): Job {
+        return $conn->transaction(function () use ($conn, $jobClass, $params, $options, $tags, $eligible, $delaySeconds): Job {
             $job = Job::create([
                 'job_class' => $jobClass,
                 'name' => $options['name'] ?? null,
@@ -188,11 +193,12 @@ class JobWarden
                 'attempt_count' => 0,
                 'max_runtime_sec' => $options['max_runtime_sec'] ?? config('jobwarden.stuck.max_runtime_sec'),
                 'backoff_strategy' => $options['backoff_strategy'] ?? config('jobwarden.retry.backoff.strategy'),
-                'tags' => $options['tags'] ?? null,
                 'batch_id' => $options['batch_id'] ?? null,
                 'schedule_id' => $options['schedule_id'] ?? null,
                 'created_by' => $options['created_by'] ?? null,
             ]);
+
+            TagWriter::write($job, $tags);
 
             // Stamp the DB-clock timestamps via the query builder (Eloquent's datetime cast
             // rejects a raw CURRENT_TIMESTAMP, and a stored Carbon would be re-serialized in

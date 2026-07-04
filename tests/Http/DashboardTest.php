@@ -49,13 +49,38 @@ final class DashboardTest extends TestCase
 
     public function test_jobs_list_filters_by_state(): void
     {
-        Job::create(['job_class' => 'Alpha', 'state' => JobState::Queued]);
-        Job::create(['job_class' => 'Beta', 'state' => JobState::Failed]);
+        // Assert on job NAMES: every distinct class now appears in the class
+        // filter dropdown, so class names show even for filtered-out rows.
+        Job::create(['job_class' => 'Alpha', 'state' => JobState::Queued, 'name' => 'alpha-run']);
+        Job::create(['job_class' => 'Beta', 'state' => JobState::Failed, 'name' => 'beta-run']);
 
         Livewire::test(Jobs::class)
             ->set('state', 'failed')
-            ->assertSee('Beta')
-            ->assertDontSee('Alpha');
+            ->assertSee('beta-run')
+            ->assertDontSee('alpha-run');
+    }
+
+    public function test_jobs_list_search_matches_tags_and_free_text(): void
+    {
+        config(['jobwarden.search.promoted_params' => ['storeid']]);
+        app(JobWarden::class)->dispatch('App\\Jobs\\BackfillJob', ['storeid' => 'AMAZ'], ['name' => 'match-me']);
+        app(JobWarden::class)->dispatch('App\\Jobs\\BackfillJob', ['storeid' => 'WMALL'], ['name' => 'other-run']);
+
+        Livewire::test(Jobs::class)
+            ->set('q', 'storeid:AMAZ Backfill')
+            ->assertSee('match-me')
+            ->assertDontSee('other-run');
+    }
+
+    public function test_jobs_list_filters_by_class(): void
+    {
+        Job::create(['job_class' => 'App\\Jobs\\Alpha', 'state' => JobState::Queued, 'name' => 'alpha-run']);
+        Job::create(['job_class' => 'App\\Jobs\\Beta', 'state' => JobState::Queued, 'name' => 'beta-run']);
+
+        Livewire::test(Jobs::class)
+            ->set('job_class', 'App\\Jobs\\Beta')
+            ->assertSee('beta-run')
+            ->assertDontSee('alpha-run');
     }
 
     public function test_jobs_list_emits_a_browser_renderable_epoch(): void

@@ -17,6 +17,7 @@ final class Jobs extends Component
 
     #[Url] public string $state = '';
     #[Url] public string $lane = '';
+    #[Url] public string $job_class = '';
     #[Url] public string $batch_id = '';
     #[Url] public string $q = '';
 
@@ -27,7 +28,7 @@ final class Jobs extends Component
 
     public function clear(): void
     {
-        $this->reset('state', 'lane', 'batch_id', 'q');
+        $this->reset('state', 'lane', 'job_class', 'batch_id', 'q');
         $this->resetPage();
     }
 
@@ -36,12 +37,18 @@ final class Jobs extends Component
         $jobs = Job::query()
             ->when($this->state !== '', fn ($x) => $x->where('state', $this->state))
             ->when($this->lane !== '', fn ($x) => $x->where('lane', $this->lane))
+            ->when($this->job_class !== '', fn ($x) => $x->where('job_class', $this->job_class))
             ->when($this->batch_id !== '', fn ($x) => $x->where('batch_id', $this->batch_id))
-            ->when($this->q !== '', fn ($x) => $x->where('job_class', 'like', '%'.$this->q.'%'))
-            ->orderByDesc('created_at')
+            ->when($this->q !== '', fn ($x) => $x->search($this->q))
+            ->orderByDesc('id') // UUIDv7 ⇒ creation order, served by the PK (no filesort)
             ->withDisplayEpochs()
             ->paginate(25);
 
-        return view('jobwarden::livewire.jobs', ['jobs' => $jobs]);
+        return view('jobwarden::livewire.jobs', [
+            'jobs' => $jobs,
+            // Distinct filter values off their own indexes (class idx / claim idx).
+            'classes' => Job::query()->select('job_class')->distinct()->orderBy('job_class')->pluck('job_class'),
+            'lanes' => Job::query()->select('lane')->distinct()->orderBy('lane')->pluck('lane'),
+        ]);
     }
 }

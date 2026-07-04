@@ -2,7 +2,8 @@
     <h1>Jobs</h1>
 
     <div class="toolbar">
-        <input type="text" wire:model.live.debounce.400ms="q" placeholder="search class…" style="min-width:200px">
+        <input type="text" wire:model.live.debounce.400ms="q" placeholder="class, name, or tag:value…" style="min-width:260px"
+               title="tokens AND together — bare words match class/name; name:value matches a tag; trailing * = prefix (e.g. store:AMAZ date:2025-01*)">
         <select wire:model.live="state">
             <option value="">any state</option>
             @foreach (['pending','queued','running','retrying','orphaned','succeeded','failed','canceled','stopped'] as $s)
@@ -11,10 +12,17 @@
         </select>
         <select wire:model.live="lane">
             <option value="">any lane</option>
-            <option value="default">default</option>
-            <option value="scheduled">scheduled</option>
+            @foreach ($lanes as $l)
+                <option value="{{ $l }}">{{ $l }}</option>
+            @endforeach
         </select>
-        @if ($state || $lane || $q || $batch_id)
+        <select wire:model.live="job_class">
+            <option value="">any class</option>
+            @foreach ($classes as $c)
+                <option value="{{ $c }}">{{ class_basename($c) }}</option>
+            @endforeach
+        </select>
+        @if ($state || $lane || $job_class || $q || $batch_id)
             <button class="btn" wire:click="clear">clear</button>
         @endif
         <span class="muted">{{ $jobs->total() }} job(s)</span>

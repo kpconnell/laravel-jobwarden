@@ -84,7 +84,7 @@ final class JobShow extends Component
 
     public function render()
     {
-        $job = Job::with(['attempts' => fn ($q) => $q->orderBy('attempt_number'), 'events' => fn ($q) => $q->orderBy('id')->withDisplayEpochs()])
+        $job = Job::with(['tags', 'attempts' => fn ($q) => $q->orderBy('attempt_number'), 'events' => fn ($q) => $q->orderBy('id')->withDisplayEpochs()])
             ->withDisplayEpochs()
             ->findOrFail($this->jobId);
 

@@ -142,7 +142,7 @@ final class DispatchableTest extends TestCase
             ->maxRuntime(120)
             ->named('nightly-import')
             ->idempotencyKey('key-1')
-            ->tags(['reports', 'nightly'])
+            ->tags(['team' => 'reports', 'cadence' => 'nightly'])
             ->backoff('fixed')
             ->createdBy('tester')
             ->dispatch('store-9');
@@ -153,7 +153,7 @@ final class DispatchableTest extends TestCase
         $this->assertSame(120, (int) $job->max_runtime_sec);
         $this->assertSame('nightly-import', $job->name);
         $this->assertSame('key-1', $job->idempotency_key);
-        $this->assertSame(['reports', 'nightly'], $job->tags);
+        $this->assertSame(['cadence' => 'nightly', 'team' => 'reports'], $job->tags->sortBy('name')->pluck('value', 'name')->all());
         $this->assertSame('fixed', $job->backoff_strategy);
         $this->assertSame('tester', $job->created_by);
     }

@@ -120,6 +120,14 @@ return [
         // A child that outlasts the timeout keeps running and self-reports; if
         // the container is then torn down, a reaper recovers it (idempotent → re-run).
         'drain_timeout' => (int) env('JOBWARDEN_DRAIN_TIMEOUT', 0),
+
+        // A tick that fails on transient infrastructure (lost DB connection,
+        // failover, deadlock) is absorbed and retried with exponential backoff
+        // from this base (capped at 30s) instead of exiting — a dead supervisor
+        // gets its healthy children killed by Tier-2, so a DB blip must not
+        // become killed work. Deterministic failures (code/schema bugs, which
+        // would recur every tick) still exit loudly after a few strikes.
+        'tick_failure_backoff_ms' => (int) env('JOBWARDEN_TICK_FAILURE_BACKOFF_MS', 1000),
     ],
 
     /*

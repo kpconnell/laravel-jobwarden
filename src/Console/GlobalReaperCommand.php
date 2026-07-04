@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace JobWarden\Console;
 
 use JobWarden\Reaper\GlobalReaper;
+use JobWarden\Support\TransientFailure;
 use JobWarden\Worker\WorkerRegistry;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\Log;
@@ -18,6 +19,9 @@ final class GlobalReaperCommand extends Command
     protected $signature = 'jobwarden:reap:global {--once : single scan} {--interval= : seconds between scans}';
 
     protected $description = 'HA global reaper: declare dead hosts via stale leases and orphan their attempts.';
+
+    /** Consecutive deterministic (non-transient) tick failures tolerated before dying loudly. */
+    private const TICK_FAILURE_LIMIT = 5;
 
     private bool $stopping = false;
 
@@ -44,13 +48,42 @@ final class GlobalReaperCommand extends Command
         $this->installSignals();
         $interval = (int) ($this->option('interval') ?: config('jobwarden.reaper.global_scan_interval', 5));
 
+        $deterministicFailures = 0;
+
         while (! $this->stopping) {
             if (function_exists('pcntl_signal_dispatch')) {
                 pcntl_signal_dispatch();
             }
 
-            $reaper->tick($reaperId);
-            $registry->heartbeat($worker);
+            try {
+                $reaper->tick($reaperId);
+                $registry->heartbeat($worker);
+                $deterministicFailures = 0;
+            } catch (\Throwable $e) {
+                // This process IS the recovery backstop — transient DB failure
+                // (failover, deadlock) must be outlasted, not fatal, or nothing
+                // recovers anything until someone restarts us. A deterministic
+                // failure still exits loudly after a few strikes: a reaper that
+                // heartbeats while every scan fails is alive-looking but useless.
+                $deterministicFailures = TransientFailure::isTransient($e) ? 0 : $deterministicFailures + 1;
+
+                if ($deterministicFailures >= self::TICK_FAILURE_LIMIT) {
+                    Log::critical('global reaper: tick failing deterministically; exiting', [
+                        'role' => 'global_reaper',
+                        'consecutive_failures' => $deterministicFailures,
+                        'exception' => $e::class,
+                        'error' => $e->getMessage(),
+                    ]);
+
+                    throw $e;
+                }
+
+                Log::error('global reaper: tick failed; continuing', [
+                    'role' => 'global_reaper',
+                    'exception' => $e::class,
+                    'error' => $e->getMessage(),
+                ]);
+            }
 
             sleep(max(1, $interval));
         }

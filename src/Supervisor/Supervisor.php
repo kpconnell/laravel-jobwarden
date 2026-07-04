@@ -20,6 +20,7 @@ use JobWarden\States\ActorType;
 use JobWarden\States\AttemptState;
 use JobWarden\States\JobState;
 use JobWarden\Stamp\ProcessStampWriter;
+use JobWarden\Support\TransientFailure;
 use JobWarden\Worker\WorkerRegistry;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
@@ -36,6 +37,9 @@ final class Supervisor
     private const SIGTERM = 15;
 
     private const SIGKILL = 9;
+
+    /** Consecutive DETERMINISTIC (non-transient) tick failures tolerated before dying loudly. */
+    private const TICK_FAILURE_LIMIT = 5;
 
     private ChildRegistry $children;
 
@@ -58,6 +62,12 @@ final class Supervisor
 
     /** The adaptive loop sleep (ms) computed each tick from claim demand; used by run(). */
     private int $nextPollMs = 500;
+
+    /** Consecutive failed ticks of any kind — drives the retry backoff. */
+    private int $tickFailures = 0;
+
+    /** Consecutive failed ticks that were NOT transient — drives the die-loudly limit. */
+    private int $deterministicTickFailures = 0;
 
     public function __construct(
         private readonly ClaimDriverFactory $claimFactory,
@@ -118,10 +128,22 @@ final class Supervisor
                 pcntl_signal_dispatch();
             }
 
-            $this->tick();
+            try {
+                $this->tick();
 
-            if ($onTick !== null) {
-                $onTick();
+                if ($onTick !== null) {
+                    $onTick();
+                }
+
+                $this->tickFailures = 0;
+                $this->deterministicTickFailures = 0;
+            } catch (\Throwable $e) {
+                // Exiting here is worse than the failure itself: the local reaper
+                // treats a dead supervisor's (healthy, self-reporting) children as
+                // reparented orphans and kills them — a DB blip must not translate
+                // into killed work and parked non-idempotent jobs. Absorb what can
+                // be outlasted; die loudly on what would recur every tick.
+                $this->nextPollMs = $this->absorbTickFailure($e);
             }
 
             if ($this->shouldRecycle()) {
@@ -150,6 +172,54 @@ final class Supervisor
         }
 
         $this->shutdown();
+    }
+
+    /**
+     * A tick failed — decide whether that is survivable, and how long to back off
+     * before the next one. Two regimes (see TransientFailure):
+     *
+     *  - TRANSIENT (lost connection / failover / deadlock): retried indefinitely
+     *    with exponential backoff. The DB being down also stops our heartbeat, so
+     *    the fleet sees the truth, and surviving the outage means claiming (and
+     *    Tier-1 reaping of our children) resumes the moment it ends. Laravel
+     *    reconnects a dead handle on the next query by itself.
+     *
+     *  - DETERMINISTIC (code/schema bug — would recur every tick): retried a few
+     *    times, then rethrown. A supervisor that heartbeats while every tick
+     *    fails looks healthy to all three recovery tiers while doing no work;
+     *    dying loudly hands its children to Tier-2 and its restart to process
+     *    supervision.
+     *
+     * @return int the backoff (ms) to sleep before the next tick
+     */
+    private function absorbTickFailure(\Throwable $e): int
+    {
+        $transient = TransientFailure::isTransient($e);
+        $this->tickFailures++;
+        $this->deterministicTickFailures = $transient ? 0 : $this->deterministicTickFailures + 1;
+
+        if ($this->deterministicTickFailures >= self::TICK_FAILURE_LIMIT) {
+            Log::critical('supervisor: tick failing deterministically; exiting so recovery sees an honest death', [
+                'role' => 'supervisor',
+                'consecutive_failures' => $this->deterministicTickFailures,
+                'exception' => $e::class,
+                'error' => $e->getMessage(),
+            ]);
+
+            throw $e;
+        }
+
+        Log::error('supervisor: tick failed; backing off and continuing', [
+            'role' => 'supervisor',
+            'transient' => $transient,
+            'consecutive_failures' => $this->tickFailures,
+            'exception' => $e::class,
+            'error' => $e->getMessage(),
+        ]);
+
+        $base = max(1, (int) config('jobwarden.supervisor.tick_failure_backoff_ms', 1000));
+
+        return (int) min(30_000, $base * (2 ** min(10, $this->tickFailures - 1)));
     }
 
     private function drainTimedOut(): bool
@@ -518,8 +588,9 @@ final class Supervisor
                     sprintf('child died: exit=%s signal=%s', $handle->exitCode ?? 'n/a', $handle->termSignal ?? 'n/a')
                 );
             }
-        } catch (\JobWarden\StateMachine\Exceptions\StaleFencingTokenException) {
-            // A reaper already took over this epoch — leave its decision intact.
+        } catch (\JobWarden\StateMachine\Exceptions\StaleFencingTokenException|\JobWarden\StateMachine\Exceptions\IllegalTransitionException) {
+            // A reaper/operator already took over this epoch or resolved the job —
+            // leave that decision intact (and never let it crash the run loop).
         }
     }
 
@@ -625,10 +696,19 @@ final class Supervisor
 
     private function shutdown(): void
     {
-        if ($this->worker !== null) {
-            $this->registry->setState($this->worker, 'stopped', 'SIGTERM');
-            Log::info('jobwarden supervisor stopped', ['worker_id' => (string) $this->worker->id]);
+        if ($this->worker === null) {
+            return;
         }
+
+        try {
+            $this->registry->setState($this->worker, 'stopped', 'SIGTERM');
+        } catch (\Throwable $e) {
+            // Best-effort: with the DB unreachable the stale heartbeat already
+            // tells Tier-3 the truth about this worker.
+            Log::warning('supervisor: could not mark worker stopped on shutdown', ['error' => $e->getMessage()]);
+        }
+
+        Log::info('jobwarden supervisor stopped', ['worker_id' => (string) $this->worker->id]);
     }
 
     /**

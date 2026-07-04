@@ -6,6 +6,7 @@ namespace JobWarden\Console;
 
 use JobWarden\Reaper\LocalReaper;
 use JobWarden\Support\SystemdNotifier;
+use JobWarden\Support\TransientFailure;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\Log;
 
@@ -19,6 +20,9 @@ final class LocalReaperCommand extends Command
     protected $signature = 'jobwarden:reap:local {--once : single scan} {--interval= : seconds between scans}';
 
     protected $description = 'Per-host local reaper: verify stamps, kill reparented orphans, hold the host lease.';
+
+    /** Consecutive deterministic (non-transient) tick failures tolerated before dying loudly. */
+    private const TICK_FAILURE_LIMIT = 5;
 
     private bool $stopping = false;
 
@@ -39,22 +43,52 @@ final class LocalReaperCommand extends Command
         $systemd = new SystemdNotifier;
         $systemd->ready(); // Type=notify: tell systemd we're up.
 
+        $deterministicFailures = 0;
+
         while (! $this->stopping) {
             if (function_exists('pcntl_signal_dispatch')) {
                 pcntl_signal_dispatch();
             }
 
-            $alive = $reaper->tick();
-            if (! $alive) {
-                // Self-fenced: exit so systemd restarts us clean.
-                Log::critical('local reaper exiting after self-fence');
+            try {
+                $alive = $reaper->tick();
+                if (! $alive) {
+                    // Self-fenced: exit so systemd restarts us clean.
+                    Log::critical('local reaper exiting after self-fence');
 
-                return self::FAILURE;
+                    return self::FAILURE;
+                }
+
+                // Pet the watchdog only on a HEALTHY scan — a wedged reaper that
+                // stops ticking lets WatchdogSec expire and systemd restarts it.
+                $systemd->watchdog();
+                $deterministicFailures = 0;
+            } catch (\Throwable $e) {
+                // Surviving a transient failure matters DOUBLY here: the self-fence
+                // keys on a wall-clock stale lease (lastLeaseOk), and a crash-restart
+                // resets that clock — a reaper that dies on every scan during a
+                // partition would never fence, leaving this host's children alive
+                // past Tier-3's takeover. Absorb and retry; the watchdog is NOT
+                // petted on a failed scan, so systemd still catches a wedged loop.
+                $deterministicFailures = TransientFailure::isTransient($e) ? 0 : $deterministicFailures + 1;
+
+                if ($deterministicFailures >= self::TICK_FAILURE_LIMIT) {
+                    Log::critical('local reaper: tick failing deterministically; exiting', [
+                        'role' => 'local_reaper',
+                        'consecutive_failures' => $deterministicFailures,
+                        'exception' => $e::class,
+                        'error' => $e->getMessage(),
+                    ]);
+
+                    throw $e;
+                }
+
+                Log::error('local reaper: tick failed; continuing', [
+                    'role' => 'local_reaper',
+                    'exception' => $e::class,
+                    'error' => $e->getMessage(),
+                ]);
             }
-
-            // Pet the watchdog only on a HEALTHY scan — a wedged reaper that
-            // stops ticking lets WatchdogSec expire and systemd restarts it.
-            $systemd->watchdog();
 
             sleep(max(1, $interval));
         }

@@ -4,223 +4,678 @@
 [![Latest Version](https://img.shields.io/packagist/v/kpconnell/laravel-jobwarden.svg)](https://packagist.org/packages/kpconnell/laravel-jobwarden)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-A durable, database-backed **job, batch & scheduling engine** for Laravel — a deliberate alternative to the
-Redis/Horizon model in which **the relational database is the source of truth and the coordination layer**.
-Correctness, recovery, and observability come from durable state transitions, per-process fencing tokens, an
-idempotency-gated retry guard, and verifiable OS-process identity — never from assuming a worker is healthy.
+**Durable, process-aware jobs, batches, DAGs, and scheduling for Laravel.**
 
-> **Status: `1.0.0-beta`.** The distributed-correctness core and the full feature set are complete and proven
-> against SQLite, MariaDB/MySQL, and PostgreSQL (134 tests). APIs may shift slightly before `1.0.0`.
+JobWarden is a database-backed execution engine for Laravel jobs that are too long-running, expensive, operationally important, or unsafe to treat as anonymous queue payloads.
 
-## The core idea: positive control of every process
+It gives Laravel applications **positive control** over running work: every job attempt is tied to a real Linux child process with verifiable process identity, fencing tokens, durable state transitions, and idempotency-gated recovery.
 
-Horizon and every Redis/SQS/database *queue* share one blind spot: **the moment a job is handed to a worker, the
-system loses sight of it.** The job becomes an in-flight payload behind a visibility timeout. Nothing knows which
-OS process on which host is actually running it, whether that process is alive or wedged, or how to reach it.
-Recovery is a guess on a timer, and re-delivery is blind at-least-once — which can double-run your work.
+Use Horizon for ordinary short jobs. Use JobWarden when correctness, recovery, and operator control matter.
 
-JobWarden inverts that. Every job runs in a **child process the supervisor spawned and watches**, and the
-database row for that attempt carries the process's full OS identity: `host_id`, the supervisor and child
-**PIDs**, each PID's `/proc` **start-time**, and a per-spawn **nonce**. A row maps to a real, reuse-proof Linux
-process. The engine always knows *what is running, where, on which PID* — and can **prove** it before it acts.
+> **Status: `beta`**
+>
+> The distributed-correctness core and full feature set are implemented and tested against SQLite, MariaDB/MySQL, and PostgreSQL. APIs may shift slightly before `1.0.0`.
 
-That one property — **positive control** — is what unlocks everything a queue structurally cannot do:
+---
 
-| | Redis / Horizon / SQS queue | JobWarden |
+## Why JobWarden exists
+
+Most queue systems know when a job has been claimed.
+
+They do **not** know which exact operating-system process is running it.
+
+Once a job is handed to a worker, Redis, SQS, Horizon, and traditional queue backends mostly see an in-flight payload behind a visibility timeout or worker timeout. They cannot prove:
+
+- which host is running the job,
+- which supervisor process owns it,
+- which child process is executing it,
+- whether that process is still alive,
+- whether a PID has been reused,
+- or whether it is safe to retry the work.
+
+For many jobs, that is fine.
+
+For a quick email, notification, cache refresh, webhook fan-out, or idempotent background task, Laravel's queue system is usually the right tool.
+
+But for jobs that run for minutes or hours, mutate external systems, generate expensive reports, sync marketplaces, bill customers, reconcile inventory, import large datasets, or coordinate business-critical workflows, blind at-least-once delivery can be a problem.
+
+JobWarden was built for that class of work.
+
+---
+
+## The core idea: positive control
+
+JobWarden does not run many jobs inside one long-lived worker process.
+
+Instead:
+
+1. a supervisor claims a job,
+2. the supervisor spawns a dedicated child process for that job,
+3. the attempt row is stamped with the child process identity,
+4. the supervisor watches that child,
+5. reapers verify process liveness before recovery,
+6. and every reassignment is protected by a fencing token.
+
+Each running attempt is tied to:
+
+- `host_id`
+- supervisor PID
+- child PID
+- each PID's `/proc` start time
+- a per-spawn nonce
+- a fencing token
+- durable attempt state
+
+That means a JobWarden attempt maps to a real, reuse-resistant Linux process.
+
+The system can answer the operational question queues usually cannot:
+
+> What exact process is running this job right now, and can we prove it before acting?
+
+That is positive control.
+
+---
+
+## What positive control gives you
+
+| Capability | Redis / Horizon / SQS-style queue | JobWarden |
 |---|---|---|
-| **What the system knows** | "a job is in flight somewhere" | the exact host + PID + start-time behind every attempt |
-| **Detecting a dead/wedged worker** | wait out a visibility timeout / missed heartbeat | *verified* — `waitpid`, then `/proc` stamp checks, across three tiers |
-| **Recovery latency** | bounded by the job's own timeout (a 4 h job ⇒ ~4 h) | decoupled from job duration (a dead host is caught in ~40 s) |
-| **Re-delivery safety** | blind at-least-once; can silently double-run | fencing token + **binary** idempotency gate: retry *or* park |
-| **Killing one specific running job** | not possible — no handle to the process | targeted SIGTERM→SIGKILL of the exact stamped PID, *confirmed dead* |
-| **Reused-PID safety** | n/a | start-time match means a recycled PID is never mistaken for the original |
-| **Graceful deploys** | in-flight jobs abandoned / blindly re-queued | drain: stop claiming, bleed off in-flight work, then exit |
-| **Blast radius of a bad job** | can wedge or OOM the worker and its siblings | one job = one child; a crash/OOM/segfault can't take the supervisor down |
+| What the system knows | A job is in flight somewhere | Exact host, supervisor PID, child PID, start time, nonce, and attempt |
+| Dead worker recovery | Wait for timeout / visibility window | Verify liveness through supervisor, local `/proc`, and global host leases |
+| Long-running job failure | Recovery is often tied to job timeout | Recovery is decoupled from job duration |
+| Re-delivery | Blind at-least-once | Fencing-token protected retry or park |
+| Non-idempotent jobs | Easy to double-run accidentally | Park instead of auto-retrying |
+| Cancel one running job | Usually no exact process handle | Targeted SIGTERM → SIGKILL of the verified child process |
+| PID reuse safety | Not applicable / not tracked | `/proc` start-time check prevents killing the wrong reused PID |
+| Deploy drains | In-flight work may be abandoned or blindly retried | Stop claiming, let children finish, then exit |
+| Crash isolation | A bad job can poison the worker process | One job = one child process |
+| Auditability | Usually distributed across queue/backend/logs | Durable job, attempt, event, and recovery state in the database |
 
-### What positive control buys you
+---
 
-- **Detect orphans — verified, not guessed.** Detection runs in three tiers: the supervisor `waitpid`s its own
-  children instantly; a per-host local reaper checks each attempt's `/proc` stamp (catching a *dead supervisor*
-  whose child reparented to `init`); and a leader-leased global reaper catches whole dead hosts via an expired
-  lease. It keys on the **per-process** `worker_id`, so restarting a box never masks the incarnation that died on
-  it — and a 4-hour job on a pulled-plug host is recovered in ~40 s, not 4 hours.
-- **Kill a specific running job — on demand.** An operator cancel flips `cancel_requested`; the supervisor
-  SIGTERMs *that exact child*, waits a grace window, then SIGKILLs. A reaper that finds a supervisor-less child
-  SIGTERM→SIGKILLs it and **confirms it is dead before orphaning** — so a replacement never runs while the
-  original still breathes. Every kill is start-time-checked, so a recycled PID is never the victim.
-- **Isolate every job.** One job = one child process. A job that segfaults, OOMs, or blocks for an hour can't
-  take down the supervisor or its siblings, and because the supervisor is *watching* it, a busy job is never
-  mistaken for a dead one. Lanes and a dedicated DB connection isolate fleets and coordination traffic.
-- **Bleed off work for zero-loss deploys.** On SIGTERM the supervisor stops claiming, lets its in-flight
-  children finish (a bounded drain window), then exits — so a rolling deploy drains gracefully instead of
-  abandoning jobs. (Prefork recycling reuses the same drain to periodically rebaseline the worker.)
-- **Never double-run by accident.** Reassignment bumps a **fencing token**, so a presumed-dead worker that comes
-  back can't clobber the new owner. And idempotency is binary: a lost idempotent job retries automatically; a
-  non-idempotent one **parks** for an operator instead of silently running twice. Every step lands in a durable
-  audit ledger.
+## When to use JobWarden
 
-Two more things queues make you bolt on, here for free:
+JobWarden is a good fit when your jobs are:
 
-- **No Redis to operate.** Your database is already durable, transactional, and backed up. JobWarden coordinates
-  entirely through it (`FOR UPDATE SKIP LOCKED`, with an optimistic-CAS fallback where that isn't available).
-- **Batches, DAGs & scheduling, built in** — fan-out, chains, arbitrary dependency graphs, cron, and one-off
-  runs — all on the same durable substrate, all under the same positive control.
+- long-running,
+- expensive to repeat,
+- operationally important,
+- unsafe to blindly retry,
+- hard to make fully idempotent,
+- part of a batch or dependency graph,
+- coordinating external systems,
+- or important enough that operators need to see, cancel, retry, park, or inspect them.
 
-JobWarden coexists with Laravel's Bus/Queue; it does **not** hijack `dispatch()`.
+Examples:
+
+- marketplace syncs,
+- catalog imports,
+- inventory reconciliation,
+- billing runs,
+- fulfillment workflows,
+- ERP/WMS integrations,
+- report generation,
+- file processing,
+- ETL jobs,
+- scheduled maintenance jobs,
+- multi-step operational workflows,
+- and any job where "it might run twice" is not acceptable.
+
+Stick with Laravel Queue / Horizon when your jobs are short, cheap, naturally idempotent, and queue timeouts are good enough.
+
+JobWarden is designed to **coexist** with Laravel's Bus and Queue systems. It does not hijack `dispatch()`. You can adopt it selectively for the jobs that need stronger guarantees.
+
+---
+
+## Design principles
+
+JobWarden is built around a few deliberate choices.
+
+### The database is the source of truth
+
+JobWarden coordinates through a relational database using durable state transitions.
+
+It does not require Redis.
+
+Your database is already durable, transactional, backed up, observable, and part of your application's recovery story. JobWarden uses that substrate for job state, attempts, claims, fences, batches, schedules, and operator actions.
+
+Databases with `FOR UPDATE SKIP LOCKED` work best. Where that is not available, JobWarden falls back to optimistic compare-and-swap claiming.
+
+### Every job runs in its own child process
+
+A job that segfaults, OOMs, blocks, or gets stuck should not take down the supervisor or poison unrelated jobs.
+
+The supervisor owns process lifecycle. The child owns user work.
+
+### Liveness is not the job's responsibility
+
+A busy job should not have to heartbeat from inside user code.
+
+If a job is legitimately blocked for an hour, that does not mean it is dead. JobWarden watches the process from outside the job.
+
+### Recovery must be verified
+
+JobWarden does not assume a job is dead just because time passed.
+
+It verifies process identity and host liveness before orphaning, killing, retrying, or parking work.
+
+### Retrying is an idempotency decision
+
+JobWarden treats idempotency as a binary safety gate.
+
+If a lost job is idempotent, it may be retried automatically.
+
+If it is not idempotent, JobWarden parks it for operator review instead of silently double-running business logic.
+
+---
+
+## Features
+
+### Durable jobs
+
+Dispatch JSON-serializable job parameters into durable database state.
+
+Each job records its lifecycle, attempts, failures, retries, cancellation requests, and recovery decisions.
+
+### Process-aware execution
+
+Every attempt runs in a dedicated Linux child process and records enough OS identity to verify that process later.
+
+### Verified orphan detection
+
+JobWarden has a three-tier recovery model:
+
+1. **Supervisor watch**  
+   The supervisor `waitpid`s its own children and observes exits immediately.
+
+2. **Local reaper**  
+   A per-host reaper checks `/proc` process stamps and catches children whose supervisor died.
+
+3. **Global reaper**  
+   A leader-leased global reaper detects stale workers and dead hosts across the fleet.
+
+This lets recovery be based on verified liveness instead of guessing from job duration.
+
+### Fencing-token recovery
+
+Every reassignment bumps a fencing token.
+
+If a presumed-dead worker comes back later, stale ownership cannot clobber the newer owner.
+
+### Idempotency-gated retry
+
+Jobs explicitly declare whether they are safe to auto-retry.
+
+Idempotent jobs can be retried.
+
+Non-idempotent jobs park for an operator instead of being blindly re-run.
+
+### Targeted cancellation
+
+Operators can cancel one specific running job.
+
+The supervisor signals the exact stamped child process, waits a grace window, escalates if needed, and confirms the process is dead.
+
+Start-time checks protect against PID reuse.
+
+### Graceful drains
+
+On shutdown, a supervisor stops claiming new work, lets existing children finish within a bounded drain window, and then exits.
+
+This supports rolling deploys without abandoning in-flight work.
+
+### Crash isolation
+
+One job runs in one child process.
+
+A crash, OOM, segfault, or blocked job does not take down the supervisor or unrelated jobs.
+
+### Batches, chains, and DAGs
+
+JobWarden includes durable workflow primitives:
+
+- fan-out batches,
+- sequential chains,
+- arbitrary dependency graphs,
+- dependency-gated admission,
+- failure policies,
+- and batch-level observability.
+
+### Scheduling
+
+JobWarden includes durable cron and one-off scheduling.
+
+Schedules can dispatch JobWarden jobs or Artisan commands.
+
+### Operator API and dashboard
+
+JobWarden includes:
+
+- a gated JSON API,
+- server-rendered Livewire dashboard,
+- read models,
+- operator actions,
+- scheduling endpoints,
+- and authorization hooks.
+
+---
 
 ## Requirements
 
-- PHP **8.3+**, Laravel **11 or 12**
-- **Linux** for the runtime (the liveness model uses POSIX signals, `proc_open`/`pcntl`, and `/proc`)
-- A database — best with `SKIP LOCKED` (PostgreSQL ≥ 9.5, MySQL ≥ 8.0.1, MariaDB ≥ 10.6); others fall back to
-  an optimistic claim. MariaDB on RDS is the primary production target.
+- PHP **8.3+**
+- Laravel **11 or 12**
+- Linux runtime
+- A relational database
+
+The runtime uses Linux process features:
+
+- POSIX signals,
+- `proc_open`,
+- `pcntl`,
+- and `/proc`.
+
+Database support:
+
+- PostgreSQL 9.5+
+- MySQL 8.0.1+
+- MariaDB 10.6+
+- SQLite for tests and local development
+
+Databases with `FOR UPDATE SKIP LOCKED` are preferred. Other supported databases use an optimistic claim fallback.
+
+MariaDB on RDS is the primary production target.
+
+---
 
 ## Installation
 
 ```bash
 composer require kpconnell/laravel-jobwarden
+
 php artisan jobwarden:install --migrate
 ```
 
-`jobwarden:install` publishes `config/jobwarden.php` and the migrations; `--migrate` runs them. By default
-JobWarden uses a **dedicated database connection** (`config('jobwarden.connection')`) so its coordination
-traffic is isolated from your app's. Every setting is env-driven with sensible defaults — you don't have to
-publish the config to tune it; see **[docs/CONFIGURATION.md](docs/CONFIGURATION.md)** for the full reference.
+The installer publishes:
+
+- `config/jobwarden.php`
+- JobWarden migrations
+
+The `--migrate` option runs the migrations immediately.
+
+By default, JobWarden uses a dedicated database connection:
+
+```php
+config('jobwarden.connection')
+```
+
+That keeps coordination traffic isolated from your application's primary query workload.
+
+Every setting is environment-driven with sensible defaults. You do not need to publish the config just to tune runtime behavior.
+
+See [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md) for the full configuration reference.
+
+---
 
 ## Defining a job
 
-A JobWarden job implements one small contract — it receives plain, JSON-serializable `params` (not a serialized
-object graph), and declares whether it is safe to auto-retry. Params are **bound to constructor parameters by
-name** (services resolve from the container as usual), so handlers get typed, promoted properties instead of
-array digging:
+A JobWarden job implements one small contract.
+
+Jobs receive plain, JSON-serializable parameters and declare whether they are safe to auto-retry.
 
 ```php
 use JobWarden\Contracts\JobWardenJob;
+use JobWarden\Dispatch\Dispatchable;
 use JobWarden\Runner\JobContext;
 
 final class ImportCatalog implements JobWardenJob
 {
-    use \JobWarden\Dispatch\Dispatchable;
+    use Dispatchable;
 
     public function __construct(
-        private readonly string $storeId,         // data — bound from params by name
-        private readonly bool $fullSync = false,  // data — optional param
+        private readonly string $storeId,
+        private readonly bool $fullSync = false,
     ) {
     }
 
     public function handle(JobContext $context, ?CatalogClient $client = null): void
     {
-        // $client is container-injected per-run (constructors are data-only)
-        // ... do the work; throwing = failure, returning = success ...
+        // $client is container-injected per run.
+        // Constructors are data-only.
+        //
+        // Do the work here.
+        // Returning means success.
+        // Throwing means failure.
     }
 
     public function idempotent(): bool
     {
-        return true; // lost/failed runs may be safely re-executed
+        return true;
     }
 }
 ```
 
-The constructor carries data — a literal mirror of the params JSON — and `handle()` receives services via
-container method injection. Backed enums and date-times coerce from their JSON representations; Eloquent
-models are deliberately not hydrated (pass the key, fetch in `handle()`). See
-**[docs/JOB-AUTHORING.md](docs/JOB-AUTHORING.md)** for the binding rules, supported types, and everything
-available inside a run.
+The constructor carries data.
 
-## Dispatching
+Parameters are bound to constructor arguments by name, so job handlers get typed promoted properties instead of array digging.
+
+Services are resolved from the container into `handle()` using method injection.
+
+Supported parameter types include primitives, arrays, backed enums, and date-time values that can be represented in JSON.
+
+Eloquent models are deliberately not hydrated. Pass keys and fetch models inside `handle()`.
+
+See [`docs/JOB-AUTHORING.md`](docs/JOB-AUTHORING.md) for binding rules, supported types, and the full run context.
+
+---
+
+## Dispatching jobs
+
+You can dispatch through the opt-in `Dispatchable` trait:
 
 ```php
-// Horizon-style, via the opt-in Dispatchable trait — idempotency comes from the class:
 ImportCatalog::dispatch('store-42', fullSync: true);
-ImportCatalog::inLane('reports')->delay(300)->maxAttempts(3)->dispatch(storeId: 'store-42');
-
-// or the service API (the HTTP-API/schedule path):
-use JobWarden\JobWarden;
-
-app(JobWarden::class)->dispatch(ImportCatalog::class, ['storeId' => 'store-42'], [
-    'idempotent'   => true,
-    'max_attempts' => 3,
-    'priority'     => 10,
-    'available_at' => now()->addMinutes(5), // optional delay
-]);
 ```
 
-### Batches (fan-out, chains, DAGs)
+You can also configure lane, delay, attempts, and named parameters:
 
 ```php
+ImportCatalog::inLane('reports')
+    ->delay(300)
+    ->maxAttempts(3)
+    ->dispatch(storeId: 'store-42');
+```
+
+Or use the service API directly:
+
+```php
+use JobWarden\JobWarden;
+
+app(JobWarden::class)->dispatch(
+    ImportCatalog::class,
+    ['storeId' => 'store-42'],
+    [
+        'idempotent' => true,
+        'max_attempts' => 3,
+        'priority' => 10,
+        'available_at' => now()->addMinutes(5),
+    ],
+);
+```
+
+The service API is useful for HTTP APIs, dashboards, internal tools, and schedules.
+
+---
+
+## Batches, chains, and DAGs
+
+JobWarden supports fan-out, chains, and arbitrary dependency graphs on the same durable substrate.
+
+```php
+use JobWarden\JobWarden;
+
 app(JobWarden::class)->batch('nightly-sync', failurePolicy: 'continue')
-    ->add('extract',   ExtractJob::class,   ['store_id' => 42])
+    ->add('extract', ExtractJob::class, ['store_id' => 42])
     ->add('transform', TransformJob::class, ['store_id' => 42], dependsOn: ['extract'])
-    ->add('load',      LoadJob::class,      ['store_id' => 42], dependsOn: ['transform'])
-    ->add('report',    ReportJob::class,    [],                 dependsOn: ['load'])
+    ->add('load', LoadJob::class, ['store_id' => 42], dependsOn: ['transform'])
+    ->add('report', ReportJob::class, [], dependsOn: ['load'])
     ->dispatch();
 ```
 
-A member with no `dependsOn` starts immediately; one with dependencies is admitted only when **all** of them
-have succeeded. Independent chains run in parallel. Failure policies: `continue`, `fail_fast`, `threshold(N)`.
+A member with no dependencies starts immediately.
 
-### Scheduling
+A member with dependencies is admitted only when all of its dependencies have succeeded.
 
-```php
-$jw = app(JobWarden::class);
-$jw->schedule('hourly-metrics', '0 * * * *', ComputeMetrics::class);      // cron → a job
-$jw->scheduleCommand('nightly-prune', '0 3 * * *', 'cache:prune');        // cron → an artisan command
-$jw->scheduleOnce('one-off', now()->addHour(), SendDigest::class);        // fire once
-```
+Independent chains can run in parallel.
 
-## Running the engine
+Failure policies:
 
-JobWarden runs as **long-running processes**. `jobwarden:work` already brings its own Tier-2 local
-reaper (a co-resident child process), so the minimum is a worker, the global reaper, and the scheduler:
+- `continue`
+- `fail_fast`
+- `threshold(N)`
 
-```bash
-php artisan jobwarden:work          # claim + run jobs — and bundle a co-resident Tier-2 reaper
-php artisan jobwarden:reap:global   # Tier-3: detect dead workers fleet-wide (leader-leased)
-php artisan jobwarden:schedule      # evaluate schedules
-```
+---
 
-You never have to remember `jobwarden:reap:local` — the worker spawns it, and a per-host lease keeps
-exactly one active even when several workers share a box. (It remains a standalone command for
-advanced split topologies.)
+## Scheduling
 
-Each daemon should be supervised by the OS (systemd `Restart=always`, or a container restart policy). Unit
-templates are in [`packaging/systemd/`](packaging/systemd), and a container image that runs any set of roles
-via a `JOBWARDEN_ROLES` env var is in [`docker/`](docker) (see [`docker-compose.yml`](docker-compose.yml) for a
-full local stack).
-
-**→ See [docs/HOSTING.md](docs/HOSTING.md)** for deployment topologies: serving the UI from your existing app
-host, running everything on a single worker box, and how to scale out to a fleet.
-
-### How recovery works (the short version)
-
-Every claim is stamped with the claiming worker's globally-unique id and a fencing token. A worker heartbeats a
-lease while it lives. When a lease goes stale, a reaper orphans that worker's in-flight attempts — bumping the
-fence so the presumed-dead worker can never clobber the reassignment — and recovery re-queues idempotent jobs or
-parks non-idempotent ones. Liveness is never the job's responsibility: jobs run in a child process the
-supervisor watches, so a job that blocks for an hour is never mistaken for a dead one.
-
-## Operator API & dashboard
-
-A gated JSON API (read models + actions + scheduling) mounts under `config('jobwarden.api.prefix')`, and a
-server-rendered Livewire dashboard mounts under `config('jobwarden.dashboard.prefix')`. Both sit behind an
-authorization gate that defaults to local-only — open it explicitly:
+JobWarden can schedule jobs and Artisan commands.
 
 ```php
 use JobWarden\JobWarden;
 
-JobWarden::auth(fn ($request) => $request->user()?->can('viewJobWarden') ?? false);
+$jw = app(JobWarden::class);
+
+$jw->schedule(
+    'hourly-metrics',
+    '0 * * * *',
+    ComputeMetrics::class,
+);
+
+$jw->scheduleCommand(
+    'nightly-prune',
+    '0 3 * * *',
+    'cache:prune',
+);
+
+$jw->scheduleOnce(
+    'one-off-digest',
+    now()->addHour(),
+    SendDigest::class,
+);
 ```
 
-See [`docs/API.md`](docs/API.md) for the full endpoint reference.
+Schedules are durable and evaluated by the JobWarden scheduler daemon.
+
+---
+
+## Running JobWarden
+
+JobWarden runs as long-lived processes.
+
+The minimum production topology is:
+
+```bash
+php artisan jobwarden:work
+php artisan jobwarden:reap:global
+php artisan jobwarden:schedule
+```
+
+`jobwarden:work` claims and runs jobs.
+
+It also starts the Tier-2 local reaper as a co-resident child process. You normally do not need to run `jobwarden:reap:local` yourself.
+
+`jobwarden:reap:global` performs fleet-wide recovery using a leader lease.
+
+`jobwarden:schedule` evaluates schedules and admits due work.
+
+Each daemon should be supervised by the operating system or container platform.
+
+Examples:
+
+- systemd with `Restart=always`
+- Docker / Compose restart policies
+- Kubernetes deployments
+- ECS services
+- other container supervisors
+
+Systemd templates are included in [`packaging/systemd/`](packaging/systemd).
+
+A container image that can run any set of roles through `JOBWARDEN_ROLES` is included in [`docker/`](docker).
+
+See [`docker-compose.yml`](docker-compose.yml) for a local stack.
+
+See [`docs/HOSTING.md`](docs/HOSTING.md) for deployment topologies, including:
+
+- serving the UI from an existing app host,
+- running everything on one worker box,
+- splitting roles across hosts,
+- and scaling out to a fleet.
+
+---
+
+## Recovery model
+
+Every claim is stamped with:
+
+- the claiming worker ID,
+- process identity,
+- attempt state,
+- and a fencing token.
+
+A worker heartbeats a lease while it is alive.
+
+When a lease goes stale, a reaper verifies liveness before orphaning the worker's in-flight attempts.
+
+Recovery then follows the job's idempotency declaration:
+
+- idempotent jobs may be re-queued,
+- non-idempotent jobs are parked for operator review.
+
+Because reassignment bumps the fencing token, a stale worker cannot safely write as the current owner after recovery.
+
+Because liveness is checked outside the job process, a long-running or blocked job is not mistaken for a dead one merely because it is busy.
+
+---
+
+## Cancellation model
+
+JobWarden supports targeted cancellation of a specific running attempt.
+
+When an operator requests cancellation:
+
+1. the attempt is marked `cancel_requested`,
+2. the owning supervisor sees the request,
+3. the supervisor verifies the stamped child process,
+4. it sends SIGTERM,
+5. waits a configured grace period,
+6. escalates to SIGKILL if necessary,
+7. and confirms the process is dead.
+
+If a reaper finds a supervisor-less child, it uses the same verified process identity before killing or orphaning the attempt.
+
+PID reuse is guarded by `/proc` start-time checks.
+
+---
+
+## Deploy and shutdown behavior
+
+When a supervisor receives a shutdown signal, it drains.
+
+Drain behavior:
+
+1. stop claiming new jobs,
+2. continue watching existing children,
+3. allow in-flight work to finish within a bounded window,
+4. exit cleanly.
+
+This makes rolling deploys much safer for long-running jobs.
+
+The same drain mechanism is also used by prefork recycling to periodically rebaseline workers.
+
+---
+
+## Operator API and dashboard
+
+JobWarden includes a gated JSON API and a Livewire dashboard.
+
+The API mounts under:
+
+```php
+config('jobwarden.api.prefix')
+```
+
+The dashboard mounts under:
+
+```php
+config('jobwarden.dashboard.prefix')
+```
+
+Both are protected by an authorization gate that defaults to local-only.
+
+Open access explicitly:
+
+```php
+use JobWarden\JobWarden;
+
+JobWarden::auth(
+    fn ($request) => $request->user()?->can('viewJobWarden') ?? false
+);
+```
+
+See [`docs/API.md`](docs/API.md) for the endpoint reference.
+
+---
 
 ## Testing
 
+Run the package test suite:
+
 ```bash
-composer test                       # SQLite (fast)
-# full matrix (SQLite + MariaDB + Postgres) runs in the Docker stack and in CI
-docker compose run --rm migrate php vendor/bin/testbench package:test
+composer test
 ```
+
+That runs the fast SQLite suite.
+
+The full database matrix runs in Docker and CI:
+
+```bash
+docker compose run --rm migrate
+
+php vendor/bin/testbench package:test
+```
+
+The test matrix covers SQLite, MariaDB/MySQL, and PostgreSQL.
+
+---
+
+## Comparison with Laravel Queue and Horizon
+
+JobWarden is not a replacement for every Laravel queue use case.
+
+Laravel Queue and Horizon are excellent for high-throughput, short-lived, naturally idempotent background jobs.
+
+JobWarden is for jobs where execution control matters more than raw queue throughput.
+
+| Use case | Prefer |
+|---|---|
+| Emails, notifications, cache warming | Laravel Queue / Horizon |
+| Short idempotent webhook fan-out | Laravel Queue / Horizon |
+| High-throughput generic background work | Laravel Queue / Horizon |
+| Long-running imports or syncs | JobWarden |
+| Non-idempotent or hard-to-retry workflows | JobWarden |
+| Jobs that need exact operator cancellation | JobWarden |
+| Jobs that must survive dead hosts without blind double-run | JobWarden |
+| Batches, chains, DAGs, and schedules needing durable auditability | JobWarden |
+
+A common deployment pattern is to use both:
+
+- Horizon for ordinary application jobs,
+- JobWarden for the operationally sensitive workflows.
+
+---
+
+## Current status
+
+JobWarden is currently `1.0.0-beta`.
+
+The core execution, recovery, batching, scheduling, dashboard, and API features are complete.
+
+The project is beta because public APIs may still receive minor adjustments before `1.0.0`.
+
+Feedback, design review, and real-world testing are welcome.
+
+---
+
+## Documentation
+
+- [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md)
+- [`docs/JOB-AUTHORING.md`](docs/JOB-AUTHORING.md)
+- [`docs/API.md`](docs/API.md)
+- [`docs/HOSTING.md`](docs/HOSTING.md)
+
+---
 
 ## License
 
-MIT © Kevin Connell. See [LICENSE](LICENSE).
+MIT © Kevin Connell.
+
+See [LICENSE](LICENSE).

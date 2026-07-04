@@ -128,7 +128,11 @@ return [
     |--------------------------------------------------------------------------
     */
     'retry' => [
-        'max_attempts' => (int) env('JOBWARDEN_MAX_ATTEMPTS', 1),
+        // The retry budget only ever spends for IDEMPOTENT jobs (non-idempotent
+        // jobs never retry — they fail on error and park on orphan regardless of
+        // budget), so a >1 default is safe fleet-wide and means "idempotent"
+        // actually buys recovery without each dispatch site granting a budget.
+        'max_attempts' => (int) env('JOBWARDEN_MAX_ATTEMPTS', 4),
         'backoff' => [
             'strategy' => env('JOBWARDEN_BACKOFF_STRATEGY', 'exponential'),
             'base' => (int) env('JOBWARDEN_BACKOFF_BASE', 5),

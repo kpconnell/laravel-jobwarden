@@ -184,7 +184,7 @@ class JobWarden
                 'idempotency_key' => $options['idempotency_key'] ?? null,
                 'priority' => (int) ($options['priority'] ?? 0),
                 'state' => $eligible ? JobState::Queued : JobState::Pending,
-                'max_attempts' => (int) ($options['max_attempts'] ?? config('jobwarden.retry.max_attempts', 1)),
+                'max_attempts' => (int) ($options['max_attempts'] ?? config('jobwarden.retry.max_attempts', 4)),
                 'attempt_count' => 0,
                 'max_runtime_sec' => $options['max_runtime_sec'] ?? config('jobwarden.stuck.max_runtime_sec'),
                 'backoff_strategy' => $options['backoff_strategy'] ?? config('jobwarden.retry.backoff.strategy'),

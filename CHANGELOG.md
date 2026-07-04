@@ -113,6 +113,25 @@ All notable changes to `laravel-jobwarden` are documented here. The format follo
   is empty at the end of chaos tests.
 
 ### Changed
+- **Default retry budget raised: `JOBWARDEN_MAX_ATTEMPTS` now defaults to 4 (was 1).**
+  With a budget of 1, declaring a job idempotent bought nothing unless the dispatch
+  site also granted attempts — the first failure or host-loss orphaning was terminal
+  (`orphaned → failed (attempts exhausted)`). The budget only ever spends for
+  idempotent jobs — non-idempotent jobs fail on error and park on orphan regardless —
+  so the higher default is safe fleet-wide. Explicit per-job `max_attempts` and env
+  overrides behave exactly as before. (The scheduled tier already defaulted
+  idempotent runs to 3.)
+- **The admit pass is priority-first** (new migration — run `php artisan migrate`). The
+  Admitter's promotion window (`pending`/`retrying → queued`, LIMIT 200 per pass) was
+  ordered by `available_at` alone, so when more rows were eligible than one window —
+  routine at fleet scale — every slot went to earlier-due low-priority rows and a
+  high-priority job waited passes on end while low-priority work already ran. Admission
+  now orders `priority DESC, available_at ASC`, consistent with the claim's
+  `priority DESC, created_at ASC`; below the window size behavior is unchanged (the
+  claim re-sorts `queued` anyway). Backed by a new `(state, priority DESC, available_at)`
+  index — the admit pass previously had no serving index at all and filesorted the jobs
+  table every tick. Scheduling semantics now documented in
+  **docs/SCHEDULING-AND-PRIORITY.md**.
 - **`jobwarden:work` bundles its own Tier-2 local reaper.** The worker now spawns a
   co-resident `jobwarden:reap:local` as a separate child process, so a worker can never
   run without recovery and you never start the reaper yourself. It stays a distinct

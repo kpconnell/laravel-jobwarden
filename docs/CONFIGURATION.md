@@ -100,7 +100,7 @@ floor/ceiling bound the ramp.
 
 | Env var | Default | Effect |
 |---|---|---|
-| `JOBWARDEN_MAX_ATTEMPTS` | `1` | Default attempts before a job is terminal (per-job `max_attempts` overrides). |
+| `JOBWARDEN_MAX_ATTEMPTS` | `4` | Default attempts before a job is terminal (per-job `max_attempts` overrides). Only idempotent jobs ever spend the budget — non-idempotent jobs never retry. |
 | `JOBWARDEN_BACKOFF_STRATEGY` | `exponential` | Retry backoff shape (`exponential` / `fixed`). |
 | `JOBWARDEN_BACKOFF_BASE` | `5` | Base backoff seconds. |
 | `JOBWARDEN_BACKOFF_CAP` | `300` | Max backoff seconds. |

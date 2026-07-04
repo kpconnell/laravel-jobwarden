@@ -108,7 +108,7 @@ return [
     |--------------------------------------------------------------------------
     */
     'retry' => [
-        'max_attempts' => (int) env('JOBWARDEN_MAX_ATTEMPTS', 1),
+        'max_attempts' => (int) env('JOBWARDEN_MAX_ATTEMPTS', 4),
         'backoff' => [
             'strategy' => env('JOBWARDEN_BACKOFF_STRATEGY', 'exponential'),
             'base' => (int) env('JOBWARDEN_BACKOFF_BASE', 5),

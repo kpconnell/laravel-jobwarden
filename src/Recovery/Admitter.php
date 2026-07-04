@@ -38,9 +38,15 @@ final class Admitter
         // Carbon::setTestNow() so time-travel tests still exercise the delay.
         $now = SqlTime::nowExpr(Job::query()->getConnection());
 
+        // Priority first: below the window size admission order is invisible (the
+        // claim re-sorts `queued` by priority anyway), but when more rows are
+        // eligible than the LIMIT, due-time-only ordering would hand every slot to
+        // earlier-due low-priority work and park a high-priority job for passes on
+        // end. Within a band, earliest due first.
         $query = Job::query()
             ->where('state', $from->value)
             ->where(fn ($q) => $q->whereNull('available_at')->orWhereRaw("available_at <= {$now}"))
+            ->orderByDesc('priority')
             ->orderBy('available_at')
             ->limit($limit);
 

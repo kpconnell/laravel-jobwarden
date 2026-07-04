@@ -19,6 +19,7 @@ use JobWarden\States\JobState;
 use JobWarden\Support\SqlTime;
 use Illuminate\Database\Connection;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
 
 /**
  * Derives a batch's lifecycle from its members (spec §8). Reacts to each member
@@ -66,6 +67,61 @@ final class BatchCoordinator
         }
 
         $this->maybeComplete($batch);
+    }
+
+    /**
+     * The event-loss backstop (leader-only, called from the global reaper's
+     * tick). Batch lifecycle normally advances via after-commit JobStateChanged
+     * listeners — and a process that dies between a member's commit and its
+     * listener loses that event FOREVER: a batch is left `running` with nothing
+     * in flight, an eager failure policy goes unapplied, or dependents sit
+     * `pending` behind an upstream that can no longer succeed. Everything the
+     * lost event would have decided is re-derivable from the counters (which the
+     * StateMachine maintains transactionally, not via events) and the dependency
+     * table, so this sweep re-derives it. Every action funnels through the same
+     * guarded writes the live path uses, so racing a live listener is harmless —
+     * one writer wins, the other no-ops.
+     */
+    public function reconcile(int $limit = 200): void
+    {
+        // Stranded dependents first: their cancellation updates the counters that
+        // the completion sweep below reads, so one pass converges a lost-event
+        // chain (upstream failed → dependent canceled → batch partial).
+        foreach ($this->strandedMemberIds($limit) as $id) {
+            $job = Job::find($id);
+            if ($job === null) {
+                continue;
+            }
+
+            Log::warning('batch reconcile: canceling a member stranded behind a non-succeeded dependency', [
+                'role' => 'batch_reconcile',
+                'job_id' => (string) $job->id,
+                'batch_id' => (string) $job->batch_id,
+            ]);
+            $this->cancelMember($job, 'unreachable: an upstream dependency did not succeed');
+        }
+
+        foreach ($this->reconcilableBatchIds($limit) as $id) {
+            $batch = Batch::find($id);
+            if ($batch === null || $batch->state->isTerminal()) {
+                continue; // healed by a live listener in the meantime
+            }
+
+            Log::warning('batch reconcile: healing a batch whose member event was lost', [
+                'role' => 'batch_reconcile',
+                'batch_id' => (string) $batch->id,
+                'failure_policy' => $batch->failure_policy,
+            ]);
+
+            if ($this->shouldEagerFail($batch)) {
+                $this->transitionBatch($batch, BatchState::Failed, "member failed ({$batch->failure_policy})");
+                $this->cancelRemainingMembers($batch, "batch member failed under {$batch->failure_policy}");
+
+                continue;
+            }
+
+            $this->maybeComplete($batch);
+        }
     }
 
     /** Cancel a whole batch — propagates to every non-terminal member (spec §8.3). */
@@ -152,6 +208,65 @@ final class BatchCoordinator
         } catch (IllegalTransitionException|GuardFailedException|StaleFencingTokenException) {
             // raced with a claim/transition — the desired-state flag remains.
         }
+    }
+
+    /**
+     * Running batches whose lost member-event is re-derivable from the counters:
+     * nothing left in flight (a lost completion), or an eager failure policy that
+     * a member's recorded failure should already have tripped.
+     *
+     * @return string[]
+     */
+    private function reconcilableBatchIds(int $limit): array
+    {
+        return $this->connection()->table($this->tbl('batches'))
+            ->where('state', BatchState::Running->value)
+            ->where(function ($q): void {
+                $q->whereRaw('pending_count + running_count = 0')
+                    ->orWhere(function ($q): void {
+                        $q->where('failure_policy', 'fail_fast')->where('failed_count', '>', 0);
+                    })
+                    ->orWhere(function ($q): void {
+                        $q->where('failure_policy', 'threshold')
+                            ->whereRaw('failed_count > COALESCE(failure_threshold, 0)');
+                    });
+            })
+            ->orderBy('id')
+            ->limit($limit)
+            ->pluck('id')
+            ->map(static fn ($id): string => (string) $id)
+            ->all();
+    }
+
+    /**
+     * Pending members of running batches with an upstream dependency that is
+     * terminally non-succeeded — they can never be admitted (deps are strict) and
+     * a lost cascade event means nobody canceled them. `orphaned` upstreams are
+     * deliberately NOT doomed: a parked orphan awaits an operator verdict and may
+     * still be restarted.
+     *
+     * @return string[]
+     */
+    private function strandedMemberIds(int $limit): array
+    {
+        $doomed = [JobState::Failed->value, JobState::Canceled->value, JobState::Stopped->value];
+
+        return $this->connection()->table($this->tbl('jobs').' as j')
+            ->join($this->tbl('batches').' as b', 'b.id', '=', 'j.batch_id')
+            ->where('b.state', BatchState::Running->value)
+            ->where('j.state', JobState::Pending->value)
+            ->whereExists(function ($q) use ($doomed): void {
+                $q->selectRaw('1')
+                    ->from($this->tbl('job_dependencies').' as d')
+                    ->join($this->tbl('jobs').' as dep', 'dep.id', '=', 'd.depends_on_job_id')
+                    ->whereColumn('d.job_id', 'j.id')
+                    ->whereIn('dep.state', $doomed);
+            })
+            ->orderBy('j.id')
+            ->limit($limit)
+            ->pluck('j.id')
+            ->map(static fn ($id): string => (string) $id)
+            ->all();
     }
 
     private function transitionBatch(Batch $batch, BatchState $to, ?string $reason): void

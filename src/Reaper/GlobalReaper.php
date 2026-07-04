@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace JobWarden\Reaper;
 
+use JobWarden\Batch\BatchCoordinator;
 use JobWarden\Models\Job;
 use JobWarden\Models\JobAttempt;
 use JobWarden\Recovery\RecoveryService;
@@ -49,6 +50,7 @@ final class GlobalReaper
         private readonly AttemptOrphaner $orphaner,
         private readonly StateMachine $stateMachine,
         private readonly RecoveryService $recovery,
+        private readonly BatchCoordinator $batches,
     ) {
     }
 
@@ -65,6 +67,10 @@ final class GlobalReaper
         }
 
         $this->reconcileStrandedJobs($reaperId);
+
+        // Batch-level backstop: batches advance via after-commit events, which a
+        // crash can lose forever — re-derive the lost decision from the counters.
+        $this->batches->reconcile();
 
         return true;
     }

@@ -34,6 +34,13 @@ use Illuminate\Support\Facades\Log;
  * elsewhere. (The local reaper still keys on host_id because it /proc-verifies
  * each child and can therefore tell a reused host_id apart; Tier 3 cannot verify
  * across hosts, so it must key on the unique per-process id.)
+ *
+ * `stopped` is a live state here too, not just `active`/`starting`/`draining`/`dead`:
+ * a supervisor that hits `drain_timeout` abandons its still-running children and
+ * marks its OWN row `stopped` on the way out (Supervisor::shutdown()) — the
+ * attempt it owned never got a chance to be finalized. A `stopped` row is just as
+ * capable of stranding in-flight attempts as a `dead` one, and must be scanned the
+ * same way once its heartbeat goes stale.
  */
 final class GlobalReaper
 {
@@ -172,9 +179,12 @@ final class GlobalReaper
             // states: a prior reap can mark a worker `dead` yet die before finishing
             // its orphan pass (or be killed mid-loop by a container teardown),
             // stranding that worker's in-flight attempts forever because a `dead`
-            // row was never re-scanned. Gate on actually owning an in-flight attempt
-            // so we don't re-touch already-cleaned dead rows on every scan.
-            ->whereIn('state', ['active', 'starting', 'draining', 'dead'])
+            // row was never re-scanned. Also include `stopped`: a supervisor that
+            // abandons children after `drain_timeout` sets its own row `stopped`
+            // while still owning an in-flight attempt. Gate on actually owning an
+            // in-flight attempt so we don't re-touch already-cleaned rows on every
+            // scan (a normal graceful stop never has one, so this can't misfire).
+            ->whereIn('state', ['active', 'starting', 'draining', 'dead', 'stopped'])
             ->whereRaw('heartbeat_at < '.SqlTime::nowMinus($conn, $this->budgetSeconds()))
             ->whereExists(function ($q) use ($conn): void {
                 $q->selectRaw('1')
@@ -190,10 +200,12 @@ final class GlobalReaper
     {
         $conn = $this->connection();
 
-        // Declare this specific dead process's row dead (no skew — DB clock).
+        // Declare this specific dead process's row dead (no skew — DB clock). A
+        // `stopped` row (drain-timeout abandonment) is reclassified to `dead` too,
+        // so the dashboard reflects that it stranded work rather than stopping clean.
         $conn->table($this->tbl('workers'))
             ->where('id', $workerId)
-            ->whereIn('state', ['active', 'starting', 'draining'])
+            ->whereIn('state', ['active', 'starting', 'draining', 'stopped'])
             ->update(['state' => 'dead', 'stopped_at' => $conn->raw('CURRENT_TIMESTAMP'), 'last_signal' => 'worker_dead']);
 
         $attempts = JobAttempt::query()

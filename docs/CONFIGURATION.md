@@ -80,7 +80,7 @@ JobWarden::auth(fn ($request) => $request->user()?->can('viewJobWarden') ?? fals
 | `JOBWARDEN_EXECUTION_MODE` | `child` | `child` = a fresh `php` process per job (full isolation, ~144ms boot each). `prefork` = fork the already-booted supervisor per job (same isolation, no boot; needs `pcntl`). See [HOSTING → Execution model](HOSTING.md#execution-model-child-vs-prefork). |
 | `JOBWARDEN_PREFORK_RECYCLE_AFTER` | `50000` | `prefork` only — forks before the master drains + restarts for a fresh copy-on-write baseline. `0` disables. |
 | `JOBWARDEN_GRACEFUL_TIMEOUT` | `10` | Seconds a stop waits (SIGTERM → SIGKILL) for a cancelled child before force-killing it. |
-| `JOBWARDEN_DRAIN_TIMEOUT` | `0` | Seconds a supervisor waits for in-flight children on SIGTERM. `0` = wait indefinitely (recommended when the orchestrator protects busy tasks). |
+| `JOBWARDEN_DRAIN_TIMEOUT` | `0` | Seconds a supervisor waits for in-flight children on SIGTERM. `0` = wait indefinitely (recommended when the orchestrator protects busy tasks). A child that outlives this timeout is **abandoned, not killed** — the supervisor stops claiming new work and exits without it, and the abandoned attempt is picked up by the Tier-3 global reaper on the normal heartbeat budget (see below), not immediately. Set this only as long as your longest expected job, or leave it `0` and rely on orchestrator task-protection instead. |
 | `JOBWARDEN_BUNDLE_REAPER` | `true` | Whether `jobwarden:work` bundles its own Tier-2 local reaper. `false` only for advanced splits that run `jobwarden:reap:local` separately. |
 
 **Poll cadence is adaptive.** The supervisor senses demand from each claim's *fill
@@ -121,6 +121,12 @@ in the system.
 | `JOBWARDEN_GLOBAL_LEASE_TTL` | `15` | Tier-3 global-reaper leader-lease TTL = failover time (seconds). |
 | `JOBWARDEN_GLOBAL_SCAN_INTERVAL` | `5` | Tier-3 scan cadence (seconds). |
 | `JOBWARDEN_RECONCILE_GRACE` | `30` | Leader-only backstop: heal a job stuck in `running` whose attempt already settled, only after this many seconds (so a healthy worker mid-completion is never raced). |
+
+A supervisor that abandons a child via `JOBWARDEN_DRAIN_TIMEOUT` marks its own
+worker row `stopped`, exactly like a normal clean exit — it is not treated as
+`dead`. The global reaper scans `stopped` rows the same as `dead` ones, so the
+abandoned attempt is still recovered once that worker's heartbeat goes stale
+(after the budget above), just not instantly.
 
 ### Stuck detection
 

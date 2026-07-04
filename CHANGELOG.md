@@ -69,6 +69,15 @@ All notable changes to `laravel-jobwarden` are documented here. The format follo
   job data lives in the constructor.
 
 ### Fixed
+- **Global reaper now recovers attempts abandoned via `drain_timeout`.** A supervisor
+  that hits `JOBWARDEN_DRAIN_TIMEOUT` abandons its still-running children and marks its
+  own worker row `stopped` on the way out — not `dead` — but `GlobalReaper`'s
+  dead-worker scan only ever looked at `active`/`starting`/`draining`/`dead`, so a
+  `stopped` row with a stale heartbeat was invisible to it forever. The attempt (and its
+  job) stayed `running` indefinitely — found in production after a deploy landed
+  mid-job. `stopped` is now scanned the same as `dead`, and a stale `stopped` worker is
+  reclassified to `dead` on reap so the dashboard reflects that it stranded work rather
+  than exiting clean. See **docs/CONFIGURATION.md → `JOBWARDEN_DRAIN_TIMEOUT`**.
 - **Documented: handlers must not use the `STDOUT`/`STDERR` constants — use `Log::` or
   `php://stderr`.** Prefork children close the constants to reclaim fds 1/2 into the
   per-attempt log (the dying-words capture), so `fwrite(STDERR, …)` throws in a handler

@@ -114,7 +114,31 @@ final class GlobalReaperTest extends TestCase
         $this->assertSame(JobState::Running, Job::find($job->id)->state);
     }
 
-    private function seedDeadWorker(string $hostId, int $staleSeconds): Worker
+    /**
+     * The drain_timeout bug: a supervisor that abandons an in-flight child after
+     * hitting drain_timeout marks its OWN worker row `stopped` (not `dead`) on the
+     * way out, with the attempt still `running`. That row must still be reaped
+     * once its heartbeat goes stale — it must not be permanently invisible just
+     * because it stopped "cleanly" from its own point of view.
+     */
+    public function test_a_worker_stopped_via_drain_timeout_with_an_abandoned_child_is_still_reaped(): void
+    {
+        $abandoned = $this->seedDeadWorker('host-DRAIN-TIMEOUT', staleSeconds: 30, state: 'stopped');
+        [$job, $attempt] = $this->seedRunningOn($abandoned, idempotent: true, maxAttempts: 3, token: 1);
+
+        $this->reaper()->tick('reaper-x');
+
+        // Reclassified dead (it stranded work, not a clean stop).
+        $this->assertSame('dead', Worker::find($abandoned->id)->state);
+
+        $attempt = JobAttempt::find($attempt->id);
+        $this->assertSame(AttemptState::Orphaned, $attempt->state);
+        $this->assertSame(2, $attempt->fencing_token);
+
+        $this->assertSame(JobState::Retrying, Job::find($job->id)->state);
+    }
+
+    private function seedDeadWorker(string $hostId, int $staleSeconds, string $state = 'active'): Worker
     {
         return Worker::create([
             'role' => 'supervisor',
@@ -122,7 +146,7 @@ final class GlobalReaperTest extends TestCase
             'hostname' => $hostId,
             'pid' => 1234,
             'incarnation' => 1,
-            'state' => 'active',
+            'state' => $state,
             'capacity' => 5,
             'started_at' => Carbon::now()->subMinutes(10),
             'heartbeat_at' => Carbon::now()->subSeconds($staleSeconds),

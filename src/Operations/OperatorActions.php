@@ -12,7 +12,7 @@ use JobWarden\StateMachine\StateMachine;
 use JobWarden\StateMachine\TransitionContext;
 use JobWarden\States\ActorType;
 use JobWarden\States\JobState;
-use Illuminate\Support\Carbon;
+use JobWarden\Support\SqlTime;
 use Illuminate\Support\Facades\DB;
 
 /**
@@ -102,12 +102,14 @@ final class OperatorActions
 
     private function setCancelFlags(Job $job, string $mode, string $reason): void
     {
-        $this->connection()->table($this->tbl('jobs'))->where('id', $job->id)->update([
+        $conn = $this->connection();
+        $now = $conn->raw(SqlTime::nowExpr($conn));
+        $conn->table($this->tbl('jobs'))->where('id', $job->id)->update([
             'cancel_requested' => true,
             'cancel_mode' => $mode,
             'cancel_reason' => $reason,
-            'cancel_requested_at' => Carbon::now(),
-            'updated_at' => Carbon::now(),
+            'cancel_requested_at' => $now,
+            'updated_at' => $now,
         ]);
     }
 

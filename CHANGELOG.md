@@ -83,7 +83,11 @@ All notable changes to `laravel-jobwarden` are documented here. The format follo
   while `started_at` (DB-clock) was correct. `JobWardenModel` now restamps both via the query
   builder (`SqlTime::nowExpr()`, `CURRENT_TIMESTAMP` — freezable under `setTestNow`) inside the
   insert transaction, matching every other coordination timestamp and adding no extra commit. A
-  caller-supplied `created_at`/`updated_at` (import/replay) is left untouched.
+  caller-supplied `created_at`/`updated_at` (import/replay) is left untouched. The same drift in
+  the explicit `Carbon::now()` writes is fixed too: the batch row's `started_at`/`finished_at`
+  (started_at even landed *before* created_at), batch/operator cancel stamps, and job **log
+  `ts`** / artifact `created_at` now use `SqlTime::nowExpr()` — so log lines and batch timings
+  read in the correct frame instead of hours off.
 - **`job_events.reason` is now MEDIUMTEXT** (new migration — run `php artisan migrate`).
   Failure reasons embed the exception message; past ~239 chars, strict-mode MariaDB/MySQL
   rejected the audit INSERT (error 1406) inside the failure-recording transaction itself.

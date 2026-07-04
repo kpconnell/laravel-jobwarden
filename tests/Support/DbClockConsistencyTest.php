@@ -81,6 +81,23 @@ final class DbClockConsistencyTest extends TestCase
         $this->assertLessThanOrEqual(5, $drift, "created_at drifted {$drift}s from the DB clock — it was written on the app timezone");
     }
 
+    public function test_batch_started_at_is_stamped_from_the_db_clock_not_the_app_timezone(): void
+    {
+        $batch = $this->app->make(JobWarden::class)->batch('b')->add('a', MarkerJob::class)->dispatch();
+
+        // The batch row's own started_at was written with Carbon::now() (app clock), so it drifted
+        // from its DB-clock created_at and from its members' timestamps — started_at even landed
+        // *before* created_at. It must sit on the DB clock like everything else.
+        $conn = (new Job)->getConnection();
+        $startedMs = (float) $conn->selectOne(
+            'SELECT '.SqlTime::epochMsExpr($conn, 'started_at').' AS ms FROM '.$batch->getTable().' WHERE id = ?',
+            [$batch->id]
+        )->ms;
+
+        $drift = abs((int) round($startedMs / 1000) - SqlTime::now($conn)->getTimestamp());
+        $this->assertLessThanOrEqual(5, $drift, "batch started_at drifted {$drift}s from the DB clock — it was written on the app timezone");
+    }
+
     private function dueByDbClock(string $id): bool
     {
         $conn = (new Job)->getConnection();

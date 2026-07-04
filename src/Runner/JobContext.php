@@ -5,7 +5,7 @@ declare(strict_types=1);
 namespace JobWarden\Runner;
 
 use Closure;
-use Illuminate\Support\Carbon;
+use JobWarden\Support\SqlTime;
 use Illuminate\Support\Facades\DB;
 use Symfony\Component\Uid\Uuid;
 
@@ -87,8 +87,8 @@ final class JobContext
     {
         $id = (string) Uuid::v7();
 
-        DB::connection(config('jobwarden.connection'))
-            ->table(((string) config('jobwarden.table_prefix')).'job_artifacts')
+        $conn = DB::connection(config('jobwarden.connection'));
+        $conn->table(((string) config('jobwarden.table_prefix')).'job_artifacts')
             ->insert([
                 'id' => $id,
                 'job_id' => $this->jobId,
@@ -101,7 +101,7 @@ final class JobContext
                 'checksum' => $opts['checksum'] ?? null,
                 'content_type' => $opts['content_type'] ?? null,
                 'meta' => isset($opts['meta']) ? json_encode($opts['meta']) : null,
-                'created_at' => Carbon::now(),
+                'created_at' => $conn->raw(SqlTime::nowExpr($conn)),
             ]);
 
         return $id;

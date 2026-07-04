@@ -16,8 +16,8 @@ use JobWarden\StateMachine\TransitionContext;
 use JobWarden\States\ActorType;
 use JobWarden\States\BatchState;
 use JobWarden\States\JobState;
+use JobWarden\Support\SqlTime;
 use Illuminate\Database\Connection;
-use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
 
 /**
@@ -132,12 +132,14 @@ final class BatchCoordinator
 
     private function cancelMember(Job $job, string $reason): void
     {
-        $this->connection()->table($this->tbl('jobs'))->where('id', $job->id)->update([
+        $conn = $this->connection();
+        $now = $conn->raw(SqlTime::nowExpr($conn));
+        $conn->table($this->tbl('jobs'))->where('id', $job->id)->update([
             'cancel_requested' => true,
             'cancel_mode' => 'cancel',
             'cancel_reason' => $reason,
-            'cancel_requested_at' => Carbon::now(),
-            'updated_at' => Carbon::now(),
+            'cancel_requested_at' => $now,
+            'updated_at' => $now,
         ]);
         $job->refresh();
 
@@ -160,14 +162,16 @@ final class BatchCoordinator
         }
 
         // Guarded UPDATE: only one concurrent finalizer wins.
-        $affected = $this->connection()->table($this->tbl('batches'))
+        $conn = $this->connection();
+        $now = $conn->raw(SqlTime::nowExpr($conn));
+        $affected = $conn->table($this->tbl('batches'))
             ->where('id', $batch->id)
             ->where('state', $from->value)
             ->update([
                 'state' => $to->value,
                 'summary' => json_encode($this->summary($batch->refresh(), $to), JSON_THROW_ON_ERROR),
-                'finished_at' => $to->isTerminal() ? Carbon::now() : $batch->finished_at,
-                'updated_at' => Carbon::now(),
+                'finished_at' => $to->isTerminal() ? $now : $batch->finished_at,
+                'updated_at' => $now,
             ]);
 
         if ($affected === 1) {

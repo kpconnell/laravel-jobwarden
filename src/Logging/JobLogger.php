@@ -5,8 +5,8 @@ declare(strict_types=1);
 namespace JobWarden\Logging;
 
 use JobWarden\Logging\Contracts\LogBodySink;
+use JobWarden\Support\SqlTime;
 use Illuminate\Database\Connection;
-use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
 
 /**
@@ -36,17 +36,18 @@ final class JobLogger
         // step is promoted to its own column; don't duplicate it in context.
         unset($context['step']);
 
+        $now = $conn->raw(SqlTime::nowExpr($conn));
         $conn->table($this->tbl('job_logs'))->insert([
             'job_id' => $jobId,
             'attempt_id' => $attemptId,
             'seq' => $seq,
-            'ts' => Carbon::now(),
+            'ts' => $now,
             'level' => $level,
             'step' => $step,
             'context' => $context === [] ? null : json_encode($context, JSON_PARTIAL_OUTPUT_ON_ERROR | JSON_UNESCAPED_SLASHES | JSON_INVALID_UTF8_SUBSTITUTE),
             'body_sink' => $this->sink->name(),
             'body_ref' => $this->sink->store($attemptId, $seq, $message),
-            'created_at' => Carbon::now(),
+            'created_at' => $now,
         ]);
     }
 

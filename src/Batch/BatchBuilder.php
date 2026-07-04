@@ -63,8 +63,13 @@ final class BatchBuilder
                 'params' => null,
                 'total_jobs' => count($this->specs),
                 'pending_count' => count($this->specs),
-                'started_at' => Carbon::now(),
             ]);
+            // started_at on the DB clock — the batch is Running from creation. Eloquent's
+            // datetime cast can't carry a raw CURRENT_TIMESTAMP, so stamp it via the query
+            // builder like every other JobWarden time column (see JobWarden::dispatch()).
+            $conn->table($batch->getTable())
+                ->where($batch->getKeyName(), $batch->getKey())
+                ->update(['started_at' => $conn->raw(SqlTime::nowExpr($conn))]);
 
             $ids = [];
             $dbNow = SqlTime::now($conn); // the DB clock, once, for eligibility math

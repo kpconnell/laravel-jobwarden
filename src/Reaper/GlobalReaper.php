@@ -168,38 +168,54 @@ final class GlobalReaper
     }
 
     /**
-     * Workers (job-claiming processes) whose OWN heartbeat has gone stale beyond
-     * the budget. Keyed per worker_id — a fresh incarnation under the same
-     * host_id cannot mask a dead one, because they are distinct worker rows.
+     * Workers whose OWN heartbeat has gone stale beyond the budget. Keyed per
+     * worker_id — a fresh incarnation under the same host_id cannot mask a dead
+     * one, because they are distinct worker rows.
+     *
+     * Two independent branches, because "stale" means something different
+     * depending on what state the row currently claims:
      *
      * @return object[] rows of {id, host_id}
      */
     private function deadWorkers(): array
     {
         $conn = $this->connection();
+        $cutoff = SqlTime::nowMinus($conn, $this->budgetSeconds());
 
-        return $conn->table($this->tbl('workers'))
+        // Still claiming to be alive (active/starting/draining) but hasn't beaten
+        // in budgetSeconds() — dead, full stop, for ANY role. This must NOT be
+        // gated on owning an in-flight attempt: a scheduler/global_reaper/
+        // local_reaper never owns one (they don't claim jobs), so a whereExists
+        // gate here would mean those roles could never be reaped at all — they'd
+        // zombie in `active` forever, silently inflating the Fleet/`/stats`
+        // counts (observed in prod: the large majority of "active" scheduler and
+        // reaper rows were long past their heartbeat budget).
+        $liveButStale = $conn->table($this->tbl('workers'))
             ->select('id', 'host_id')
-            ->where('role', 'supervisor')  // only job-claiming workers stamp attempts
-            // Stale-beyond-budget = not-alive. Include `dead`, not just the live
-            // states: a prior reap can mark a worker `dead` yet die before finishing
-            // its orphan pass (or be killed mid-loop by a container teardown),
-            // stranding that worker's in-flight attempts forever because a `dead`
-            // row was never re-scanned. Also include `stopped`: a supervisor that
-            // abandons children after `drain_timeout` sets its own row `stopped`
-            // while still owning an in-flight attempt. Gate on actually owning an
-            // in-flight attempt so we don't re-touch already-cleaned rows on every
-            // scan (a normal graceful stop never has one, so this can't misfire).
-            ->whereIn('state', ['active', 'starting', 'draining', 'dead', 'stopped'])
-            ->whereRaw('heartbeat_at < '.SqlTime::nowMinus($conn, $this->budgetSeconds()))
+            ->whereIn('state', ['active', 'starting', 'draining'])
+            ->whereRaw("heartbeat_at < {$cutoff}")
+            ->get();
+
+        // Already `dead`/`stopped` supervisors that still strand in-flight work: a
+        // prior reap can be interrupted before finishing its orphan pass, or
+        // `drain_timeout` abandonment marks the row `stopped` while an attempt is
+        // still running. Only supervisors ever own attempts, so this stays scoped
+        // to that role; the whereExists gate keeps an ordinary graceful stop (no
+        // stranded work) from being re-touched on every scan.
+        $strandedDeadOrStopped = $conn->table($this->tbl('workers'))
+            ->select('id', 'host_id')
+            ->where('role', 'supervisor')
+            ->whereIn('state', ['dead', 'stopped'])
+            ->whereRaw("heartbeat_at < {$cutoff}")
             ->whereExists(function ($q) use ($conn): void {
                 $q->selectRaw('1')
                     ->from($this->tbl('job_attempts').' as a')
                     ->whereColumn('a.worker_id', $this->tbl('workers').'.id')
                     ->whereIn('a.state', [AttemptState::Dispatched->value, AttemptState::Running->value]);
             })
-            ->get()
-            ->all();
+            ->get();
+
+        return $liveButStale->merge($strandedDeadOrStopped)->unique('id')->all();
     }
 
     private function reapWorker(string $workerId, string $hostId, string $reaperId): void

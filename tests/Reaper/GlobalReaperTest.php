@@ -14,6 +14,7 @@ use JobWarden\States\JobState;
 use JobWarden\Tests\Concerns\RefreshesJobWardenSchema;
 use JobWarden\Tests\TestCase;
 use Illuminate\Support\Carbon;
+use PHPUnit\Framework\Attributes\DataProvider;
 
 /**
  * Tier 3, made deterministic by seeding a stale host lease + in-flight attempts
@@ -138,10 +139,61 @@ final class GlobalReaperTest extends TestCase
         $this->assertSame(JobState::Retrying, Job::find($job->id)->state);
     }
 
-    private function seedDeadWorker(string $hostId, int $staleSeconds, string $state = 'active'): Worker
+    /**
+     * The Fleet-inflation bug: schedulers and reapers never claim job_attempts,
+     * so the old detection query (which required owning an in-flight attempt)
+     * could never reap them — a crashed scheduler/reaper stayed `active` forever
+     * and kept inflating the Fleet/`/stats` counts. Staleness alone must be
+     * enough for these roles.
+     *
+     */
+    #[DataProvider('nonAttemptOwningRoles')]
+    public function test_a_stale_non_attempt_owning_worker_is_reaped_without_any_in_flight_work(string $role): void
+    {
+        $stale = $this->seedDeadWorker('host-'.$role, staleSeconds: 30, role: $role);
+
+        $this->reaper()->tick('reaper-x');
+
+        $this->assertSame('dead', Worker::find($stale->id)->state);
+    }
+
+    /** @return array<string, array{0: string}> */
+    public static function nonAttemptOwningRoles(): array
+    {
+        return [
+            'scheduler' => ['scheduler'],
+            'global_reaper' => ['global_reaper'],
+            'local_reaper' => ['local_reaper'],
+        ];
+    }
+
+    public function test_a_fresh_non_attempt_owning_worker_is_not_reaped(): void
+    {
+        $live = $this->seedDeadWorker('host-sched-live', staleSeconds: 0, role: 'scheduler');
+
+        $this->reaper()->tick('reaper-x');
+
+        $this->assertSame('active', Worker::find($live->id)->state);
+    }
+
+    /**
+     * The narrower version of the same bug: a supervisor that dies while idle
+     * (nothing currently claimed) previously stayed `active` forever too, since
+     * detection required an in-flight attempt to exist regardless of role.
+     */
+    public function test_a_stale_idle_supervisor_with_no_in_flight_work_is_reaped(): void
+    {
+        $idle = $this->seedDeadWorker('host-idle-supervisor', staleSeconds: 30);
+
+        $this->reaper()->tick('reaper-x');
+
+        $this->assertSame('dead', Worker::find($idle->id)->state);
+    }
+
+    private function seedDeadWorker(string $hostId, int $staleSeconds, string $state = 'active', string $role = 'supervisor'): Worker
     {
         return Worker::create([
-            'role' => 'supervisor',
+            'role' => $role,
             'host_id' => $hostId,
             'hostname' => $hostId,
             'pid' => 1234,

@@ -2,6 +2,11 @@
 (function () {
     'use strict';
 
+    // wire:navigate re-evaluates body scripts on every navigation; all our
+    // wiring is document-level and survives the body swap, so register once.
+    if (window.__jwScriptsBooted) return;
+    window.__jwScriptsBooted = true;
+
     // ---- timezone renderer -------------------------------------------------
     // Render every <time data-jw-epoch> in the viewer's own timezone. The epoch
     // is the true instant (computed in SQL), so this is correct regardless of
@@ -81,7 +86,7 @@
         if (refresh) {
             refresh.classList.add('spin');
             setTimeout(function () { refresh.classList.remove('spin'); }, 700);
-            if (window.Livewire) window.Livewire.all().forEach(function (c) { c.$refresh(); });
+            if (window.Livewire) window.Livewire.all().forEach(function (c) { if (c.$wire) c.$wire.$refresh(); });
             return;
         }
 
@@ -96,10 +101,15 @@
     var updatedAt = Date.now();
     function tickUpdated() {
         var s = Math.round((Date.now() - updatedAt) / 1000);
-        var label = s < 3 ? 'just now' : (s < 60 ? s + 's ago' : Math.round(s / 60) + 'm ago');
-        document.querySelectorAll('[data-jw-updated]').forEach(function (el) { el.textContent = label; });
+        // Coarse buckets, and write only on change — the label lives in the
+        // topbar flex row, so a churning textContent invalidates layout for
+        // the whole header every tick.
+        var label = s < 10 ? 'just now' : (s < 60 ? (Math.floor(s / 10) * 10) + 's ago' : Math.round(s / 60) + 'm ago');
+        document.querySelectorAll('[data-jw-updated]').forEach(function (el) {
+            if (el.textContent !== label) el.textContent = label;
+        });
     }
-    setInterval(tickUpdated, 2000);
+    setInterval(tickUpdated, 5000);
 
     // ---- log tail autoscroll -------------------------------------------------
     function autoscroll(root) {

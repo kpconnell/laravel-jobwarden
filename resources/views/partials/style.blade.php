@@ -104,7 +104,7 @@ a{color:inherit;text-decoration:none}
 .tb-search input:focus{border-color:var(--accent)}
 .tb-search input::placeholder{color:var(--fg-3)}
 .tb-right{display:flex;align-items:center;gap:8px;flex:none}
-.tb-updated{font-size:11px;color:var(--fg-3);white-space:nowrap}
+.tb-updated{font-size:11px;color:var(--fg-3);white-space:nowrap;min-width:118px;text-align:right;font-variant-numeric:tabular-nums}
 .tb-refresh{width:32px;height:32px;display:flex;align-items:center;justify-content:center;border:1px solid var(--border-2);border-radius:7px;background:var(--panel);color:var(--fg-2)}
 .tb-refresh:hover{background:var(--hover)}
 .tb-refresh.spin svg{animation:jw-spin .7s linear}

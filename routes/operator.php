@@ -6,12 +6,15 @@ use JobWarden\Http\Controllers\BatchesController;
 use JobWarden\Http\Controllers\JobsController;
 use JobWarden\Http\Controllers\SchedulesController;
 use JobWarden\Http\Controllers\StatsController;
+use JobWarden\Http\Controllers\TagsController;
 use JobWarden\Http\Controllers\WorkersController;
 use Illuminate\Support\Facades\Route;
 
 // Operator API. Mounted under jobwarden.api.prefix, behind the Authorize gate.
 
 Route::get('stats', StatsController::class);
+
+Route::get('tags', [TagsController::class, 'index']);
 
 Route::post('jobs', [JobsController::class, 'store']);
 Route::get('jobs', [JobsController::class, 'index']);

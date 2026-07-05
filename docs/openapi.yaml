@@ -111,6 +111,8 @@ tags:
     description: Create, update, and fire cron-based recurring or one-time schedules.
   - name: Workers
     description: Read the process registry (supervisors, schedulers, reapers).
+  - name: Tags
+    description: Discover known tag names/values, for building filter UIs.
 
 paths:
   /stats:
@@ -663,6 +665,67 @@ paths:
         "403":
           $ref: "#/components/responses/Forbidden"
 
+  /tags:
+    get:
+      operationId: listTags
+      tags: [Tags]
+      summary: Discover tag names, or values for a tag name
+      description: >-
+        Tag discovery for building filter UIs — without `name`, lists the
+        distinct tag names in use; with `name`, lists the distinct values
+        recorded for that one name instead. Neither form is paginated;
+        `limit` bounds the result set. Ordered alphabetically.
+      parameters:
+        - name: name
+          in: query
+          description: >-
+            When present, switches the response from "known names" to "known
+            values for this name."
+          schema:
+            type: string
+        - name: value
+          in: query
+          description: >-
+            Only meaningful together with `name`. Prefix-filters the returned
+            values (no trailing `*` needed — this endpoint always
+            prefix-matches), e.g. for a typeahead as the operator types.
+          schema:
+            type: string
+        - name: limit
+          in: query
+          description: >-
+            Caps the result count. Default 500 when listing names, 100 when
+            listing values for a name; hard-capped at 5x the applicable
+            default.
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/TagNameCountList"
+                  - $ref: "#/components/schemas/TagValueCountList"
+              examples:
+                names:
+                  summary: "Known names (no `name` param)"
+                  value:
+                    - name: "storeid"
+                      job_count: 128
+                    - name: "team"
+                      job_count: 4
+                values:
+                  summary: "Known values (`?name=storeid`)"
+                  value:
+                    - value: "AMAZ"
+                      job_count: 96
+                    - value: "WMALL"
+                      job_count: 32
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
 components:
   parameters:
     JobId:
@@ -1197,6 +1260,38 @@ components:
           type: string
           maxLength: 200
       required: [job_id, name, value]
+
+    TagNameCount:
+      type: object
+      description: One distinct tag name and how many jobs carry it.
+      properties:
+        name:
+          type: string
+          maxLength: 64
+        job_count:
+          type: integer
+      required: [name, job_count]
+
+    TagValueCount:
+      type: object
+      description: One distinct value recorded for a tag name, and how many jobs carry it.
+      properties:
+        value:
+          type: string
+          maxLength: 200
+        job_count:
+          type: integer
+      required: [value, job_count]
+
+    TagNameCountList:
+      type: array
+      items:
+        $ref: "#/components/schemas/TagNameCount"
+
+    TagValueCountList:
+      type: array
+      items:
+        $ref: "#/components/schemas/TagValueCount"
 
     Batch:
       type: object

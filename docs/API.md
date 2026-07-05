@@ -59,6 +59,7 @@ Base path below is relative to the configured prefix (`jobwarden/api`).
 | `GET /schedules` | Paginated. Filter: `enabled`. |
 | `GET /schedules/{id}` | One schedule with `recent_runs` (last 25 occurrences). |
 | `GET /workers` | Registered processes (supervisors, schedulers, reapers). `all=1` to include stopped/dead, `role` to filter. |
+| `GET /tags` | Tag discovery for building filter UIs — see below. |
 
 **Tag search.** Jobs carry searchable tags (name → value strings, values ≤ 200
 chars), stored in an indexed table so tag lookups never scan the jobs table.
@@ -69,6 +70,15 @@ values are strings become tags automatically at dispatch. Filter with
 tokens AND together: `name:value` matches a tag (trailing `*` = prefix, bare
 `name:` = has-tag), any other token substring-matches the class or job name —
 e.g. `q=storeid:AMAZ date:2025-01* Backfill`.
+
+**Tag discovery.** `GET /tags` lists the distinct tag names in use, each with
+a `job_count` (how many jobs carry it) — e.g. to populate a filter dropdown.
+`GET /tags?name=storeid` instead lists the distinct **values** recorded for
+that one name, each with its own `job_count`; add `value=AM` to prefix-filter
+them (no trailing `*` needed — this endpoint always prefix-matches), which is
+what a typeahead should call as the operator types. Results are capped
+(`limit`, default 500 for names / 100 for values, hard-capped at 5x that) and
+ordered alphabetically; neither form is paginated.
 
 **Polling contract.** Dispatch returns the job id; poll `GET /jobs/{id}` until
 `state` is terminal (`succeeded` | `failed` | `canceled` | `stopped`). `result`

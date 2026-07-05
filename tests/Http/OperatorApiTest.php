@@ -221,6 +221,49 @@ final class OperatorApiTest extends TestCase
             ->assertJsonPath('schedule_id', $schedule->id);
     }
 
+    public function test_tags_index_lists_distinct_names_with_job_counts(): void
+    {
+        config(['jobwarden.search.promoted_params' => ['storeid']]);
+        $jw = app(JobWarden::class);
+        $jw->dispatch(RunArtisanCommand::class, ['storeid' => 'AMAZ', 'command' => 'x', 'arguments' => []]);
+        $jw->dispatch(RunArtisanCommand::class, ['storeid' => 'WMALL', 'command' => 'x', 'arguments' => []]);
+        $jw->dispatch(RunArtisanCommand::class, ['storeid' => 'AMAZ', 'command' => 'x', 'arguments' => []], ['tags' => ['team' => 'ops']]);
+
+        $this->getJson('jobwarden/api/tags')
+            ->assertOk()
+            ->assertJsonCount(2)
+            ->assertJsonFragment(['name' => 'storeid', 'job_count' => 3])
+            ->assertJsonFragment(['name' => 'team', 'job_count' => 1]);
+    }
+
+    public function test_tags_index_lists_distinct_values_for_a_name(): void
+    {
+        config(['jobwarden.search.promoted_params' => ['storeid']]);
+        $jw = app(JobWarden::class);
+        $jw->dispatch(RunArtisanCommand::class, ['storeid' => 'AMAZ', 'command' => 'x', 'arguments' => []]);
+        $jw->dispatch(RunArtisanCommand::class, ['storeid' => 'AMAZ', 'command' => 'x', 'arguments' => []]);
+        $jw->dispatch(RunArtisanCommand::class, ['storeid' => 'WMALL', 'command' => 'x', 'arguments' => []]);
+
+        $this->getJson('jobwarden/api/tags?name=storeid')
+            ->assertOk()
+            ->assertJsonCount(2)
+            ->assertJsonFragment(['value' => 'AMAZ', 'job_count' => 2])
+            ->assertJsonFragment(['value' => 'WMALL', 'job_count' => 1]);
+    }
+
+    public function test_tags_index_values_filters_by_prefix(): void
+    {
+        config(['jobwarden.search.promoted_params' => ['storeid']]);
+        $jw = app(JobWarden::class);
+        $jw->dispatch(RunArtisanCommand::class, ['storeid' => 'AMAZ', 'command' => 'x', 'arguments' => []]);
+        $jw->dispatch(RunArtisanCommand::class, ['storeid' => 'WMALL', 'command' => 'x', 'arguments' => []]);
+
+        $this->getJson('jobwarden/api/tags?name=storeid&value=AM')
+            ->assertOk()
+            ->assertJsonCount(1)
+            ->assertJsonFragment(['value' => 'AMAZ']);
+    }
+
     public function test_workers_index(): void
     {
         Worker::create(['role' => 'api_test_worker', 'host_id' => 'h', 'state' => 'active', 'pid' => 1, 'started_at' => now(), 'heartbeat_at' => now()]);

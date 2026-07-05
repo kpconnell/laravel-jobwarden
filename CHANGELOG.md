@@ -7,6 +7,19 @@ All notable changes to `laravel-jobwarden` are documented here. The format follo
 ## [Unreleased]
 
 ### Added
+- **`GET /tags` — tag-filter discovery for UIs.** With no `name`, lists the distinct tag
+  names currently in use, each with a `job_count`; with `?name=storeid`, lists the
+  distinct values recorded for that one name instead, each with its own `job_count`.
+  `?value=` prefix-filters the returned values (no trailing `*` needed — this endpoint
+  always prefix-matches), so a typeahead can call it as the operator types. Neither form
+  is paginated; both are capped by `limit` (default 500 for names, 100 for values). Lets
+  a client populate a tag filter/autocomplete without hardcoding the tag vocabulary. See
+  **docs/API.md → Tag discovery**.
+- **A comprehensive OpenAPI 3.1 spec for the operator API** (`docs/openapi.yaml`) —
+  every endpoint, request/response schema, enum, and error shape, cross-checked against
+  the controllers/models/migrations rather than hand-guessed from **docs/API.md** alone.
+  Load it into Redoc, Swagger UI, or Postman for interactive docs or a generated client;
+  linked from the top of **docs/API.md**.
 - **Job completion results (`jobs.result`).** A handler stores a completion payload with
   `$context->result([...])`; it commits **atomically with the succeeded transition**, so a
   caller polling `GET /jobs/{id}` can never observe `state=succeeded` without its final
@@ -69,6 +82,20 @@ All notable changes to `laravel-jobwarden` are documented here. The format follo
   job data lives in the constructor.
 
 ### Fixed
+- **Global reaper now reaps stale `scheduler`/`global_reaper`/`local_reaper` rows and
+  idle dead supervisors, not just supervisors with stranded work.** `deadWorkers()`
+  required `role = supervisor` **and** an in-flight attempt before it would even look
+  at a row, so `scheduler`/`global_reaper`/`local_reaper` — which never claim job
+  attempts — could never be reaped, and a supervisor that crashed between jobs (no
+  attempt in flight at the moment it died) fell through the same gap. Found in
+  production: the large majority of "active" scheduler/reaper rows, and several idle
+  supervisors, had heartbeats stale by hours to days yet still counted on the Fleet
+  page and in `GET /stats`. Any role whose heartbeat has gone stale while still
+  claiming `active`/`starting`/`draining` is now reaped unconditionally; the
+  in-flight-attempt-gated rescan of `dead`/`stopped` rows (which recovers stranded
+  work) stays scoped to `supervisor`. Reaped rows drop out of Fleet/`/stats`
+  automatically and become eligible for `jobwarden:prune` after
+  `JOBWARDEN_RETENTION_WORKERS_DAYS`.
 - **Global reaper now recovers attempts abandoned via `drain_timeout`.** A supervisor
   that hits `JOBWARDEN_DRAIN_TIMEOUT` abandons its still-running children and marks its
   own worker row `stopped` on the way out — not `dead` — but `GlobalReaper`'s
@@ -126,6 +153,31 @@ All notable changes to `laravel-jobwarden` are documented here. The format follo
   is empty at the end of chaos tests.
 
 ### Changed
+- **The Livewire dashboard is a full operator console now — complete redesign.** A
+  sidebar-shell UI (IBM Plex via Google Fonts, light/dark themes and compact/comfortable
+  density persisted client-side, `wire:navigate` throughout) with live nav count badges,
+  a global tag-grammar search box, and per-screen endpoint pills. Every screen rebuilt:
+  **Overview** (KPI tiles that click through to filtered Jobs, a needs-attention panel
+  with inline Retry/Restart, in-flight/lane charts, workers/batches summaries, a live
+  `job_events` activity feed); **Jobs** (multi-select state chips OR'd together, lane
+  chips, a tag filter with value typeahead backed by the tag index, and row selection
+  with **bulk retry/restart/cancel/stop** — per-row state guards, one audited action per
+  id, partial results reported in a toast); **Job detail** (meta grid, first-class
+  Params/Tags panels, `last_error` with stack trace, and Logs / Attempts / Timeline /
+  Result tabs — the log tail is a nested component polling at 2s by an id cursor that
+  skips rendering while idle, so the page around it stays quiet); **Batches** (segmented
+  progress bars) plus a new **batch detail page** (`/batches/{id}`) that draws the
+  dependency fan-out as a DAG — lanes are the independent sub-chains (labeled by the tag
+  that distinguishes them, e.g. `storeid`), columns are dependency depth, failed nodes
+  stay loud while their canceled downstream dims, and big batches collapse by lane
+  (pure-PHP layout, no recursive CTEs — identical on SQLite/MariaDB/Postgres);
+  **Schedules** (enable switches, a create modal that now also takes timezone and
+  missed/overlap policies) plus a new **schedule detail page** (`/schedules/{id}`) with
+  Run-now/Enable/Delete and the `schedule_runs` history; **Workers** (role summary
+  chips, a dead-supervisors warning, load/capacity bars). Existing routes, component
+  names, and the `JobWarden::auth()` gate are unchanged; timestamps stay on the
+  SQL-epoch viewer-timezone contract. `JOBWARDEN_DASHBOARD_POLL` now defaults to `10s`
+  (was `5s`); Workers polls at 5s and the log tail at 2s regardless.
 - **Default retry budget raised: `JOBWARDEN_MAX_ATTEMPTS` now defaults to 4 (was 1).**
   With a budget of 1, declaring a job idempotent bought nothing unless the dispatch
   site also granted attempts — the first failure or host-loss orphaning was terminal
@@ -183,5 +235,5 @@ complete and proven against SQLite, MariaDB/MySQL, and PostgreSQL.
 - **Deployment**: a single "host" image (init baked in) that runs any set of roles via
   `JOBWARDEN_ROLES`; systemd unit templates; a Docker Compose dev stack.
 
-[Unreleased]: https://github.com/kpconnell/laravel-jobwarden/compare/v1.0.0-beta...HEAD
+[Unreleased]: https://github.com/kpconnell/laravel-jobwarden/compare/v1.6.0-beta...HEAD
 [1.0.0-beta]: https://github.com/kpconnell/laravel-jobwarden/releases/tag/v1.0.0-beta

@@ -16,7 +16,7 @@ class Schedule extends JobWardenModel
     protected $guarded = [];
 
     /** @var list<string> */
-    protected array $displayTimes = ['next_due_at'];
+    protected array $displayTimes = ['next_due_at', 'last_enqueued_for'];
 
     const CREATED_AT = 'created_at';
     const UPDATED_AT = 'updated_at';

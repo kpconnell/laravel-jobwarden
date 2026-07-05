@@ -282,7 +282,7 @@ return [
         'enabled' => (bool) env('JOBWARDEN_DASHBOARD_ENABLED', true),
         'prefix' => env('JOBWARDEN_DASHBOARD_PREFIX', 'jobwarden'),
         'middleware' => ['web'],
-        'poll' => env('JOBWARDEN_DASHBOARD_POLL', '5s'),
+        'poll' => env('JOBWARDEN_DASHBOARD_POLL', '10s'),
     ],
 
 ];

@@ -11,14 +11,24 @@ use Livewire\Component;
 #[Layout('jobwarden::layout')]
 final class Workers extends Component
 {
+    private const LIVE = ['starting', 'active', 'draining'];
+
     public bool $all = false;
+
+    public function toggleAll(): void
+    {
+        $this->all = ! $this->all;
+    }
 
     public function render()
     {
-        $workers = Worker::query()
-            ->when(! $this->all, fn ($q) => $q->whereIn('state', ['starting', 'active', 'draining']))
-            ->orderBy('role')->orderByDesc('heartbeat_at')->withDisplayEpochs()->get();
-
-        return view('jobwarden::livewire.workers', ['workers' => $workers]);
+        return view('jobwarden::livewire.workers', [
+            'workers' => Worker::query()
+                ->when(! $this->all, fn ($q) => $q->whereIn('state', self::LIVE))
+                ->orderBy('role')->orderByDesc('heartbeat_at')->withDisplayEpochs()->get(),
+            'roleCounts' => Worker::query()->whereIn('state', self::LIVE)
+                ->groupBy('role')->selectRaw('role, count(*) as c')->orderBy('role')->pluck('c', 'role'),
+            'deadSupervisors' => Worker::query()->where('state', 'dead')->where('role', 'supervisor')->count(),
+        ]);
     }
 }

@@ -119,9 +119,13 @@ class JobWardenServiceProvider extends ServiceProvider
         \Livewire\Livewire::component('jobwarden.overview', \JobWarden\Http\Livewire\Overview::class);
         \Livewire\Livewire::component('jobwarden.jobs', \JobWarden\Http\Livewire\Jobs::class);
         \Livewire\Livewire::component('jobwarden.job-show', \JobWarden\Http\Livewire\JobShow::class);
+        \Livewire\Livewire::component('jobwarden.job-log-tail', \JobWarden\Http\Livewire\JobLogTail::class);
         \Livewire\Livewire::component('jobwarden.batches', \JobWarden\Http\Livewire\Batches::class);
+        \Livewire\Livewire::component('jobwarden.batch-show', \JobWarden\Http\Livewire\BatchShow::class);
         \Livewire\Livewire::component('jobwarden.schedules', \JobWarden\Http\Livewire\Schedules::class);
+        \Livewire\Livewire::component('jobwarden.schedule-show', \JobWarden\Http\Livewire\ScheduleShow::class);
         \Livewire\Livewire::component('jobwarden.workers', \JobWarden\Http\Livewire\Workers::class);
+        \Livewire\Livewire::component('jobwarden.sidebar', \JobWarden\Http\Livewire\Shell\Sidebar::class);
 
         Route::group([
             'prefix' => config('jobwarden.dashboard.prefix', 'jobwarden'),

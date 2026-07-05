@@ -3,10 +3,12 @@
 declare(strict_types=1);
 
 use JobWarden\Http\Livewire\Batches;
+use JobWarden\Http\Livewire\BatchShow;
 use JobWarden\Http\Livewire\Jobs;
 use JobWarden\Http\Livewire\JobShow;
 use JobWarden\Http\Livewire\Overview;
 use JobWarden\Http\Livewire\Schedules;
+use JobWarden\Http\Livewire\ScheduleShow;
 use JobWarden\Http\Livewire\Workers;
 use Illuminate\Support\Facades\Route;
 
@@ -16,5 +18,7 @@ Route::get('/', Overview::class)->name('jobwarden.overview');
 Route::get('/jobs', Jobs::class)->name('jobwarden.jobs');
 Route::get('/jobs/{job}', JobShow::class)->name('jobwarden.jobs.show');
 Route::get('/batches', Batches::class)->name('jobwarden.batches');
+Route::get('/batches/{batch}', BatchShow::class)->name('jobwarden.batches.show');
 Route::get('/schedules', Schedules::class)->name('jobwarden.schedules');
+Route::get('/schedules/{schedule}', ScheduleShow::class)->name('jobwarden.schedules.show');
 Route::get('/workers', Workers::class)->name('jobwarden.workers');

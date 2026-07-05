@@ -4,42 +4,28 @@ declare(strict_types=1);
 
 namespace JobWarden\Http\Livewire;
 
-use JobWarden\Logging\Contracts\LogBodySink;
+use JobWarden\Http\Livewire\Concerns\JobActionGuards;
 use JobWarden\Models\Job;
-use JobWarden\Models\JobLog;
 use JobWarden\Operations\OperatorActions;
-use Illuminate\Support\Collection;
 use Livewire\Attributes\Layout;
+use Livewire\Attributes\Url;
 use Livewire\Component;
 use Throwable;
 
 #[Layout('jobwarden::layout')]
 final class JobShow extends Component
 {
-    /** Inline log preview cap; the "view all" dialog loads up to self::DIALOG_LOG_CAP. */
-    private const PREVIEW_LOG_CAP = 300;
+    use JobActionGuards;
 
-    private const DIALOG_LOG_CAP = 5000;
+    private const TABS = ['logs', 'attempts', 'timeline', 'result'];
 
     public string $jobId;
 
-    public ?string $flash = null;
-
-    public bool $showAllLogs = false;
+    #[Url] public string $tab = 'logs';
 
     public function mount(string $job): void
     {
         $this->jobId = $job;
-    }
-
-    public function openLogs(): void
-    {
-        $this->showAllLogs = true;
-    }
-
-    public function closeLogs(): void
-    {
-        $this->showAllLogs = false;
     }
 
     public function cancel(OperatorActions $ops): void
@@ -66,15 +52,10 @@ final class JobShow extends Component
     {
         try {
             $action();
-            $this->flash = $ok;
+            $this->dispatch('jw-toast', message: $ok);
         } catch (Throwable $e) {
-            $this->flash = 'error: '.$e->getMessage();
+            $this->dispatch('jw-toast', message: 'action failed', detail: $e->getMessage(), tone: 'error');
         }
-    }
-
-    private function actor(): string
-    {
-        return (string) (auth()->id() ?? 'dashboard');
     }
 
     private function job(): Job
@@ -84,40 +65,21 @@ final class JobShow extends Component
 
     public function render()
     {
-        $job = Job::with(['tags', 'attempts' => fn ($q) => $q->orderBy('attempt_number'), 'events' => fn ($q) => $q->orderBy('id')->withDisplayEpochs()])
-            ->withDisplayEpochs()
-            ->findOrFail($this->jobId);
-
-        $logs = $this->loadLogs(self::PREVIEW_LOG_CAP);
-
-        // Only pay for the full stream while the dialog is open. Fetch one past the
-        // cap so we can tell the operator honestly when it was truncated.
-        $allLogs = null;
-        $allLogsTruncated = false;
-        if ($this->showAllLogs) {
-            $allLogs = $this->loadLogs(self::DIALOG_LOG_CAP + 1);
-            $allLogsTruncated = $allLogs->count() > self::DIALOG_LOG_CAP;
-            $allLogs = $allLogs->take(self::DIALOG_LOG_CAP);
+        if (! in_array($this->tab, self::TABS, true)) {
+            $this->tab = 'logs';
         }
+
+        $job = Job::with([
+            'tags',
+            'attempts' => fn ($q) => $q->orderBy('attempt_number')->withDisplayEpochs(),
+            'events' => fn ($q) => $q->orderBy('id')->withDisplayEpochs(),
+            'batch:id,name',
+            'schedule:id,name',
+        ])->withDisplayEpochs()->findOrFail($this->jobId);
 
         return view('jobwarden::livewire.job-show', [
             'job' => $job,
-            'logs' => $logs,
-            'allLogs' => $allLogs,
-            'allLogsTruncated' => $allLogsTruncated,
-            'dialogLogCap' => self::DIALOG_LOG_CAP,
+            'lastAttempt' => $job->attempts->last(),
         ]);
-    }
-
-    private function loadLogs(int $limit): Collection
-    {
-        $sink = app(LogBodySink::class);
-
-        return JobLog::query()->where('job_id', $this->jobId)
-            ->orderBy('ts')->orderBy('id')->limit($limit)->withDisplayEpochs()->get()
-            ->map(fn (JobLog $l) => (object) [
-                'ts' => $l->ts, 'ts_ms' => $l->ts_ms, 'level' => $l->level, 'step' => $l->step,
-                'body' => $sink->resolve((string) $l->body_ref),
-            ]);
     }
 }

@@ -4,6 +4,10 @@ A gated JSON API over JobWarden's read models and operator actions. It's the
 service layer the (forthcoming Livewire) dashboard renders on top of, and it's
 usable headlessly on its own.
 
+A full [OpenAPI 3.1 spec](openapi.yaml) covers every endpoint, request/response
+schema, and error shape below in machine-readable form — load it into Redoc,
+Swagger UI, or Postman for interactive docs / a generated client.
+
 Responses are plain Eloquent models / paginators serialized by Laravel — enum
 columns come back as their string value, dates as ISO-8601, JSON columns as
 objects. List endpoints return Laravel's paginator shape (`{data, links, meta}`).

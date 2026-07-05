@@ -1,0 +1,1699 @@
+openapi: 3.1.0
+
+info:
+  title: JobWarden Operator API
+  version: "1.1"
+  description: |
+    A gated JSON API over JobWarden's read models and operator actions. It's the
+    service layer the Livewire dashboard renders on top of, and it's usable
+    headlessly on its own.
+
+    Responses are plain Eloquent models / paginators serialized by Laravel —
+    enum columns come back as their string value, dates as ISO-8601, JSON
+    columns as objects. List endpoints return Laravel's paginator shape
+    (`{data, links, meta}`).
+
+    ### Authorization
+
+    Every request passes through a gate that **defaults to `local` environment
+    only** (`config('jobwarden.api.enabled')` must also be `true`, the
+    default). A host application opens it up explicitly, typically from
+    `AppServiceProvider::boot`:
+
+    ```php
+    use JobWarden\JobWarden;
+
+    JobWarden::auth(function ($request) {
+        return $request->user()?->can('viewJobWarden') ?? false;
+    });
+    ```
+
+    The gate is the **security boundary** — this spec does not model a bearer
+    token or API key because JobWarden delegates entirely to the host
+    application's own authentication (session, Sanctum, custom header, IP
+    allowlist, etc. all work; the gate callback receives the full `Request`).
+    Any transport-level credential the host application requires (cookies, an
+    `Authorization` header) should be added by the client; JobWarden itself
+    imposes none.
+
+    Note that `jobs.params`, `last_error`, and `result` contain whatever the
+    application put there — including, potentially, secrets or PII. They are
+    returned as-is to any caller the gate admits, so gate appropriately and
+    avoid stuffing raw secrets into job params.
+
+    ### Conventions
+
+    - All request/response bodies are JSON. The API forces
+      `Accept: application/json` internally, so validation failures, 403s, and
+      404s always render as JSON — even if the client omits the header.
+    - List endpoints accept `per_page` (default `jobwarden.api.pagination`,
+      50; hard-capped at 200) and return Laravel's standard paginator
+      envelope.
+    - Every mutating job/batch action accepts an optional `reason` string,
+      recorded in the audit trail (`job_events.reason`). The actor recorded is
+      the authenticated user's id (`$request->user()->getAuthIdentifier()`),
+      or the literal string `api` when there is no authenticated user.
+    - **Polling contract.** `POST /jobs` and `POST /schedules/{id}/run` return
+      the created job; poll `GET /jobs/{id}` until `state` is terminal
+      (`succeeded`, `failed`, `canceled`, `stopped`). `result` is written
+      atomically with the `succeeded` transition, so `state = succeeded`
+      guarantees the final `result` is present in that same read (`null` if
+      the handler never stored one — see `JobContext::result()`). `result` is
+      success-only; failures carry their story in `last_error`.
+    - **Tag search.** Jobs carry searchable tags (name → value strings, values
+      ≤ 200 chars) in an indexed table, so tag lookups never scan the jobs
+      table. Tags come from the dispatcher (`tags` on `POST /jobs`) and from
+      **param promotion**: param names listed in
+      `jobwarden.search.promoted_params` whose values are strings become tags
+      automatically at dispatch. Filter with `tag[name]=value` (repeatable,
+      ANDed; a trailing `*` is a prefix match), or use `q`, whose
+      whitespace-separated tokens AND together — `name:value` matches a tag
+      (trailing `*` = prefix, bare `name:` = has-tag), any other token
+      substring-matches the job class or name, e.g.
+      `q=storeid:AMAZ date:2025-01* Backfill`.
+
+  contact:
+    name: Kevin Connell
+    url: https://github.com/kpconnell/laravel-jobwarden
+  license:
+    name: MIT
+    url: https://github.com/kpconnell/laravel-jobwarden/blob/main/LICENSE.md
+
+externalDocs:
+  description: Full package documentation (setup, job authoring, scheduling, hosting)
+  url: https://github.com/kpconnell/laravel-jobwarden/tree/main/docs
+
+servers:
+  - url: "/{prefix}"
+    description: >-
+      Mounted by the service provider when jobwarden.api.enabled is true
+      (the default). Base path defaults to jobwarden/api
+      (jobwarden.api.prefix) but is host-application-configurable.
+    variables:
+      prefix:
+        default: jobwarden/api
+
+# No security scheme is modeled: JobWarden::auth() delegates entirely to the
+# host application's own authentication (session, header, IP allowlist, ...),
+# so there is no fixed credential type to describe — see the Authorization
+# section above. `security: []` here is an explicit "not modeled", not a
+# claim that the API is unauthenticated.
+security: []
+
+tags:
+  - name: Stats
+    description: Fleet-wide overview counts.
+  - name: Jobs
+    description: Read jobs, tail their logs, and take operator actions on them.
+  - name: Batches
+    description: Read and cancel batches (fan-out / chain / DAG groups of jobs).
+  - name: Schedules
+    description: Create, update, and fire cron-based recurring or one-time schedules.
+  - name: Workers
+    description: Read the process registry (supervisors, schedulers, reapers).
+
+paths:
+  /stats:
+    get:
+      operationId: getStats
+      tags: [Stats]
+      summary: Overview counts
+      description: >-
+        Jobs by state, jobs by lane, batches by state, schedule counts, and
+        active worker counts by role. A plain associative array, not a
+        paginator.
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Stats"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+  /jobs:
+    get:
+      operationId: listJobs
+      tags: [Jobs]
+      summary: List jobs
+      parameters:
+        - $ref: "#/components/parameters/JobStateFilter"
+        - $ref: "#/components/parameters/LaneFilter"
+        - $ref: "#/components/parameters/NameFilter"
+        - $ref: "#/components/parameters/JobClassFilter"
+        - $ref: "#/components/parameters/CreatedByFilter"
+        - $ref: "#/components/parameters/BatchIdFilter"
+        - $ref: "#/components/parameters/ScheduleIdFilter"
+        - $ref: "#/components/parameters/TagFilter"
+        - $ref: "#/components/parameters/QFilter"
+        - $ref: "#/components/parameters/PerPage"
+        - name: page
+          in: query
+          description: Page number (standard Laravel paginator parameter).
+          schema:
+            type: integer
+            minimum: 1
+            default: 1
+      responses:
+        "200":
+          description: Paginated jobs, newest first (ordered by id — UUIDv7 sorts by creation time).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JobPage"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+    post:
+      operationId: dispatchJob
+      tags: [Jobs]
+      summary: Dispatch a job (single or bulk)
+      description: >-
+        Dispatch one ad-hoc job, or a batch of them in a single atomic
+        request. Send `{"jobs": [...]}` for the bulk form — the whole array
+        is validated and created in one database transaction, so a bad spec
+        rolls the entire request back rather than half-creating it. The bulk
+        form exists to pay one HTTP round-trip + one framework bootstrap for
+        many jobs instead of one per job.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: "#/components/schemas/DispatchJobRequest"
+                - $ref: "#/components/schemas/DispatchBulkRequest"
+            examples:
+              single:
+                summary: Single job
+                value:
+                  job_class: "App\\Jobs\\ImportCatalog"
+                  params: { store: "north" }
+                  idempotent: true
+                  max_attempts: 3
+                  tags: { storeid: "north" }
+              bulk:
+                summary: Bulk dispatch
+                value:
+                  jobs:
+                    - job_class: "App\\Jobs\\ImportCatalog"
+                      params: { store: "north" }
+                    - job_class: "App\\Jobs\\ImportCatalog"
+                      params: { store: "south" }
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/Job"
+                  - $ref: "#/components/schemas/BulkDispatchResult"
+              examples:
+                single:
+                  summary: Single dispatch response (the fresh Job)
+                  value:
+                    id: "018f2f3b-8b8a-7000-8f1a-2f7b6c9e0a11"
+                    job_class: "App\\Jobs\\ImportCatalog"
+                    name: null
+                    lane: "default"
+                    params: { store: "north" }
+                    idempotent: true
+                    state: "queued"
+                    priority: 0
+                    max_attempts: 3
+                    attempt_count: 0
+                    created_by: "api"
+                bulk:
+                  summary: Bulk dispatch response
+                  value:
+                    created: 2
+                    ids:
+                      - "018f2f3b-8b8a-7000-8f1a-2f7b6c9e0a11"
+                      - "018f2f3b-8b8b-7000-8f1a-2f7b6c9e0a12"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+
+  /jobs/{jobId}:
+    get:
+      operationId: getJob
+      tags: [Jobs]
+      summary: Get one job
+      description: >-
+        Returns the job with `attempts`, `events`, `artifacts`, and `tags`
+        eager-loaded. This is the completion-polling endpoint — see the
+        polling contract in the top-level description.
+      parameters:
+        - $ref: "#/components/parameters/JobId"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JobDetailed"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /jobs/{jobId}/logs:
+    get:
+      operationId: getJobLogs
+      tags: [Jobs]
+      summary: Tail a job's logs
+      description: Ordered by `id`; drives the live tail via the `after` cursor.
+      parameters:
+        - $ref: "#/components/parameters/JobId"
+        - name: after
+          in: query
+          description: Return only log lines with `id` greater than this cursor.
+          schema:
+            type: integer
+            minimum: 0
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 200
+      responses:
+        "200":
+          description: OK — a plain array (not paginated).
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/JobLog"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+  /jobs/{jobId}/cancel:
+    post:
+      operationId: cancelJob
+      tags: [Jobs]
+      summary: Cancel a job
+      description: >-
+        Desired-state cancel (spec §6.3): pre-run states (pending, queued,
+        retrying) transition to `canceled` immediately; a `running` job is
+        flagged and the owning supervisor observes the flag and stops the
+        child. An already-orphaned job transitions straight to `stopped`. The
+        flag is set durably first, so even if the immediate transition races a
+        claim, the request is still honored once the race resolves. Always
+        returns 200 with the job's current state — cancel does not error on
+        an unexpected state.
+      parameters:
+        - $ref: "#/components/parameters/JobId"
+      requestBody:
+        $ref: "#/components/requestBodies/ActionReason"
+      responses:
+        "200":
+          description: The job's fresh state after the action.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Job"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /jobs/{jobId}/stop:
+    post:
+      operationId: stopJob
+      tags: [Jobs]
+      summary: Stop a job
+      description: >-
+        Desired-state stop — identical mechanics to cancel, but the resulting
+        terminal state for an already-orphaned job is `stopped` either way
+        (cancel and stop converge for pre-run/orphaned jobs; they differ only
+        in the flag recorded for a still-running job's supervisor to act on).
+      parameters:
+        - $ref: "#/components/parameters/JobId"
+      requestBody:
+        $ref: "#/components/requestBodies/ActionReason"
+      responses:
+        "200":
+          description: The job's fresh state after the action.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Job"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /jobs/{jobId}/retry:
+    post:
+      operationId: retryJob
+      tags: [Jobs]
+      summary: Retry a failed job
+      description: >-
+        Operator retry: re-queues the job and mints a fresh attempt. Only
+        valid on a job currently in the `failed` state.
+      parameters:
+        - $ref: "#/components/parameters/JobId"
+      requestBody:
+        $ref: "#/components/requestBodies/ActionReason"
+      responses:
+        "200":
+          description: The job's fresh state (`queued`) after the action.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Job"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InvalidStateTransition"
+
+  /jobs/{jobId}/restart:
+    post:
+      operationId: restartJob
+      tags: [Jobs]
+      summary: Restart a parked job
+      description: >-
+        Operator restart: re-queues the job and mints a fresh attempt. Only
+        valid on a job currently `orphaned` (parked, indeterminate) or
+        `stopped`.
+      parameters:
+        - $ref: "#/components/parameters/JobId"
+      requestBody:
+        $ref: "#/components/requestBodies/ActionReason"
+      responses:
+        "200":
+          description: The job's fresh state (`queued`) after the action.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Job"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InvalidStateTransition"
+
+  /batches:
+    get:
+      operationId: listBatches
+      tags: [Batches]
+      summary: List batches
+      parameters:
+        - $ref: "#/components/parameters/BatchStateFilter"
+        - $ref: "#/components/parameters/PerPage"
+        - name: page
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            default: 1
+      responses:
+        "200":
+          description: Paginated batches, newest first.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BatchPage"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+  /batches/{batchId}:
+    get:
+      operationId: getBatch
+      tags: [Batches]
+      summary: Get one batch
+      description: Returns the batch with its member `jobs` eager-loaded.
+      parameters:
+        - $ref: "#/components/parameters/BatchId"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BatchDetailed"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /batches/{batchId}/cancel:
+    post:
+      operationId: cancelBatch
+      tags: [Batches]
+      summary: Cancel a batch
+      description: Cancels the batch and propagates cancellation to every non-terminal member job.
+      parameters:
+        - $ref: "#/components/parameters/BatchId"
+      requestBody:
+        $ref: "#/components/requestBodies/ActionReason"
+      responses:
+        "200":
+          description: The batch's fresh state after the action.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Batch"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /schedules:
+    get:
+      operationId: listSchedules
+      tags: [Schedules]
+      summary: List schedules
+      parameters:
+        - name: enabled
+          in: query
+          description: Filter by enabled/disabled.
+          schema:
+            type: boolean
+        - $ref: "#/components/parameters/PerPage"
+        - name: page
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            default: 1
+      responses:
+        "200":
+          description: Paginated schedules, ordered by name.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SchedulePage"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+    post:
+      operationId: createSchedule
+      tags: [Schedules]
+      summary: Create a schedule
+      description: >-
+        Create a recurring cron schedule that either runs an artisan command
+        (`type=command`) or dispatches a JobWarden job class (`type=job`).
+        There is no `run_at` / one-time creation route on the operator API —
+        one-time schedules are created via `JobWarden::scheduleOnce()` in
+        application code.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateScheduleRequest"
+            examples:
+              command:
+                summary: Artisan command schedule
+                value:
+                  name: "nightly-prune"
+                  cron: "0 3 * * *"
+                  type: "command"
+                  command: "cache:prune"
+                  idempotent: true
+              job:
+                summary: Job class schedule
+                value:
+                  name: "hourly-reconcile"
+                  cron: "0 * * * *"
+                  type: "job"
+                  job_class: "App\\Jobs\\ReconcileInventory"
+                  params: { warehouse: "east" }
+                  idempotent: true
+                  max_attempts: 3
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Schedule"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+
+  /schedules/{scheduleId}:
+    get:
+      operationId: getSchedule
+      tags: [Schedules]
+      summary: Get one schedule
+      description: >-
+        Returns the schedule with `recent_runs` set to its last 25 occurrences
+        (by `occurrence_time` descending).
+      parameters:
+        - $ref: "#/components/parameters/ScheduleId"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ScheduleDetailed"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+    patch:
+      operationId: updateSchedule
+      tags: [Schedules]
+      summary: Update a schedule
+      description: >-
+        Toggle `enabled`, or tweak the cron expression, idempotency, retry
+        budget, or missed/overlap policy. All fields are optional; only the
+        fields present are updated.
+      parameters:
+        - $ref: "#/components/parameters/ScheduleId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateScheduleRequest"
+      responses:
+        "200":
+          description: The updated schedule.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Schedule"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+
+    delete:
+      operationId: deleteSchedule
+      tags: [Schedules]
+      summary: Delete a schedule
+      parameters:
+        - $ref: "#/components/parameters/ScheduleId"
+      responses:
+        "204":
+          description: Deleted.
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /schedules/{scheduleId}/run:
+    post:
+      operationId: runScheduleNow
+      tags: [Schedules]
+      summary: Fire a schedule immediately
+      description: >-
+        Dispatches an ad-hoc run of the schedule's job onto the `scheduled`
+        lane, linked to the schedule via `schedule_id`. This is independent of
+        the schedule's own cron cadence and does not consume/affect its next
+        due occurrence.
+      parameters:
+        - $ref: "#/components/parameters/ScheduleId"
+      responses:
+        "201":
+          description: The dispatched job.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Job"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /workers:
+    get:
+      operationId: listWorkers
+      tags: [Workers]
+      summary: List registered workers
+      description: >-
+        Registered processes (supervisors, schedulers, global/local reapers).
+        Not paginated — returns a plain array.
+      parameters:
+        - name: all
+          in: query
+          description: Include stopped/dead workers. Default is live-only (starting, active, draining).
+          schema:
+            type: boolean
+            default: false
+        - name: role
+          in: query
+          description: Filter by role, e.g. `supervisor`, `scheduler`, `global_reaper`, `local_reaper`.
+          schema:
+            type: string
+      responses:
+        "200":
+          description: OK, ordered by role then most-recent heartbeat first.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Worker"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+components:
+  parameters:
+    JobId:
+      name: jobId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    BatchId:
+      name: batchId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    ScheduleId:
+      name: scheduleId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    PerPage:
+      name: per_page
+      in: query
+      description: Page size. Capped at 200 regardless of the value sent.
+      schema:
+        type: integer
+        default: 50
+        maximum: 200
+    JobStateFilter:
+      name: state
+      in: query
+      description: Repeatable — one or more job states (OR'd together).
+      style: form
+      explode: true
+      schema:
+        type: array
+        items:
+          $ref: "#/components/schemas/JobState"
+    BatchStateFilter:
+      name: state
+      in: query
+      description: Repeatable — one or more batch states (OR'd together).
+      style: form
+      explode: true
+      schema:
+        type: array
+        items:
+          $ref: "#/components/schemas/BatchState"
+    LaneFilter:
+      name: lane
+      in: query
+      schema:
+        type: string
+    NameFilter:
+      name: name
+      in: query
+      description: Exact match on `jobs.name`.
+      schema:
+        type: string
+    JobClassFilter:
+      name: job_class
+      in: query
+      description: Exact match on `jobs.job_class` (fully-qualified class name).
+      schema:
+        type: string
+    CreatedByFilter:
+      name: created_by
+      in: query
+      schema:
+        type: string
+    BatchIdFilter:
+      name: batch_id
+      in: query
+      schema:
+        type: string
+        format: uuid
+    ScheduleIdFilter:
+      name: schedule_id
+      in: query
+      schema:
+        type: string
+        format: uuid
+    TagFilter:
+      name: tag
+      in: query
+      description: >-
+        Map of tag name → value, e.g. `tag[storeid]=AMAZ&tag[date]=2025-01*`.
+        Multiple entries are ANDed; a trailing `*` on a value is a prefix
+        match; an empty value matches any value for that tag name.
+      style: deepObject
+      explode: true
+      schema:
+        type: object
+        additionalProperties:
+          type: string
+    QFilter:
+      name: q
+      in: query
+      description: >-
+        Free-text search. Whitespace-separated tokens AND together:
+        `name:value` hits the tag index (trailing `*` = prefix, bare `name:` =
+        has-tag); any other token substring-matches the job class or name.
+      schema:
+        type: string
+
+  requestBodies:
+    ActionReason:
+      required: false
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              reason:
+                type: string
+                description: Recorded in the audit trail. Defaults to a generic per-action message.
+        application/x-www-form-urlencoded:
+          schema:
+            type: object
+            properties:
+              reason:
+                type: string
+
+  responses:
+    Forbidden:
+      description: >-
+        The `JobWarden::auth()` gate rejected the request (or the operator API
+        is disabled). Defaults to allowing only the `local` environment.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/MessageError"
+          example:
+            message: "Forbidden (jobwarden operator API)."
+    NotFound:
+      description: No row with that id.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/MessageError"
+          example:
+            message: "No query results for model [JobWarden\\Models\\Job] 018f..."
+    ValidationError:
+      description: Request failed validation.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ValidationError"
+    InvalidStateTransition:
+      description: >-
+        The job is not in a state this action allows (e.g. retrying a job
+        that isn't `failed`, or restarting one that isn't `orphaned`/
+        `stopped`). Raised as an uncaught `InvalidArgumentException` — there
+        is no dedicated 409 handling, so this currently surfaces as a generic
+        500. Check `state` before calling, or treat any non-200 response as
+        "the action did not apply."
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/MessageError"
+
+  schemas:
+    # ---- enums -----------------------------------------------------------
+    JobState:
+      type: string
+      enum: [pending, queued, running, retrying, orphaned, succeeded, failed, canceled, stopped]
+      description: >-
+        Terminal states: succeeded, failed, canceled, stopped. `orphaned` is a
+        parked, indeterminate state awaiting an operator (restart) — never
+        auto-resolved for a non-idempotent job.
+    BatchState:
+      type: string
+      enum: [pending, running, succeeded, failed, partial, canceled, stopped]
+      description: Terminal states — succeeded, failed, partial, canceled, stopped.
+    AttemptState:
+      type: string
+      enum: [dispatched, running, succeeded, failed, orphaned, canceled, stopped]
+      description: >-
+        One immutable execution attempt. `orphaned` here has no outgoing edge
+        — the owning Job recovers by minting a fresh attempt, never by
+        resurrecting this one.
+    ActorType:
+      type: string
+      enum: [supervisor, worker, scheduler, reaper, operator, system]
+      description: The actor that caused a job_events transition.
+    CancelMode:
+      type: [string, "null"]
+      enum: [cancel, stop, null]
+    BackoffStrategy:
+      type: [string, "null"]
+      enum: [fixed, exponential, custom, null]
+    MissedPolicy:
+      type: string
+      enum: [run_all, run_latest, skip, coalesce]
+      description: How a schedule catches up on occurrences missed while disabled/down.
+    OverlapPolicy:
+      type: string
+      enum: [allow, skip, queue]
+      description: What happens when an occurrence is due while the previous run is still in flight.
+    ScheduleKind:
+      type: string
+      enum: [recurring, one_time]
+    FailurePolicy:
+      type: string
+      enum: [continue, fail_fast, threshold]
+      description: >-
+        continue — members run independently regardless of sibling failures.
+        fail_fast — the first member failure cancels remaining non-terminal
+        members. threshold — the batch fails (and cancels remaining members)
+        once `failed_count` exceeds `failure_threshold`.
+    WorkerRole:
+      type: string
+      description: Free-form in the schema; production values are these four.
+      enum: [supervisor, scheduler, global_reaper, local_reaper]
+    WorkerState:
+      type: string
+      enum: [starting, active, draining, stopped, dead]
+    LogLevel:
+      type: string
+      enum: [debug, info, notice, warning, error, critical]
+    ArtifactType:
+      type: string
+      enum: [file, request, response, report, dump]
+    ScheduleRunAction:
+      type: string
+      enum: [enqueued, skipped, coalesced, overlapped, outside_window]
+
+    # ---- core resources ----------------------------------------------------
+    Job:
+      type: object
+      description: A durable job (run) — the intent and verdict that outlive any single execution attempt.
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: UUIDv7 — sortable by creation time.
+        batch_id:
+          type: [string, "null"]
+          format: uuid
+        schedule_id:
+          type: [string, "null"]
+          format: uuid
+        job_class:
+          type: string
+          description: Fully-qualified class implementing JobWarden\Contracts\JobWardenJob, resolved from the container.
+        name:
+          type: [string, "null"]
+        lane:
+          type: string
+          default: default
+          description: Claim partition — the business fleet uses `default` (or app-defined lanes); the scheduled-tier runner uses `scheduled`.
+        params:
+          type: [object, "null"]
+          description: Bound to the handler's constructor parameters by name at execution time.
+          additionalProperties: true
+        idempotent:
+          type: boolean
+          description: THE guard — whether a lost/failed attempt may be automatically retried, or must park for an operator.
+        idempotency_key:
+          type: [string, "null"]
+        priority:
+          type: integer
+          description: Higher claims first within a lane.
+        state:
+          $ref: "#/components/schemas/JobState"
+        available_at:
+          type: [string, "null"]
+          format: date-time
+          description: Not claimable before this instant (delayed dispatch).
+        max_attempts:
+          type: integer
+        attempt_count:
+          type: integer
+        current_attempt_id:
+          type: [string, "null"]
+          format: uuid
+        max_runtime_sec:
+          type: [integer, "null"]
+          description: Past this, an alive+verified running job is surfaced as STUCK for an operator — never auto-reaped.
+        backoff_strategy:
+          $ref: "#/components/schemas/BackoffStrategy"
+        cancel_requested:
+          type: boolean
+          description: Desired-state flag set by cancel/stop.
+        cancel_mode:
+          $ref: "#/components/schemas/CancelMode"
+        cancel_reason:
+          type: [string, "null"]
+        cancel_requested_at:
+          type: [string, "null"]
+          format: date-time
+        last_error:
+          type: [object, "null"]
+          additionalProperties: true
+          description: Present when the most recent attempt failed. Structure is handler/runner-defined.
+        result:
+          type: [object, "null"]
+          additionalProperties: true
+          description: >-
+            Success-only completion payload, capped at
+            jobwarden.results.max_bytes (default 64KiB). Written atomically
+            with the succeeded transition. Null if the handler never called
+            JobContext::result().
+        created_by:
+          type: [string, "null"]
+          description: Authenticated user id at dispatch time, or `api`.
+        created_at:
+          type: [string, "null"]
+          format: date-time
+        queued_at:
+          type: [string, "null"]
+          format: date-time
+        started_at:
+          type: [string, "null"]
+          format: date-time
+        finished_at:
+          type: [string, "null"]
+          format: date-time
+        updated_at:
+          type: [string, "null"]
+          format: date-time
+      required: [id, job_class, lane, idempotent, state, max_attempts, attempt_count]
+
+    JobDetailed:
+      description: A Job with attempts, events, artifacts, and tags eager-loaded (the shape returned by GET /jobs/{jobId}).
+      allOf:
+        - $ref: "#/components/schemas/Job"
+        - type: object
+          properties:
+            attempts:
+              type: array
+              items:
+                $ref: "#/components/schemas/JobAttempt"
+            events:
+              type: array
+              items:
+                $ref: "#/components/schemas/JobEvent"
+            artifacts:
+              type: array
+              items:
+                $ref: "#/components/schemas/JobArtifact"
+            tags:
+              type: array
+              items:
+                $ref: "#/components/schemas/JobTag"
+
+    JobAttempt:
+      type: object
+      description: One immutable execution attempt bound to a single worker/lease epoch (the process stamp).
+      properties:
+        id:
+          type: string
+          format: uuid
+        job_id:
+          type: string
+          format: uuid
+        attempt_number:
+          type: integer
+        state:
+          $ref: "#/components/schemas/AttemptState"
+        worker_id:
+          type: [string, "null"]
+          format: uuid
+        fencing_token:
+          type: integer
+          description: Monotonic per job; the fencing epoch — stale-token writes are rejected.
+        host_id:
+          type: [string, "null"]
+          description: Boot-stable id (machine-id + boot_id), not the hostname.
+        hostname:
+          type: [string, "null"]
+        supervisor_pid:
+          type: [integer, "null"]
+        supervisor_start_time:
+          type: [integer, "null"]
+          description: /proc starttime ticks, used for liveness verification (Linux).
+        child_pid:
+          type: [integer, "null"]
+        child_start_time:
+          type: [integer, "null"]
+        proc_nonce:
+          type: [string, "null"]
+        started_at:
+          type: [string, "null"]
+          format: date-time
+        finished_at:
+          type: [string, "null"]
+          format: date-time
+        exit_code:
+          type: [integer, "null"]
+        term_signal:
+          type: [integer, "null"]
+        duration_ms:
+          type: [integer, "null"]
+        progress:
+          type: [object, "null"]
+          additionalProperties: true
+        error:
+          type: [object, "null"]
+          additionalProperties: true
+        created_at:
+          type: [string, "null"]
+          format: date-time
+        updated_at:
+          type: [string, "null"]
+          format: date-time
+      required: [id, job_id, attempt_number, state, fencing_token]
+
+    JobEvent:
+      type: object
+      description: Append-only audit row. Never updated, only inserted, in the same transaction as the state change it records.
+      properties:
+        id:
+          type: integer
+          description: Monotonic bigint ordering column.
+        job_id:
+          type: string
+          format: uuid
+        attempt_id:
+          type: [string, "null"]
+          format: uuid
+        level:
+          type: string
+          enum: [job, attempt, batch]
+        from_state:
+          type: [string, "null"]
+        to_state:
+          type: string
+        actor_type:
+          $ref: "#/components/schemas/ActorType"
+        actor_id:
+          type: [string, "null"]
+        reason:
+          type: [string, "null"]
+        context:
+          type: [object, "null"]
+          additionalProperties: true
+          description: Error context, process snapshot, or fencing token, depending on the transition.
+        created_at:
+          type: [string, "null"]
+          format: date-time
+      required: [id, job_id, level, to_state, actor_type]
+
+    JobLog:
+      type: object
+      description: One LogIndex row. The body lives inline (database sink) or as a pointer (disk/s3 sink).
+      properties:
+        id:
+          type: integer
+        job_id:
+          type: string
+          format: uuid
+        attempt_id:
+          type: string
+          format: uuid
+        seq:
+          type: integer
+          description: Monotonic per attempt — the ordered tailing cursor within an attempt.
+        ts:
+          type: string
+          format: date-time
+        level:
+          $ref: "#/components/schemas/LogLevel"
+        step:
+          type: [string, "null"]
+        context:
+          type: [object, "null"]
+          additionalProperties: true
+        body_sink:
+          type: string
+          enum: [database, disk, s3, custom]
+          default: database
+        body_ref:
+          type: [string, "null"]
+          description: The inline message (database sink) or a pointer/key into the configured sink.
+        created_at:
+          type: [string, "null"]
+          format: date-time
+      required: [id, job_id, attempt_id, seq, ts, level]
+
+    JobArtifact:
+      type: object
+      description: A file, dump, or request/response pair captured for support-case review.
+      properties:
+        id:
+          type: string
+          format: uuid
+        job_id:
+          type: string
+          format: uuid
+        attempt_id:
+          type: [string, "null"]
+          format: uuid
+        type:
+          $ref: "#/components/schemas/ArtifactType"
+        name:
+          type: string
+        disk:
+          type: [string, "null"]
+          description: Laravel filesystem disk name.
+        path:
+          type: [string, "null"]
+          description: File path or URL. Null for inline summaries kept entirely in `meta`.
+        size_bytes:
+          type: [integer, "null"]
+        checksum:
+          type: [string, "null"]
+        content_type:
+          type: [string, "null"]
+        meta:
+          type: [object, "null"]
+          additionalProperties: true
+        created_at:
+          type: [string, "null"]
+          format: date-time
+      required: [id, job_id, type, name]
+
+    JobTag:
+      type: object
+      description: One searchable name→value pair on a job. Immutable after creation.
+      properties:
+        job_id:
+          type: string
+          format: uuid
+        name:
+          type: string
+          maxLength: 64
+        value:
+          type: string
+          maxLength: 200
+      required: [job_id, name, value]
+
+    Batch:
+      type: object
+      description: A fan-out / chain / DAG grouping of jobs, with completion derived from member terminal states under its failure policy.
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: [string, "null"]
+        type:
+          type: [string, "null"]
+          description: Logical batch type / coordinator class, application-defined.
+        state:
+          $ref: "#/components/schemas/BatchState"
+        failure_policy:
+          $ref: "#/components/schemas/FailurePolicy"
+        failure_threshold:
+          type: [integer, "null"]
+          description: Used only when failure_policy is `threshold`.
+        params:
+          type: [object, "null"]
+          additionalProperties: true
+        summary:
+          type: [object, "null"]
+          additionalProperties: true
+        total_jobs:
+          type: integer
+        pending_count:
+          type: integer
+        running_count:
+          type: integer
+        succeeded_count:
+          type: integer
+        failed_count:
+          type: integer
+        canceled_count:
+          type: integer
+        created_by:
+          type: [string, "null"]
+        created_at:
+          type: [string, "null"]
+          format: date-time
+        started_at:
+          type: [string, "null"]
+          format: date-time
+        finished_at:
+          type: [string, "null"]
+          format: date-time
+        updated_at:
+          type: [string, "null"]
+          format: date-time
+      required: [id, state, failure_policy, total_jobs]
+
+    BatchDetailed:
+      description: A Batch with its member jobs eager-loaded (the shape returned by GET /batches/{batchId}).
+      allOf:
+        - $ref: "#/components/schemas/Batch"
+        - type: object
+          properties:
+            jobs:
+              type: array
+              items:
+                $ref: "#/components/schemas/Job"
+
+    Schedule:
+      type: object
+      description: A cron-driven recurring schedule (or a one-time schedule created via application code) that materializes jobs.
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+          description: Unique.
+        job_class:
+          type: string
+          description: For a command schedule this is always JobWarden\Jobs\RunArtisanCommand, with `command`/`arguments` folded into params.
+        params:
+          type: [object, "null"]
+          additionalProperties: true
+        kind:
+          $ref: "#/components/schemas/ScheduleKind"
+        cron_expression:
+          type: [string, "null"]
+        run_at:
+          type: [string, "null"]
+          format: date-time
+          description: Set only for kind=one_time.
+        timezone:
+          type: string
+          default: UTC
+        enabled:
+          type: boolean
+        idempotent:
+          type: boolean
+          description: Whether a lost occurrence's run can be safely retried on another host, versus parked for an operator.
+        max_attempts:
+          type: [integer, "null"]
+          description: Null defers to a default derived from `idempotent`.
+        missed_policy:
+          $ref: "#/components/schemas/MissedPolicy"
+        catch_up_window_sec:
+          type: [integer, "null"]
+        max_catch_up:
+          type: [integer, "null"]
+        overlap_policy:
+          $ref: "#/components/schemas/OverlapPolicy"
+        priority:
+          type: integer
+        owner:
+          type: [string, "null"]
+        tags:
+          type: [object, "null"]
+          additionalProperties: true
+        last_evaluated_at:
+          type: [string, "null"]
+          format: date-time
+        last_enqueued_for:
+          type: [string, "null"]
+          format: date-time
+        next_due_at:
+          type: [string, "null"]
+          format: date-time
+        created_at:
+          type: [string, "null"]
+          format: date-time
+        updated_at:
+          type: [string, "null"]
+          format: date-time
+      required: [id, name, job_class, kind, enabled, idempotent]
+
+    ScheduleDetailed:
+      description: A Schedule with recent_runs set to its last 25 occurrences (the shape returned by GET /schedules/{scheduleId}).
+      allOf:
+        - $ref: "#/components/schemas/Schedule"
+        - type: object
+          properties:
+            recent_runs:
+              type: array
+              items:
+                $ref: "#/components/schemas/ScheduleRun"
+
+    ScheduleRun:
+      type: object
+      description: One evaluation/occurrence audit row. A (schedule_id, occurrence_time) pair materializes at most once regardless of concurrent evaluators.
+      properties:
+        id:
+          type: string
+          format: uuid
+        schedule_id:
+          type: string
+          format: uuid
+        occurrence_time:
+          type: string
+          format: date-time
+          description: The scheduled instant this row represents.
+        detected_at:
+          type: [string, "null"]
+          format: date-time
+        action:
+          $ref: "#/components/schemas/ScheduleRunAction"
+        job_id:
+          type: [string, "null"]
+          format: uuid
+        reason:
+          type: [string, "null"]
+        evaluator_worker_id:
+          type: [string, "null"]
+          format: uuid
+        created_at:
+          type: [string, "null"]
+          format: date-time
+      required: [id, schedule_id, occurrence_time, action]
+
+    Worker:
+      type: object
+      description: A row in the process registry — supervisors, schedulers, and reapers self-register and heartbeat here.
+      properties:
+        id:
+          type: string
+          format: uuid
+        role:
+          $ref: "#/components/schemas/WorkerRole"
+        host_id:
+          type: string
+          description: Boot-stable id (machine-id + boot_id).
+        hostname:
+          type: [string, "null"]
+        pid:
+          type: [integer, "null"]
+        incarnation:
+          type: integer
+          description: Monotonic; a new value on every (re)start of this process.
+        state:
+          $ref: "#/components/schemas/WorkerState"
+        capacity:
+          type: [integer, "null"]
+        current_load:
+          type: integer
+        app_version:
+          type: [string, "null"]
+        php_version:
+          type: [string, "null"]
+        meta:
+          type: [object, "null"]
+          additionalProperties: true
+        started_at:
+          type: [string, "null"]
+          format: date-time
+        heartbeat_at:
+          type: [string, "null"]
+          format: date-time
+          description: The host lease — the one coarse liveness signal the global reaper watches.
+        stopped_at:
+          type: [string, "null"]
+          format: date-time
+        last_signal:
+          type: [string, "null"]
+      required: [id, role, host_id, state, incarnation]
+
+    Stats:
+      type: object
+      description: Overview counts. jobs/jobs_by_lane/batches/workers are maps keyed by state or lane/role (only keys with at least one row present).
+      properties:
+        jobs:
+          type: object
+          description: "Map of JobState value → count."
+          additionalProperties:
+            type: integer
+        jobs_by_lane:
+          type: object
+          description: "Map of lane → count."
+          additionalProperties:
+            type: integer
+        batches:
+          type: object
+          description: "Map of BatchState value → count."
+          additionalProperties:
+            type: integer
+        schedules:
+          type: object
+          properties:
+            enabled:
+              type: integer
+            total:
+              type: integer
+          required: [enabled, total]
+        workers:
+          type: object
+          description: "Map of role → count, restricted to live states (starting, active, draining)."
+          additionalProperties:
+            type: integer
+      required: [jobs, jobs_by_lane, batches, schedules, workers]
+
+    # ---- request bodies ----------------------------------------------------
+    DispatchJobRequest:
+      type: object
+      description: Dispatch a single ad-hoc job.
+      properties:
+        job_class:
+          type: string
+          description: Must be a class implementing JobWarden\Contracts\JobWardenJob, otherwise rejected with a 422.
+        params:
+          type: object
+          additionalProperties: true
+          description: Bound to the handler's constructor by parameter name.
+        lane:
+          type: string
+          default: default
+        name:
+          type: [string, "null"]
+        idempotent:
+          type: boolean
+          default: false
+        idempotency_key:
+          type: [string, "null"]
+        priority:
+          type: integer
+          default: 0
+        available_at:
+          type: string
+          format: date-time
+          description: Absolute instant before which the job is not claimable. Mutually meaningful with a client-side delay; there is no separate `delay` (seconds) field on this endpoint.
+        max_attempts:
+          type: integer
+          minimum: 1
+          default: 4
+        max_runtime_sec:
+          type: [integer, "null"]
+          minimum: 1
+        backoff_strategy:
+          $ref: "#/components/schemas/BackoffStrategy"
+        tags:
+          type: [object, "null"]
+          description: Name → string value map. Names ≤ 64 chars, values ≤ 200 chars, non-empty — otherwise a 422.
+          additionalProperties:
+            type: string
+            maxLength: 200
+      required: [job_class]
+
+    DispatchBulkRequest:
+      type: object
+      description: >-
+        Bulk dispatch. Only job_class, params, and tags are strictly
+        validated per item (job_class must resolve to a JobWardenJob
+        subclass, tags must pass the same rules as the single form); other
+        per-job dispatch options below are accepted and applied the same way
+        as the single-dispatch endpoint but are not independently validated.
+      properties:
+        jobs:
+          type: array
+          minItems: 1
+          description: Capped by jobwarden.api.max_bulk (default 2000).
+          items:
+            allOf:
+              - $ref: "#/components/schemas/DispatchJobRequest"
+      required: [jobs]
+
+    BulkDispatchResult:
+      type: object
+      properties:
+        created:
+          type: integer
+        ids:
+          type: array
+          items:
+            type: string
+            format: uuid
+      required: [created, ids]
+
+    CreateScheduleRequest:
+      type: object
+      description: type=command requires `command` (+ optional `arguments`); type=job requires `job_class` (+ optional `params`).
+      properties:
+        name:
+          type: string
+        cron:
+          type: string
+          description: Standard 5-field cron expression. Rejected with 422 if invalid.
+        type:
+          type: string
+          enum: [command, job]
+        command:
+          type: string
+          description: Artisan command signature. Required when type=command.
+        arguments:
+          type: object
+          additionalProperties: true
+          description: Artisan arguments/options, used only when type=command.
+        job_class:
+          type: string
+          description: Required when type=job.
+        params:
+          type: object
+          additionalProperties: true
+          description: Used only when type=job.
+        idempotent:
+          type: boolean
+          default: false
+        max_attempts:
+          type: integer
+          minimum: 1
+        timezone:
+          type: string
+          default: UTC
+        missed_policy:
+          $ref: "#/components/schemas/MissedPolicy"
+        overlap_policy:
+          $ref: "#/components/schemas/OverlapPolicy"
+      required: [name, cron, type]
+
+    UpdateScheduleRequest:
+      type: object
+      description: All fields optional; only fields present are updated.
+      properties:
+        enabled:
+          type: boolean
+        cron_expression:
+          type: string
+          description: Rejected with 422 if invalid.
+        idempotent:
+          type: boolean
+        max_attempts:
+          type: [integer, "null"]
+          minimum: 1
+        missed_policy:
+          $ref: "#/components/schemas/MissedPolicy"
+        overlap_policy:
+          $ref: "#/components/schemas/OverlapPolicy"
+
+    # ---- pagination + errors -----------------------------------------------
+    PaginationLink:
+      type: object
+      properties:
+        url:
+          type: [string, "null"]
+        label:
+          type: string
+        active:
+          type: boolean
+      required: [label, active]
+
+    PaginationMeta:
+      type: object
+      properties:
+        current_page:
+          type: integer
+        from:
+          type: [integer, "null"]
+        last_page:
+          type: integer
+        links:
+          type: array
+          items:
+            $ref: "#/components/schemas/PaginationLink"
+        path:
+          type: string
+        per_page:
+          type: integer
+        to:
+          type: [integer, "null"]
+        total:
+          type: integer
+      required: [current_page, last_page, per_page, total]
+
+    PaginationLinks:
+      type: object
+      properties:
+        first:
+          type: [string, "null"]
+        last:
+          type: [string, "null"]
+        prev:
+          type: [string, "null"]
+        next:
+          type: [string, "null"]
+
+    JobPage:
+      type: object
+      properties:
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/Job"
+        links:
+          $ref: "#/components/schemas/PaginationLinks"
+        meta:
+          $ref: "#/components/schemas/PaginationMeta"
+      required: [data, links, meta]
+
+    BatchPage:
+      type: object
+      properties:
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/Batch"
+        links:
+          $ref: "#/components/schemas/PaginationLinks"
+        meta:
+          $ref: "#/components/schemas/PaginationMeta"
+      required: [data, links, meta]
+
+    SchedulePage:
+      type: object
+      properties:
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/Schedule"
+        links:
+          $ref: "#/components/schemas/PaginationLinks"
+        meta:
+          $ref: "#/components/schemas/PaginationMeta"
+      required: [data, links, meta]
+
+    MessageError:
+      type: object
+      properties:
+        message:
+          type: string
+      required: [message]
+
+    ValidationError:
+      type: object
+      properties:
+        message:
+          type: string
+        errors:
+          type: object
+          additionalProperties:
+            type: array
+            items:
+              type: string
+      required: [message, errors]
+      example:
+        message: "The cron field is not a valid cron expression."
+        errors:
+          cron: ["The cron field is not a valid cron expression."]

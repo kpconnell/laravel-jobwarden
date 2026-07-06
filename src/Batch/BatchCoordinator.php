@@ -30,9 +30,24 @@ use Illuminate\Support\Facades\Log;
  *    ok) or partial (some failed/canceled).
  * Progress counters are maintained transactionally by the StateMachine; the
  * batch transition itself is a guarded UPDATE so concurrent finalizers are safe.
+ *
+ * The cascade also runs in reverse: when a doomed member re-enters the DAG
+ * (operator retry/restart), a partial/failed batch reopens and the dependents
+ * the system canceled as unreachable are revived to `pending` — back to
+ * waiting on their dependencies.
  */
 final class BatchCoordinator
 {
+    /** Terminal member states that make dependents unreachable (deps are strict). */
+    private const DOOMED = [JobState::Failed, JobState::Canceled, JobState::Stopped];
+
+    /**
+     * The cancel_reason stamped by the unreachable-dependents cascade. Revival
+     * matches on it exactly so it only ever undoes the system's own cascade,
+     * never an operator's cancel verdict.
+     */
+    private const UNREACHABLE_REASON = 'unreachable: an upstream dependency did not succeed';
+
     public function __construct(private readonly StateMachine $stateMachine)
     {
     }
@@ -40,12 +55,34 @@ final class BatchCoordinator
     public function onJobStateChanged(JobStateChanged $event): void
     {
         $batchId = $event->job->getAttribute('batch_id');
-        if ($batchId === null || ! $event->to->isTerminal()) {
+        if ($batchId === null) {
+            return;
+        }
+
+        $reentered = ! $event->to->isTerminal() && in_array($event->from, self::DOOMED, true);
+        if (! $event->to->isTerminal() && ! $reentered) {
             return;
         }
 
         $batch = Batch::find($batchId);
-        if ($batch === null || $batch->state->isTerminal()) {
+        if ($batch === null) {
+            return;
+        }
+
+        if ($reentered) {
+            // A doomed member re-entered the DAG (operator retry/restart, or a
+            // revival cascading below): reopen a completed batch and put the
+            // dependents its doom canceled back to waiting on it. Each revival
+            // cascades transitively via its own event.
+            $this->reopenBatch($batch);
+            if (! $batch->state->isTerminal()) {
+                $this->reviveUnreachableDependents($event->job->id, $batch);
+            }
+
+            return;
+        }
+
+        if ($batch->state->isTerminal()) {
             return;
         }
 
@@ -62,7 +99,7 @@ final class BatchCoordinator
         // are strict: all must succeed). Cancel them so the batch can complete
         // (partial) instead of hanging on stranded `pending` members. Each
         // cancellation cascades transitively via its own event.
-        if (in_array($event->to, [JobState::Failed, JobState::Canceled, JobState::Stopped], true)) {
+        if (in_array($event->to, self::DOOMED, true)) {
             $this->cancelUnreachableDependents($event->job->id, $batch);
         }
 
@@ -84,7 +121,38 @@ final class BatchCoordinator
      */
     public function reconcile(int $limit = 200): void
     {
-        // Stranded dependents first: their cancellation updates the counters that
+        // Lost re-entry events first: a retried/restarted member whose event was
+        // lost leaves its completed batch terminal with work in flight, and its
+        // canceled-as-unreachable dependents unrevived. Reopen, then revive —
+        // each revival re-fires the live cascade for its own dependents.
+        foreach ($this->reopenableBatchIds($limit) as $id) {
+            $batch = Batch::find($id);
+            if ($batch === null) {
+                continue;
+            }
+
+            Log::warning('batch reconcile: reopening a completed batch whose member re-entered the DAG', [
+                'role' => 'batch_reconcile',
+                'batch_id' => (string) $batch->id,
+            ]);
+            $this->reopenBatch($batch);
+        }
+
+        foreach ($this->revivableMemberIds($limit) as $id) {
+            $job = Job::find($id);
+            if ($job === null) {
+                continue;
+            }
+
+            Log::warning('batch reconcile: reviving a canceled member whose upstreams are viable again', [
+                'role' => 'batch_reconcile',
+                'job_id' => (string) $job->id,
+                'batch_id' => (string) $job->batch_id,
+            ]);
+            $this->reviveMember($job);
+        }
+
+        // Stranded dependents next: their cancellation updates the counters that
         // the completion sweep below reads, so one pass converges a lost-event
         // chain (upstream failed → dependent canceled → batch partial).
         foreach ($this->strandedMemberIds($limit) as $id) {
@@ -98,7 +166,7 @@ final class BatchCoordinator
                 'job_id' => (string) $job->id,
                 'batch_id' => (string) $job->batch_id,
             ]);
-            $this->cancelMember($job, 'unreachable: an upstream dependency did not succeed');
+            $this->cancelMember($job, self::UNREACHABLE_REASON);
         }
 
         foreach ($this->reconcilableBatchIds($limit) as $id) {
@@ -133,10 +201,15 @@ final class BatchCoordinator
         $this->cancelRemainingMembers($batch, $reason);
     }
 
+    /**
+     * Counter-based (mirrors reconcilableBatchIds' SQL) rather than "a failure
+     * event just happened": a retry decrements failed_count, and reopenBatch
+     * relies on that to tell a still-tripped policy from a repaired one.
+     */
     private function shouldEagerFail(Batch $batch): bool
     {
         return match ($batch->failure_policy) {
-            'fail_fast' => true,
+            'fail_fast' => (int) $batch->failed_count > 0,
             'threshold' => (int) $batch->failed_count > (int) ($batch->failure_threshold ?? 0),
             default => false, // continue
         };
@@ -181,7 +254,7 @@ final class BatchCoordinator
                 continue;
             }
             if (in_array($dep->state, [JobState::Pending, JobState::Queued, JobState::Retrying], true)) {
-                $this->cancelMember($dep, 'unreachable: an upstream dependency did not succeed');
+                $this->cancelMember($dep, self::UNREACHABLE_REASON);
             }
         }
     }
@@ -208,6 +281,159 @@ final class BatchCoordinator
         } catch (IllegalTransitionException|GuardFailedException|StaleFencingTokenException) {
             // raced with a claim/transition — the desired-state flag remains.
         }
+    }
+
+    /**
+     * Undo the unreachable-cascade for the direct dependents of a member that
+     * re-entered the DAG. Only members the system itself canceled (matched by
+     * cancel_reason) revive, and only once NO doomed upstream remains — a
+     * dependent behind a second, still-failed upstream stays canceled until
+     * that one is retried too (reviving it early would just see the stranded
+     * sweep cancel it again).
+     */
+    private function reviveUnreachableDependents(mixed $upstreamId, Batch $batch): void
+    {
+        $dependentIds = $this->connection()->table($this->tbl('job_dependencies'))
+            ->where('depends_on_job_id', $upstreamId)
+            ->pluck('job_id');
+
+        foreach ($dependentIds as $id) {
+            $dep = Job::find($id);
+            if ($dep === null || (string) $dep->batch_id !== (string) $batch->id) {
+                continue;
+            }
+            if ($dep->state !== JobState::Canceled || (string) $dep->cancel_reason !== self::UNREACHABLE_REASON) {
+                continue;
+            }
+            if ($this->hasDoomedDependency($dep->id)) {
+                continue;
+            }
+            $this->reviveMember($dep);
+        }
+    }
+
+    /** Revive a canceled-as-unreachable member back to waiting on its dependencies. */
+    private function reviveMember(Job $job): void
+    {
+        try {
+            // One transaction: the cancellation-flag withdrawal and the audited
+            // state move commit together (mirrors OperatorActions::requeue).
+            $this->connection()->transaction(function () use ($job): void {
+                $conn = $this->connection();
+                $conn->table($this->tbl('jobs'))->where('id', $job->id)->update([
+                    'cancel_requested' => false,
+                    'cancel_mode' => null,
+                    'cancel_reason' => null,
+                    'cancel_requested_at' => null,
+                    'finished_at' => null,
+                    'updated_at' => $conn->raw(SqlTime::nowExpr($conn)),
+                ]);
+                $job->refresh();
+
+                $this->stateMachine->applyJobTransition(
+                    $job,
+                    JobState::Pending,
+                    TransitionContext::for(ActorType::System, null, 'revived: upstream dependency was re-queued')
+                );
+            });
+        } catch (IllegalTransitionException|GuardFailedException|StaleFencingTokenException) {
+            // raced with another transition — leave the member as it is.
+        }
+    }
+
+    private function hasDoomedDependency(mixed $jobId): bool
+    {
+        return $this->connection()->table($this->tbl('job_dependencies').' as d')
+            ->join($this->tbl('jobs').' as dep', 'dep.id', '=', 'd.depends_on_job_id')
+            ->where('d.job_id', $jobId)
+            ->whereIn('dep.state', array_map(static fn (JobState $s): string => $s->value, self::DOOMED))
+            ->exists();
+    }
+
+    /**
+     * Reopen a completed batch whose member re-entered the DAG. Only the
+     * derived verdicts (partial, failed) reopen — canceled/stopped are operator
+     * verdicts on the whole batch and stay put. A failure policy that would
+     * still trip eagerly (fail_fast/threshold with enough failures on record)
+     * keeps the batch failed: reopening would only see the next sweep re-fail
+     * it and cancel the retried member again.
+     */
+    private function reopenBatch(Batch $batch): void
+    {
+        $batch->refresh();
+        $from = $batch->state;
+        if (! in_array($from, [BatchState::Partial, BatchState::Failed], true) || $this->shouldEagerFail($batch)) {
+            return;
+        }
+
+        $conn = $this->connection();
+        $affected = $conn->table($this->tbl('batches'))
+            ->where('id', $batch->id)
+            ->where('state', $from->value)
+            ->update([
+                'state' => BatchState::Running->value,
+                'summary' => null,
+                'finished_at' => null,
+                'updated_at' => $conn->raw(SqlTime::nowExpr($conn)),
+            ]);
+
+        if ($affected === 1) {
+            $batch->state = BatchState::Running;
+            $batch->summary = null;
+            $batch->finished_at = null;
+            event(new BatchStateChanged($batch, $from, BatchState::Running, 'member re-entered the DAG'));
+        } else {
+            $batch->refresh(); // lost the race — let the caller see the truth
+        }
+    }
+
+    /**
+     * Terminal batches a lost re-entry event left inconsistent: partial/failed
+     * with members back in flight (pending_count counts pending/queued/retrying,
+     * so a completed batch can only regain it through a retry/restart/revival).
+     *
+     * @return string[]
+     */
+    private function reopenableBatchIds(int $limit): array
+    {
+        return $this->connection()->table($this->tbl('batches'))
+            ->whereIn('state', [BatchState::Partial->value, BatchState::Failed->value])
+            ->where('pending_count', '>', 0)
+            ->orderBy('id')
+            ->limit($limit)
+            ->pluck('id')
+            ->map(static fn ($id): string => (string) $id)
+            ->all();
+    }
+
+    /**
+     * Members of running batches still canceled by the unreachable-cascade even
+     * though no doomed upstream remains — the revival event that should have
+     * restored them was lost. The inverse of strandedMemberIds().
+     *
+     * @return string[]
+     */
+    private function revivableMemberIds(int $limit): array
+    {
+        $doomed = array_map(static fn (JobState $s): string => $s->value, self::DOOMED);
+
+        return $this->connection()->table($this->tbl('jobs').' as j')
+            ->join($this->tbl('batches').' as b', 'b.id', '=', 'j.batch_id')
+            ->where('b.state', BatchState::Running->value)
+            ->where('j.state', JobState::Canceled->value)
+            ->where('j.cancel_reason', self::UNREACHABLE_REASON)
+            ->whereNotExists(function ($q) use ($doomed): void {
+                $q->selectRaw('1')
+                    ->from($this->tbl('job_dependencies').' as d')
+                    ->join($this->tbl('jobs').' as dep', 'dep.id', '=', 'd.depends_on_job_id')
+                    ->whereColumn('d.job_id', 'j.id')
+                    ->whereIn('dep.state', $doomed);
+            })
+            ->orderBy('j.id')
+            ->limit($limit)
+            ->pluck('j.id')
+            ->map(static fn ($id): string => (string) $id)
+            ->all();
     }
 
     /**
@@ -249,7 +475,7 @@ final class BatchCoordinator
      */
     private function strandedMemberIds(int $limit): array
     {
-        $doomed = [JobState::Failed->value, JobState::Canceled->value, JobState::Stopped->value];
+        $doomed = array_map(static fn (JobState $s): string => $s->value, self::DOOMED);
 
         return $this->connection()->table($this->tbl('jobs').' as j')
             ->join($this->tbl('batches').' as b', 'b.id', '=', 'j.batch_id')

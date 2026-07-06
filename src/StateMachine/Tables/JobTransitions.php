@@ -58,6 +58,11 @@ final class JobTransitions implements TransitionTable
             new Transition(S::Orphaned, S::Queued, [A::Operator]),  // restart a parked orphan
             new Transition(S::Stopped, S::Queued, [A::Operator]),   // restart stopped work
             new Transition(S::Failed, S::Queued, [A::Operator]),    // retry a failed job
+
+            // revival: a batch member canceled as unreachable becomes reachable
+            // again when its doomed upstream is retried/restarted — back to
+            // waiting on dependencies (BatchCoordinator only).
+            new Transition(S::Canceled, S::Pending, [A::System]),
         ];
 
         $map = [];

@@ -125,6 +125,36 @@ final class BatchReconcileTest extends TestCase
         $this->assertSame('partial', $batch->summary['outcome']);
     }
 
+    public function test_reconcile_reopens_the_batch_and_revives_dependents_after_a_lost_retry_event(): void
+    {
+        $batch = $this->jobwarden()->batch('chain')
+            ->add('a', 'JobA')
+            ->add('b', 'JobB', dependsOn: ['a'])->dispatch();
+
+        // Live path: a fails, b is canceled as unreachable, batch partial.
+        $this->complete($this->member($batch, 'JobA'), JobState::Failed);
+        $this->assertSame(BatchState::Partial, $batch->refresh()->state);
+        $this->assertSame(JobState::Canceled, $this->member($batch, 'JobB')->state);
+
+        // The operator retry commits, but its event is lost: the batch stays
+        // partial with a queued member, and b stays canceled.
+        $this->loseBatchEvents();
+        $this->app->make(\JobWarden\Operations\OperatorActions::class)
+            ->retry($this->member($batch, 'JobA'), 'operator retry', 'op-1');
+        $this->assertSame(BatchState::Partial, $batch->refresh()->state);
+        $this->assertSame(JobState::Canceled, $this->member($batch, 'JobB')->state);
+
+        $this->coordinator()->reconcile();
+
+        $batch->refresh();
+        $this->assertSame(BatchState::Running, $batch->state, 'reopened');
+        $this->assertNull($batch->finished_at);
+
+        $b = $this->member($batch, 'JobB');
+        $this->assertSame(JobState::Pending, $b->state, 'revived to waiting on its predecessor');
+        $this->assertFalse((bool) $b->cancel_requested);
+    }
+
     public function test_reconcile_leaves_a_healthy_running_batch_alone(): void
     {
         $batch = $this->jobwarden()->batch('healthy')

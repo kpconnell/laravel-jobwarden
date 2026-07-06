@@ -7,6 +7,7 @@ namespace JobWarden\Tests\Batch;
 use JobWarden\JobWarden;
 use JobWarden\Models\Batch;
 use JobWarden\Models\Job;
+use JobWarden\Operations\OperatorActions;
 use JobWarden\Recovery\Admitter;
 use JobWarden\StateMachine\StateMachine;
 use JobWarden\StateMachine\TransitionContext;
@@ -140,6 +141,118 @@ final class BatchTest extends TestCase
         $this->assertSame(JobState::Canceled, $this->member($batch, 'JobB')->state, 'b is unreachable → canceled');
         $this->assertSame(JobState::Canceled, $this->member($batch, 'JobC')->state, 'c (transitively) unreachable → canceled');
         $this->assertSame(BatchState::Partial, $batch->refresh()->state, 'batch completes (partial), not hung');
+    }
+
+    public function test_retrying_a_failed_upstream_revives_its_canceled_dependents(): void
+    {
+        // Fail the chain's root: b and c are canceled as unreachable and the
+        // batch completes partial. An operator retry of the root must undo that
+        // cascade — dependents back to pending (waiting on the root), batch
+        // reopened — and the chain must then be able to run to success.
+        $batch = $this->jobwarden()->batch('chain', 'continue')
+            ->add('a', 'JobA')
+            ->add('b', 'JobB', dependsOn: ['a'])
+            ->add('c', 'JobC', dependsOn: ['b'])
+            ->dispatch();
+
+        $this->complete($this->member($batch, 'JobA'), JobState::Failed);
+        $this->assertSame(BatchState::Partial, $batch->refresh()->state);
+        $this->assertSame(JobState::Canceled, $this->member($batch, 'JobB')->state);
+
+        $this->app->make(OperatorActions::class)->retry($this->member($batch, 'JobA'), 'operator retry', 'op-1');
+
+        $batch->refresh();
+        $this->assertSame(BatchState::Running, $batch->state, 'batch reopened');
+        $this->assertNull($batch->finished_at);
+        $this->assertSame(JobState::Queued, $this->member($batch, 'JobA')->state);
+
+        $b = $this->member($batch, 'JobB');
+        $this->assertSame(JobState::Pending, $b->state, 'b waits on its predecessor again');
+        $this->assertFalse((bool) $b->cancel_requested);
+        $this->assertNull($b->cancel_reason);
+        $this->assertSame(JobState::Pending, $this->member($batch, 'JobC')->state, 'revival cascades transitively');
+
+        // The revived chain runs to completion exactly like a fresh one.
+        $admitter = $this->app->make(Admitter::class);
+        $this->complete($this->member($batch, 'JobA'), JobState::Succeeded);
+        $admitter->admit();
+        $this->complete($this->member($batch, 'JobB'), JobState::Succeeded);
+        $admitter->admit();
+        $this->complete($this->member($batch, 'JobC'), JobState::Succeeded);
+
+        $batch->refresh();
+        $this->assertSame(BatchState::Succeeded, $batch->state);
+        $this->assertSame(3, $batch->succeeded_count);
+        $this->assertSame(0, $batch->canceled_count);
+    }
+
+    public function test_a_dependent_behind_a_second_failed_upstream_revives_only_after_both_retries(): void
+    {
+        // join depends on BOTH roots. Retrying only u1 must not revive join —
+        // it is still unreachable behind the failed u2 (and would otherwise
+        // just be re-canceled by the stranded sweep).
+        $batch = $this->jobwarden()->batch('diamond', 'continue')
+            ->add('u1', 'JobU1')
+            ->add('u2', 'JobU2')
+            ->add('join', 'JobJoin', dependsOn: ['u1', 'u2'])
+            ->dispatch();
+
+        $this->complete($this->member($batch, 'JobU1'), JobState::Failed);
+        $this->complete($this->member($batch, 'JobU2'), JobState::Failed);
+        $this->assertSame(JobState::Canceled, $this->member($batch, 'JobJoin')->state);
+        $this->assertSame(BatchState::Partial, $batch->refresh()->state);
+
+        $operator = $this->app->make(OperatorActions::class);
+
+        $operator->retry($this->member($batch, 'JobU1'), 'retry u1', 'op-1');
+        $this->assertSame(BatchState::Running, $batch->refresh()->state, 'batch reopens on the first retry');
+        $this->assertSame(JobState::Canceled, $this->member($batch, 'JobJoin')->state, 'still doomed behind u2');
+
+        $operator->retry($this->member($batch, 'JobU2'), 'retry u2', 'op-1');
+        $this->assertSame(JobState::Pending, $this->member($batch, 'JobJoin')->state, 'reachable again once both are back');
+    }
+
+    public function test_an_operator_canceled_member_is_not_revived_by_an_upstream_retry(): void
+    {
+        // Revival only undoes the system's own unreachable-cascade. A member
+        // the operator canceled deliberately stays canceled.
+        $batch = $this->jobwarden()->batch('chain', 'continue')
+            ->add('a', 'JobA')
+            ->add('b', 'JobB', dependsOn: ['a'])
+            ->dispatch();
+
+        $operator = $this->app->make(OperatorActions::class);
+        $operator->cancel($this->member($batch, 'JobB'), 'operator does not want b', 'op-1');
+
+        $this->complete($this->member($batch, 'JobA'), JobState::Failed);
+        $this->assertSame(BatchState::Partial, $batch->refresh()->state);
+
+        $operator->retry($this->member($batch, 'JobA'), 'retry a', 'op-1');
+
+        $this->assertSame(BatchState::Running, $batch->refresh()->state);
+        $this->assertSame(JobState::Canceled, $this->member($batch, 'JobB')->state, 'operator verdict stands');
+
+        $this->complete($this->member($batch, 'JobA'), JobState::Succeeded);
+        $this->assertSame(BatchState::Partial, $batch->refresh()->state, 'completes partial around the canceled member');
+    }
+
+    public function test_retrying_the_only_failure_of_a_fail_fast_batch_reopens_it(): void
+    {
+        $batch = $this->jobwarden()->batch('ff', 'fail_fast')
+            ->add('a', 'JobA')->add('b', 'JobB')->dispatch();
+
+        $this->complete($this->member($batch, 'JobA'), JobState::Failed);
+        $this->assertSame(BatchState::Failed, $batch->refresh()->state);
+        $this->assertSame(JobState::Canceled, $this->member($batch, 'JobB')->state);
+
+        // With the lone failure back in flight the policy no longer trips, so
+        // the batch reopens. b was canceled by the fail_fast sweep (not the
+        // unreachable-cascade) and stays canceled — the batch ends partial.
+        $this->app->make(OperatorActions::class)->retry($this->member($batch, 'JobA'), 'retry a', 'op-1');
+        $this->assertSame(BatchState::Running, $batch->refresh()->state);
+
+        $this->complete($this->member($batch, 'JobA'), JobState::Succeeded);
+        $this->assertSame(BatchState::Partial, $batch->refresh()->state);
     }
 
     public function test_cancel_batch_propagates_to_all_non_terminal_members(): void

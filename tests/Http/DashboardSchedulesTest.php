@@ -110,6 +110,44 @@ final class DashboardSchedulesTest extends TestCase
             ->assertSee('outside catch-up window');
     }
 
+    public function test_edit_updates_cron_policies_and_retry_budget(): void
+    {
+        $schedule = $this->app->make(JobWarden::class)->scheduleCommand('s', '0 3 * * *', 'cache:prune');
+
+        Livewire::test(ScheduleShow::class, ['schedule' => $schedule->id])
+            ->call('openEdit')
+            ->assertSet('cron', '0 3 * * *')
+            ->set('cron', '30 4 * * 1')
+            ->set('idempotent', true)
+            ->set('max_attempts', '5')
+            ->set('missed_policy', 'coalesce')
+            ->set('overlap_policy', 'queue')
+            ->call('saveEdit')
+            ->assertSet('showEdit', false)
+            ->assertDispatched('jw-toast');
+
+        $schedule->refresh();
+        $this->assertSame('30 4 * * 1', $schedule->cron_expression);
+        $this->assertTrue((bool) $schedule->idempotent);
+        $this->assertSame(5, $schedule->max_attempts);
+        $this->assertSame('coalesce', $schedule->missed_policy);
+        $this->assertSame('queue', $schedule->overlap_policy);
+    }
+
+    public function test_edit_rejects_a_bad_cron_and_saves_nothing(): void
+    {
+        $schedule = $this->app->make(JobWarden::class)->scheduleCommand('s', '0 3 * * *', 'cache:prune');
+
+        Livewire::test(ScheduleShow::class, ['schedule' => $schedule->id])
+            ->call('openEdit')
+            ->set('cron', 'garbage')
+            ->call('saveEdit')
+            ->assertHasErrors('cron')
+            ->assertSet('showEdit', true);
+
+        $this->assertSame('0 3 * * *', $schedule->refresh()->cron_expression);
+    }
+
     public function test_delete_redirects_back_to_the_list(): void
     {
         $schedule = $this->app->make(JobWarden::class)->scheduleCommand('s', '0 3 * * *', 'cache:prune');

@@ -16,6 +16,11 @@ All notable changes to `laravel-jobwarden` are documented here. The format follo
   cancel. The leader reconcile backstop handles lost re-entry events the same way:
   reopenable batches first, then revivable members, each revival re-firing the live
   cascade for its own dependents.
+- **Dashboard: schedules are editable from the detail page.** An Edit modal on
+  `/schedules/{id}` covers exactly what `PATCH /schedules/{id}` allows — cron,
+  idempotency, retry budget (`max_attempts`), and the missed/overlap policies. Name,
+  target, and timezone stay fixed at creation: a different target is a different
+  schedule.
 - **`GET /tags` — tag-filter discovery for UIs.** With no `name`, lists the distinct tag
   names currently in use, each with a `job_count`; with `?name=storeid`, lists the
   distinct values recorded for that one name instead, each with its own `job_count`.

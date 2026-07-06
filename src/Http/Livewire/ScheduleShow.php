@@ -7,6 +7,7 @@ namespace JobWarden\Http\Livewire;
 use JobWarden\JobWarden;
 use JobWarden\Models\Schedule;
 use JobWarden\Models\ScheduleRun;
+use Cron\CronExpression;
 use Livewire\Attributes\Layout;
 use Livewire\Component;
 use Throwable;
@@ -16,9 +17,57 @@ final class ScheduleShow extends Component
 {
     public string $scheduleId;
 
+    // Edit modal state. Scope mirrors PATCH /schedules/{id}: cron, idempotency,
+    // retry budget, and the missed/overlap policies — name, target, and timezone
+    // are fixed at creation (a different target is a different schedule).
+    public bool $showEdit = false;
+
+    public string $cron = '';
+
+    public bool $idempotent = false;
+
+    public string $max_attempts = '';
+
+    public string $missed_policy = 'run_latest';
+
+    public string $overlap_policy = 'skip';
+
     public function mount(string $schedule): void
     {
         $this->scheduleId = $schedule;
+    }
+
+    public function openEdit(): void
+    {
+        $s = $this->schedule();
+        $this->cron = (string) $s->cron_expression;
+        $this->idempotent = (bool) $s->idempotent;
+        $this->max_attempts = $s->max_attempts === null ? '' : (string) $s->max_attempts;
+        $this->missed_policy = (string) $s->missed_policy;
+        $this->overlap_policy = (string) $s->overlap_policy;
+        $this->resetErrorBag();
+        $this->showEdit = true;
+    }
+
+    public function saveEdit(): void
+    {
+        $this->validate([
+            'cron' => ['required', 'string', fn ($a, $v, $fail) => CronExpression::isValidExpression($v) ?: $fail('Invalid cron expression.')],
+            'max_attempts' => 'nullable|integer|min:1',
+            'missed_policy' => 'required|in:run_latest,run_all,skip,coalesce',
+            'overlap_policy' => 'required|in:skip,allow,queue',
+        ]);
+
+        $this->schedule()->fill([
+            'cron_expression' => $this->cron,
+            'idempotent' => $this->idempotent,
+            'max_attempts' => $this->max_attempts === '' ? null : (int) $this->max_attempts,
+            'missed_policy' => $this->missed_policy,
+            'overlap_policy' => $this->overlap_policy,
+        ])->save();
+
+        $this->showEdit = false;
+        $this->dispatch('jw-toast', message: 'schedule updated');
     }
 
     public function toggle(): void

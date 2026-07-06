@@ -18,6 +18,7 @@
             </div>
             <div class="detail-actions">
                 <button type="button" class="btn btn-accent" wire:click="runNow">Run now</button>
+                <button type="button" class="btn" wire:click="openEdit">Edit</button>
                 <button type="button" class="btn" wire:click="toggle">{{ $schedule->enabled ? 'Disable' : 'Enable' }}</button>
                 <button type="button" class="btn btn-red" wire:click="deleteSchedule" wire:confirm="Delete schedule {{ $schedule->name }}? Its run history goes with it.">Delete</button>
             </div>
@@ -65,4 +66,60 @@
             @endforelse
         </div>
     </div>
+
+    {{-- edit modal --}}
+    @if ($showEdit)
+        <div class="modal-ov" wire:click.self="$set('showEdit', false)" wire:keydown.escape.window="$set('showEdit', false)">
+            <div class="modal">
+                <div class="modal-head">
+                    <b>Edit schedule</b>
+                    <span class="pill">PATCH /schedules/{id}</span>
+                    <button type="button" class="x" wire:click="$set('showEdit', false)">✕</button>
+                </div>
+                <div class="modal-body">
+                    <div>
+                        <div class="f-label">Cron (5-field)</div>
+                        <input class="f-input mono" type="text" wire:model="cron" placeholder="0 3 * * *">
+                        @error('cron')<div class="f-err">{{ $message }}</div>@enderror
+                    </div>
+                    <div class="f-3col">
+                        <div>
+                            <div class="f-label">Idempotent</div>
+                            <select class="f-select mono" wire:model="idempotent">
+                                <option value="0">false</option>
+                                <option value="1">true</option>
+                            </select>
+                        </div>
+                        <div>
+                            <div class="f-label">Missed</div>
+                            <select class="f-select mono" wire:model="missed_policy">
+                                <option value="run_latest">run_latest</option>
+                                <option value="run_all">run_all</option>
+                                <option value="skip">skip</option>
+                                <option value="coalesce">coalesce</option>
+                            </select>
+                        </div>
+                        <div>
+                            <div class="f-label">Overlap</div>
+                            <select class="f-select mono" wire:model="overlap_policy">
+                                <option value="skip">skip</option>
+                                <option value="allow">allow</option>
+                                <option value="queue">queue</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div>
+                        <div class="f-label">Max attempts</div>
+                        <input class="f-input mono" type="text" wire:model="max_attempts" placeholder="derived from idempotent">
+                        @error('max_attempts')<div class="f-err">{{ $message }}</div>@enderror
+                    </div>
+                    <div class="footnote" style="margin:0">Name, target, and timezone are fixed at creation — a different target is a different schedule.</div>
+                </div>
+                <div class="modal-foot">
+                    <button type="button" class="btn" wire:click="$set('showEdit', false)">Cancel</button>
+                    <button type="button" class="btn btn-accent" wire:click="saveEdit">Save changes</button>
+                </div>
+            </div>
+        </div>
+    @endif
 </div>

@@ -62,6 +62,10 @@ a{color:inherit;text-decoration:none}
 .jw-content{flex:1;overflow:auto;position:relative;display:flex;flex-direction:column}
 .jw-content>*{flex:1;display:flex;flex-direction:column;min-height:0}
 .view{animation:jw-in .18s ease;display:flex;flex-direction:column;min-height:100%}
+/* Document-flow pages (job detail): the whole page scrolls in .jw-content —
+   a tall header (verbose last_error) must push the tabs down, never eat them. */
+.view.doc{display:block}
+.view.doc .tab-body{overflow:visible}
 .view-pad{padding:18px 20px 40px;display:flex;flex-direction:column;gap:16px;flex:1}
 
 /* ---------- sidebar ---------- */
@@ -258,7 +262,7 @@ a{color:inherit;text-decoration:none}
 .errpanel .cls{font-family:var(--mono);font-size:11px;color:var(--h-red-fg);opacity:.85;word-break:break-all}
 .errpanel .msg{font-size:13px;font-weight:500;margin-bottom:6px}
 .errpanel .loc{font-family:var(--mono);font-size:11px;color:var(--fg-2);word-break:break-all}
-.errpanel .trace{margin-top:8px;padding-top:8px;border-top:1px solid var(--h-red-dot);font-family:var(--mono);font-size:10.5px;color:var(--fg-2);white-space:pre;overflow-x:auto;line-height:1.7}
+.errpanel .trace{margin-top:8px;padding-top:8px;border-top:1px solid var(--h-red-dot);font-family:var(--mono);font-size:10.5px;color:var(--fg-2);white-space:pre;overflow:auto;max-height:300px;line-height:1.7}
 
 /* ---------- logs terminal ---------- */
 .logbar{display:flex;align-items:center;gap:10px;margin-bottom:10px}

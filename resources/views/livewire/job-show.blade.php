@@ -15,7 +15,7 @@
         'stop' => ['label' => 'Stop', 'class' => 'btn-red', 'confirm' => 'Stop this job?'],
     ];
 @endphp
-<div class="view" wire:poll.{{ config('jobwarden.dashboard.poll', '10s') }}>
+<div class="view doc" wire:poll.{{ config('jobwarden.dashboard.poll', '10s') }}>
     <div class="detail-head">
         <a class="backlink" href="{{ route('jobwarden.jobs') }}" wire:navigate>← Jobs</a>
         <div class="detail-title-row">

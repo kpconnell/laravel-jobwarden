@@ -85,8 +85,10 @@
                 </label>
                 @include('jobwarden::partials.state-badge', ['state' => $job->state])
                 <div class="cell-main">
-                    <div class="t">{{ $job->name ?? class_basename($job->job_class) }}</div>
-                    <div class="s">{{ $job->job_class }}</div>
+                    <div class="t">{{ $job->job_class }}</div>
+                    @if ($job->name)
+                        <div class="t">{{ $job->name }}</div>
+                    @endif
                 </div>
                 <span>@include('jobwarden::partials.lane-badge', ['lane' => $job->lane])</span>
                 <span class="cell-mono">

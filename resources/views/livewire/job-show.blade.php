@@ -17,7 +17,7 @@
 @endphp
 <div class="view doc" wire:poll.{{ config('jobwarden.dashboard.poll', '10s') }}>
     <div class="detail-head">
-        <a class="backlink" href="{{ route('jobwarden.jobs') }}" wire:navigate>← Jobs</a>
+        <a class="backlink" href="{{ $backUrl }}" wire:navigate>← Jobs</a>
         <div class="detail-title-row">
             <div class="grow">
                 <div class="detail-title">

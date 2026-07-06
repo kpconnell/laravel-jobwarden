@@ -23,9 +23,16 @@ final class JobShow extends Component
 
     #[Url] public string $tab = 'logs';
 
+    /** Where "← Jobs" goes: the referring Jobs URL, filters/page intact. */
+    public string $backUrl = '';
+
     public function mount(string $job): void
     {
         $this->jobId = $job;
+
+        $jobs = route('jobwarden.jobs');
+        $previous = url()->previous();
+        $this->backUrl = $previous === $jobs || str_starts_with($previous, $jobs.'?') ? $previous : $jobs;
     }
 
     public function cancel(OperatorActions $ops): void

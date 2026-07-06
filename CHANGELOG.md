@@ -7,6 +7,15 @@ All notable changes to `laravel-jobwarden` are documented here. The format follo
 ## [Unreleased]
 
 ### Added
+- **Batch revival: the unreachable-dependents cascade now runs in reverse.** When a
+  failed/canceled/stopped member re-enters the DAG (operator retry/restart), its
+  completed batch **reopens** and the dependents the system canceled as unreachable are
+  revived `canceled → pending` — back to waiting on their dependencies — via a new
+  system-only `canceled → pending` transition. Revival matches the cascade's exact
+  `cancel_reason`, so it only ever undoes the system's own verdict, never an operator's
+  cancel. The leader reconcile backstop handles lost re-entry events the same way:
+  reopenable batches first, then revivable members, each revival re-firing the live
+  cascade for its own dependents.
 - **`GET /tags` — tag-filter discovery for UIs.** With no `name`, lists the distinct tag
   names currently in use, each with a `job_count`; with `?name=storeid`, lists the
   distinct values recorded for that one name instead, each with its own `job_count`.
@@ -82,6 +91,15 @@ All notable changes to `laravel-jobwarden` are documented here. The format follo
   job data lives in the constructor.
 
 ### Fixed
+- **Dashboard: a verbose `last_error` no longer buries the job-detail tabs.** The
+  detail page was pinned to the viewport by the shell's fixed frame, so a tall error
+  panel squashed the tab body to a sliver and left Logs/Attempts/Timeline/Result
+  unreachable. Job detail now scrolls as one document (matching the design prototype),
+  and the stack trace is capped at 300px with its own scrollbar so a deep trace never
+  pushes the tabs below the fold in the first place.
+- **Dashboard: "← Jobs" on job detail preserves the list's filters.** The back link
+  pointed at the bare Jobs route, dropping state/lane/tag/search/page query params that
+  the browser back button kept; it now returns to the referring Jobs URL intact.
 - **Global reaper now reaps stale `scheduler`/`global_reaper`/`local_reaper` rows and
   idle dead supervisors, not just supervisors with stranded work.** `deadWorkers()`
   required `role = supervisor` **and** an in-flight attempt before it would even look
@@ -153,6 +171,9 @@ All notable changes to `laravel-jobwarden` are documented here. The format follo
   is empty at the end of chaos tests.
 
 ### Changed
+- **Dashboard Jobs list: the Job column leads with the class.** The FQCN now sits on
+  top with the run name beneath it, both in the primary cell style (the class was
+  previously the muted subline) — operators scan by class first.
 - **The Livewire dashboard is a full operator console now — complete redesign.** A
   sidebar-shell UI (IBM Plex via Google Fonts, light/dark themes and compact/comfortable
   density persisted client-side, `wire:navigate` throughout) with live nav count badges,

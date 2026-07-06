@@ -127,15 +127,16 @@ final class BatchCoordinator
         // each revival re-fires the live cascade for its own dependents.
         foreach ($this->reopenableBatchIds($limit) as $id) {
             $batch = Batch::find($id);
-            if ($batch === null) {
+            // reopenBatch refuses (quietly) while a still-tripped failure
+            // policy keeps the batch failed despite the re-entered member.
+            if ($batch === null || ! $this->reopenBatch($batch)) {
                 continue;
             }
 
-            Log::warning('batch reconcile: reopening a completed batch whose member re-entered the DAG', [
+            Log::warning('batch reconcile: reopened a completed batch whose member re-entered the DAG', [
                 'role' => 'batch_reconcile',
                 'batch_id' => (string) $batch->id,
             ]);
-            $this->reopenBatch($batch);
         }
 
         foreach ($this->revivableMemberIds($limit) as $id) {
@@ -320,14 +321,37 @@ final class BatchCoordinator
             // state move commit together (mirrors OperatorActions::requeue).
             $this->connection()->transaction(function () use ($job): void {
                 $conn = $this->connection();
-                $conn->table($this->tbl('jobs'))->where('id', $job->id)->update([
-                    'cancel_requested' => false,
-                    'cancel_mode' => null,
-                    'cancel_reason' => null,
-                    'cancel_requested_at' => null,
-                    'finished_at' => null,
-                    'updated_at' => $conn->raw(SqlTime::nowExpr($conn)),
-                ]);
+
+                // The decision inputs may be stale by now (an operator can have
+                // canceled the batch, or re-canceled the member with their own
+                // verdict, since the caller selected it) — re-verify them here.
+                // The batch row is locked so a concurrent batch-cancel
+                // serializes against this revival instead of interleaving; a
+                // canceler always takes the batch row before the member rows,
+                // and so does this (via the counter update in the transition).
+                $batchState = $conn->table($this->tbl('batches'))
+                    ->where('id', $job->batch_id)
+                    ->lockForUpdate()
+                    ->value('state');
+                if ($batchState !== BatchState::Running->value) {
+                    return;
+                }
+
+                $affected = $conn->table($this->tbl('jobs'))
+                    ->where('id', $job->id)
+                    ->where('state', JobState::Canceled->value)
+                    ->where('cancel_reason', self::UNREACHABLE_REASON)
+                    ->update([
+                        'cancel_requested' => false,
+                        'cancel_mode' => null,
+                        'cancel_reason' => null,
+                        'cancel_requested_at' => null,
+                        'finished_at' => null,
+                        'updated_at' => $conn->raw(SqlTime::nowExpr($conn)),
+                    ]);
+                if ($affected === 0) {
+                    return; // no longer the system's own cascade-cancel
+                }
                 $job->refresh();
 
                 $this->stateMachine->applyJobTransition(
@@ -358,15 +382,16 @@ final class BatchCoordinator
      * keeps the batch failed: reopening would only see the next sweep re-fail
      * it and cancel the retried member again.
      */
-    private function reopenBatch(Batch $batch): void
+    private function reopenBatch(Batch $batch): bool
     {
         $batch->refresh();
         $from = $batch->state;
         if (! in_array($from, [BatchState::Partial, BatchState::Failed], true) || $this->shouldEagerFail($batch)) {
-            return;
+            return false;
         }
 
         $conn = $this->connection();
+        $now = $conn->raw(SqlTime::nowExpr($conn));
         $affected = $conn->table($this->tbl('batches'))
             ->where('id', $batch->id)
             ->where('state', $from->value)
@@ -374,23 +399,50 @@ final class BatchCoordinator
                 'state' => BatchState::Running->value,
                 'summary' => null,
                 'finished_at' => null,
-                'updated_at' => $conn->raw(SqlTime::nowExpr($conn)),
+                'updated_at' => $now,
             ]);
 
-        if ($affected === 1) {
-            $batch->state = BatchState::Running;
-            $batch->summary = null;
-            $batch->finished_at = null;
-            event(new BatchStateChanged($batch, $from, BatchState::Running, 'member re-entered the DAG'));
-        } else {
+        if ($affected !== 1) {
             $batch->refresh(); // lost the race — let the caller see the truth
+
+            return false;
         }
+
+        // Withdraw the eager-fail sweep's cancellation from members it only
+        // FLAGGED (they were running, so cancelMember left the desired-state
+        // flag for their supervisor): the verdict that armed those flags no
+        // longer stands, and honoring one now would kill a healthy member of
+        // the reopened batch. Matched by the sweep's own reason so an
+        // operator's cancel flag is never withdrawn.
+        $terminal = [JobState::Succeeded->value, JobState::Failed->value, JobState::Canceled->value, JobState::Stopped->value];
+        $conn->table($this->tbl('jobs'))
+            ->where('batch_id', $batch->id)
+            ->whereNotIn('state', $terminal)
+            ->where('cancel_requested', true)
+            ->where('cancel_reason', "batch member failed under {$batch->failure_policy}")
+            ->update([
+                'cancel_requested' => false,
+                'cancel_mode' => null,
+                'cancel_reason' => null,
+                'cancel_requested_at' => null,
+                'updated_at' => $now,
+            ]);
+
+        $batch->state = BatchState::Running;
+        $batch->summary = null;
+        $batch->finished_at = null;
+        event(new BatchStateChanged($batch, $from, BatchState::Running, 'member re-entered the DAG'));
+
+        return true;
     }
 
     /**
      * Terminal batches a lost re-entry event left inconsistent: partial/failed
-     * with members back in flight (pending_count counts pending/queued/retrying,
-     * so a completed batch can only regain it through a retry/restart/revival).
+     * with members back in flight. Both counters were 0 at completion, the
+     * pending bucket (pending/queued/retrying) is only regained through a
+     * retry/restart/revival, and the running bucket only regrows out of queued
+     * — so any in-flight member of a completed batch implies a re-entry, even
+     * one already claimed to running before this sweep got to it.
      *
      * @return string[]
      */
@@ -398,7 +450,7 @@ final class BatchCoordinator
     {
         return $this->connection()->table($this->tbl('batches'))
             ->whereIn('state', [BatchState::Partial->value, BatchState::Failed->value])
-            ->where('pending_count', '>', 0)
+            ->whereRaw('pending_count + running_count > 0')
             ->orderBy('id')
             ->limit($limit)
             ->pluck('id')

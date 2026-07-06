@@ -155,6 +155,58 @@ final class BatchReconcileTest extends TestCase
         $this->assertFalse((bool) $b->cancel_requested);
     }
 
+    public function test_reconcile_reopens_even_when_the_retried_member_was_already_claimed(): void
+    {
+        // The usual race: by the time the reaper ticks, the retried member has
+        // already been claimed queued → running, leaving the pending bucket
+        // empty. The reopen sweep must still recognize the re-entry.
+        $batch = $this->jobwarden()->batch('chain')
+            ->add('a', 'JobA')
+            ->add('b', 'JobB', dependsOn: ['a'])->dispatch();
+
+        $this->complete($this->member($batch, 'JobA'), JobState::Failed);
+        $this->assertSame(BatchState::Partial, $batch->refresh()->state);
+
+        $this->loseBatchEvents();
+        $sm = $this->app->make(StateMachine::class);
+        $this->app->make(\JobWarden\Operations\OperatorActions::class)
+            ->retry($this->member($batch, 'JobA'), 'operator retry', 'op-1');
+        $sm->applyJobTransition($this->member($batch, 'JobA'), JobState::Running, TransitionContext::for(ActorType::Worker));
+
+        $this->coordinator()->reconcile();
+
+        $this->assertSame(BatchState::Running, $batch->refresh()->state, 'reopened despite an empty pending bucket');
+        $this->assertSame(JobState::Pending, $this->member($batch, 'JobB')->state, 'dependent revived');
+    }
+
+    public function test_reconcile_keeps_a_batch_failed_while_its_failure_policy_still_trips(): void
+    {
+        // Two recorded failures under fail_fast; the operator retries only one.
+        // failed_count stays > 0, so reopening would just see the eager-fail
+        // sweep re-fail the batch and cancel the retried member — the reopen
+        // sweep must refuse instead.
+        $batch = $this->jobwarden()->batch('ff', 'fail_fast')
+            ->add('a', 'JobA')->add('b', 'JobB')->add('c', 'JobC')->dispatch();
+
+        $this->loseBatchEvents();
+        $this->complete($this->member($batch, 'JobA'), JobState::Failed);
+        $this->complete($this->member($batch, 'JobB'), JobState::Failed);
+
+        $this->coordinator()->reconcile();
+        $this->assertSame(BatchState::Failed, $batch->refresh()->state);
+        $this->assertSame(JobState::Canceled, $this->member($batch, 'JobC')->state);
+
+        $this->app->make(\JobWarden\Operations\OperatorActions::class)
+            ->retry($this->member($batch, 'JobA'), 'operator retry', 'op-1');
+
+        $this->coordinator()->reconcile();
+
+        $batch->refresh();
+        $this->assertSame(BatchState::Failed, $batch->state, 'b is still failed — the policy still trips');
+        $this->assertSame(JobState::Queued, $this->member($batch, 'JobA')->state, 'the retried member is left alone');
+        $this->assertSame(JobState::Canceled, $this->member($batch, 'JobC')->state);
+    }
+
     public function test_reconcile_leaves_a_healthy_running_batch_alone(): void
     {
         $batch = $this->jobwarden()->batch('healthy')

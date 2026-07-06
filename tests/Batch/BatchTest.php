@@ -255,6 +255,33 @@ final class BatchTest extends TestCase
         $this->assertSame(BatchState::Partial, $batch->refresh()->state);
     }
 
+    public function test_reopening_withdraws_the_eager_fail_flag_from_a_still_running_member(): void
+    {
+        // When fail_fast trips, a running member is only FLAGGED (its
+        // supervisor honors the flag later). If the retry lands first, the
+        // reopened batch must disarm that flag or the supervisor would kill a
+        // healthy member of a batch that is running again.
+        $batch = $this->jobwarden()->batch('ff', 'fail_fast')
+            ->add('a', 'JobA')->add('b', 'JobB')->dispatch();
+
+        $sm = $this->app->make(StateMachine::class);
+        $sm->applyJobTransition($this->member($batch, 'JobB'), JobState::Running, TransitionContext::for(ActorType::Worker));
+
+        $this->complete($this->member($batch, 'JobA'), JobState::Failed);
+        $batch->refresh();
+        $this->assertSame(BatchState::Failed, $batch->state);
+        $b = $this->member($batch, 'JobB');
+        $this->assertSame(JobState::Running, $b->state, 'running member is flagged, not transitioned');
+        $this->assertTrue((bool) $b->cancel_requested);
+
+        $this->app->make(OperatorActions::class)->retry($this->member($batch, 'JobA'), 'retry a', 'op-1');
+
+        $this->assertSame(BatchState::Running, $batch->refresh()->state);
+        $b = $this->member($batch, 'JobB');
+        $this->assertFalse((bool) $b->cancel_requested, 'stale eager-fail flag withdrawn');
+        $this->assertNull($b->cancel_reason);
+    }
+
     public function test_cancel_batch_propagates_to_all_non_terminal_members(): void
     {
         $batch = $this->jobwarden()->batch('fanout')

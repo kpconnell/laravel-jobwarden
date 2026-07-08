@@ -59,10 +59,26 @@ final class JobLogTail extends Component
                 'ts_ms' => $l->ts_ms,
                 'level' => $l->level,
                 'step' => $l->step,
+                'context' => self::contextLine($l->context),
                 'body' => $sink->resolve((string) $l->body_ref),
             ]),
             'truncated' => $truncated,
             'window' => self::WINDOW,
         ]);
+    }
+
+    /** logfmt-style `key=value` pairs; values JSON-encoded so strings, bools and arrays stay unambiguous. */
+    private static function contextLine(?array $context): ?string
+    {
+        if (! $context) {
+            return null;
+        }
+
+        $pairs = [];
+        foreach ($context as $key => $value) {
+            $pairs[] = $key.'='.json_encode($value, JSON_PARTIAL_OUTPUT_ON_ERROR | JSON_UNESCAPED_SLASHES | JSON_INVALID_UTF8_SUBSTITUTE);
+        }
+
+        return implode(' ', $pairs);
     }
 }

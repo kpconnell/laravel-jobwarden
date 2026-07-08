@@ -17,7 +17,8 @@
                     <span class="seq">{{ $l->seq }}</span>
                     <span class="t">@include('jobwarden::partials.time', ['ms' => $l->ts_ms, 'mode' => 'time'])</span>
                     <span class="lvl lvl-{{ $l->level }}">{{ $l->level }}</span>
-                    <span class="msg">{{ $l->body }}</span>
+                    {{-- .msg is pre-wrap: keep this on one source line or stray whitespace renders --}}
+                    <span class="msg">@if ($l->step)<span class="stp">[{{ $l->step }}]</span> @endif{{ $l->body }}@if ($l->context !== null) <span class="ctx">{{ $l->context }}</span>@endif</span>
                 </div>
             @endforeach
         </div>

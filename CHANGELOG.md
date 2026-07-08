@@ -21,6 +21,11 @@ All notable changes to `laravel-jobwarden` are documented here. The format follo
   idempotency, retry budget (`max_attempts`), and the missed/overlap policies. Name,
   target, and timezone stay fixed at creation: a different target is a different
   schedule.
+- **Dashboard: the log tail shows `step` and the log context.** Context was always
+  captured and stored (`job_logs.context`) but never rendered; each line now shows it as
+  dimmed logfmt-style `key=value` pairs after the message (values JSON-encoded, so
+  strings, bools, and nested arrays stay unambiguous), and the `step` column — also
+  stored but never displayed — renders as a `[step]` prefix.
 - **`GET /tags` — tag-filter discovery for UIs.** With no `name`, lists the distinct tag
   names currently in use, each with a `job_count`; with `?name=storeid`, lists the
   distinct values recorded for that one name instead, each with its own `job_count`.

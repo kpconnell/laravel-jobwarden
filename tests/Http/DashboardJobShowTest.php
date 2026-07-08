@@ -127,11 +127,12 @@ final class DashboardJobShowTest extends TestCase
 
     // ---- log tail -----------------------------------------------------------
 
-    private function makeLog(Job $job, JobAttempt $attempt, int $seq, string $body): JobLog
+    private function makeLog(Job $job, JobAttempt $attempt, int $seq, string $body, ?array $context = null, ?string $step = null): JobLog
     {
         return JobLog::create([
             'job_id' => $job->id, 'attempt_id' => $attempt->id, 'seq' => $seq,
             'ts' => now(), 'level' => 'info', 'body_sink' => 'database', 'body_ref' => $body,
+            'context' => $context, 'step' => $step,
         ]);
     }
 
@@ -144,6 +145,18 @@ final class DashboardJobShowTest extends TestCase
         Livewire::test(JobLogTail::class, ['jobId' => $job->id])
             ->assertSee('first line')
             ->assertSet('cursor', (int) $log->id);
+    }
+
+    public function test_log_tail_renders_step_and_context(): void
+    {
+        $job = Job::create(['job_class' => 'X', 'state' => JobState::Running]);
+        $attempt = JobAttempt::create(['job_id' => $job->id, 'attempt_number' => 1, 'state' => AttemptState::Running, 'fencing_token' => 1]);
+        $this->makeLog($job, $attempt, 1, 'Finished inserting records',
+            ['table' => 'products', 'totalRecordsInserted' => 500, 'partial' => false], 'import');
+
+        Livewire::test(JobLogTail::class, ['jobId' => $job->id])
+            ->assertSee('[import]')
+            ->assertSee('table="products" totalRecordsInserted=500 partial=false');
     }
 
     public function test_log_tail_poll_picks_up_new_lines(): void

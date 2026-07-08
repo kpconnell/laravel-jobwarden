@@ -273,6 +273,8 @@ a{color:inherit;text-decoration:none}
 .logline .seq{color:#4a4d55}
 .logline .t{color:#7d818b}
 .logline .msg{color:#c9ccd4;white-space:pre-wrap;word-break:break-word}
+.logline .stp{color:#a08fe0}
+.logline .ctx{color:#7d818b}
 .logline time{color:#7d818b}
 .lvl{font-weight:500}
 .lvl-debug{color:#5c6068}.lvl-info{color:#7ea6f2}.lvl-notice{color:#4fc4b6}

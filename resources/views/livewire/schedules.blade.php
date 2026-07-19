@@ -59,7 +59,11 @@
                         </div>
                         <div>
                             <div class="f-label">Timezone</div>
-                            <input class="f-input mono" type="text" wire:model="timezone" placeholder="UTC">
+                            <select class="f-select mono" wire:model="timezone">
+                                @foreach (timezone_identifiers_list() as $tz)
+                                    <option value="{{ $tz }}">{{ $tz }}</option>
+                                @endforeach
+                            </select>
                             @error('timezone')<div class="f-err">{{ $message }}</div>@enderror
                         </div>
                     </div>

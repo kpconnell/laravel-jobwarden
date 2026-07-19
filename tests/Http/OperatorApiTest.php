@@ -211,6 +211,30 @@ final class OperatorApiTest extends TestCase
         $this->assertFalse((bool) Schedule::find($schedule->id)->enabled);
     }
 
+    public function test_patch_edits_name_command_and_timezone(): void
+    {
+        $schedule = $this->app->make(JobWarden::class)->scheduleCommand('s', '0 3 * * *', 'cache:prune', ['--force' => true]);
+
+        $this->patchJson("jobwarden/api/schedules/{$schedule->id}", [
+            'name' => 'nightly-prune', 'command' => 'cache:prune-stale', 'timezone' => 'America/New_York',
+        ])->assertOk()
+            ->assertJsonPath('name', 'nightly-prune')
+            ->assertJsonPath('timezone', 'America/New_York')
+            ->assertJsonPath('params.command', 'cache:prune-stale')
+            ->assertJsonPath('params.arguments.--force', true);
+    }
+
+    public function test_patch_rejects_a_command_on_a_job_schedule_and_a_bad_timezone(): void
+    {
+        $schedule = $this->app->make(JobWarden::class)->schedule('reconcile', '0 3 * * *', 'App\\Jobs\\Reconcile');
+
+        $this->patchJson("jobwarden/api/schedules/{$schedule->id}", ['command' => 'cache:prune'])
+            ->assertStatus(422)->assertJsonValidationErrors('command');
+
+        $this->patchJson("jobwarden/api/schedules/{$schedule->id}", ['timezone' => 'Mars/Olympus'])
+            ->assertStatus(422)->assertJsonValidationErrors('timezone');
+    }
+
     public function test_run_a_schedule_now(): void
     {
         $schedule = $this->app->make(JobWarden::class)->scheduleCommand('s', '0 3 * * *', 'cache:prune');

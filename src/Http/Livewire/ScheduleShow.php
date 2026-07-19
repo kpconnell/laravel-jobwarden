@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace JobWarden\Http\Livewire;
 
 use JobWarden\JobWarden;
+use JobWarden\Jobs\RunArtisanCommand;
 use JobWarden\Models\Schedule;
 use JobWarden\Models\ScheduleRun;
 use Cron\CronExpression;
@@ -17,12 +18,19 @@ final class ScheduleShow extends Component
 {
     public string $scheduleId;
 
-    // Edit modal state. Scope mirrors PATCH /schedules/{id}: cron, idempotency,
-    // retry budget, and the missed/overlap policies — name, target, and timezone
-    // are fixed at creation (a different target is a different schedule).
+    // Edit modal state. Scope mirrors PATCH /schedules/{id}: name, target, cron,
+    // timezone, idempotency, retry budget, and the missed/overlap policies. The
+    // type is fixed: a command schedule edits its command, a job schedule its class.
     public bool $showEdit = false;
 
+    public string $name = '';
+
     public string $cron = '';
+
+    public string $timezone = 'UTC';
+
+    /** The artisan command for command schedules, the job class otherwise. */
+    public string $target = '';
 
     public bool $idempotent = false;
 
@@ -40,7 +48,12 @@ final class ScheduleShow extends Component
     public function openEdit(): void
     {
         $s = $this->schedule();
+        $this->name = (string) $s->name;
         $this->cron = (string) $s->cron_expression;
+        $this->timezone = (string) $s->timezone;
+        $this->target = $s->job_class === RunArtisanCommand::class
+            ? (string) data_get($s->params, 'command')
+            : (string) $s->job_class;
         $this->idempotent = (bool) $s->idempotent;
         $this->max_attempts = $s->max_attempts === null ? '' : (string) $s->max_attempts;
         $this->missed_policy = (string) $s->missed_policy;
@@ -52,19 +65,39 @@ final class ScheduleShow extends Component
     public function saveEdit(): void
     {
         $this->validate([
+            'name' => 'required|string',
             'cron' => ['required', 'string', fn ($a, $v, $fail) => CronExpression::isValidExpression($v) ?: $fail('Invalid cron expression.')],
+            'timezone' => 'required|timezone',
+            'target' => 'required|string',
             'max_attempts' => 'nullable|integer|min:1',
             'missed_policy' => 'required|in:run_latest,run_all,skip,coalesce',
             'overlap_policy' => 'required|in:skip,allow,queue',
         ]);
 
-        $this->schedule()->fill([
+        $s = $this->schedule()->fill([
+            'name' => $this->name,
             'cron_expression' => $this->cron,
+            'timezone' => $this->timezone,
             'idempotent' => $this->idempotent,
             'max_attempts' => $this->max_attempts === '' ? null : (int) $this->max_attempts,
             'missed_policy' => $this->missed_policy,
             'overlap_policy' => $this->overlap_policy,
-        ])->save();
+        ]);
+
+        if ($s->job_class === RunArtisanCommand::class) {
+            $s->params = array_merge((array) $s->params, ['command' => $this->target]);
+        } else {
+            $s->job_class = $this->target;
+        }
+
+        try {
+            $s->save();
+        } catch (Throwable $e) {
+            // schedules.name is UNIQUE — surface a rename collision on the field.
+            $this->addError('name', $e->getMessage());
+
+            return;
+        }
 
         $this->showEdit = false;
         $this->dispatch('jw-toast', message: 'schedule updated');

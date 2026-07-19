@@ -7,6 +7,19 @@ All notable changes to `laravel-jobwarden` are documented here. The format follo
 ## [Unreleased]
 
 ### Added
+- **A supervisor-observed child death now leaves real error artifacts.** Previously
+  `job_attempts.error` / `jobs.last_error` were written only by the child itself (on a
+  caught exception), so a SIGKILLed/OOMed child left a failed job with no error anywhere
+  — the death existed only as an events-table reason and a `term_signal` column. The
+  supervisor's finalize path now synthesizes a structured error (`class`
+  `JobWarden\Exceptions\ProcessDied`, message like *"child killed by signal 9 (SIGKILL)
+  after 364s without reporting — possible OOM or external kill"*, context
+  `{attempt, pid, duration_ms}`) onto the attempt and, per the child path's semantics,
+  `jobs.last_error` — so it's set whenever the death is the job's terminal failure. A
+  child-reported error keeps precedence. The supervisor also writes a warning line into
+  the job's own log (step `reaped`, matching the reaper-injection seam), so a dead job's
+  log stream is never info-only, and the richer death message replaces the old
+  `child died: exit=… signal=…` recovery reason in the events table.
 - **Batch revival: the unreachable-dependents cascade now runs in reverse.** When a
   failed/canceled/stopped member re-enters the DAG (operator retry/restart), its
   completed batch **reopens** and the dependents the system canceled as unreachable are
@@ -17,10 +30,15 @@ All notable changes to `laravel-jobwarden` are documented here. The format follo
   reopenable batches first, then revivable members, each revival re-firing the live
   cascade for its own dependents.
 - **Dashboard: schedules are editable from the detail page.** An Edit modal on
-  `/schedules/{id}` covers exactly what `PATCH /schedules/{id}` allows — cron,
-  idempotency, retry budget (`max_attempts`), and the missed/overlap policies. Name,
-  target, and timezone stay fixed at creation: a different target is a different
-  schedule.
+  `/schedules/{id}` covers exactly what `PATCH /schedules/{id}` allows — name, target,
+  cron, timezone, idempotency, retry budget (`max_attempts`), and the missed/overlap
+  policies. The schedule's *type* is fixed: a command schedule edits its artisan
+  command (arguments untouched), a job schedule its job class. `PATCH /schedules/{id}`
+  accepts `name`, `timezone`, `job_class`, and `command` to match (`command` is rejected
+  on non-artisan schedules). Timezone inputs in both the create and edit modals are a
+  picker over PHP's timezone identifiers instead of a free-text field, and
+  `POST /schedules` now validates `timezone` as a real identifier rather than any
+  string.
 - **Dashboard: the log tail shows `step` and the log context.** Context was always
   captured and stored (`job_logs.context`) but never rendered; each line now shows it as
   dimmed logfmt-style `key=value` pairs after the message (values JSON-encoded, so

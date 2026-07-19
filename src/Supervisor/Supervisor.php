@@ -6,7 +6,9 @@ namespace JobWarden\Supervisor;
 
 use JobWarden\Claim\ClaimDriverFactory;
 use JobWarden\Claim\WorkerContext;
+use JobWarden\Exceptions\ProcessDied;
 use JobWarden\Logging\JobLogger;
+use JobWarden\Models\Job;
 use JobWarden\Models\JobAttempt;
 use JobWarden\Models\Worker;
 use JobWarden\Process\Contracts\HostIdentity;
@@ -37,6 +39,13 @@ final class Supervisor
     private const SIGTERM = 15;
 
     private const SIGKILL = 9;
+
+    /** Names for the signals a child plausibly dies by, for readable death messages. */
+    private const SIGNAL_NAMES = [
+        1 => 'SIGHUP', 2 => 'SIGINT', 3 => 'SIGQUIT', 4 => 'SIGILL', 6 => 'SIGABRT',
+        7 => 'SIGBUS', 8 => 'SIGFPE', 9 => 'SIGKILL', 11 => 'SIGSEGV', 13 => 'SIGPIPE',
+        14 => 'SIGALRM', 15 => 'SIGTERM', 24 => 'SIGXCPU', 25 => 'SIGXFSZ',
+    ];
 
     /** Consecutive DETERMINISTIC (non-transient) tick failures tolerated before dying loudly. */
     private const TICK_FAILURE_LIMIT = 5;
@@ -547,7 +556,8 @@ final class Supervisor
 
     /**
      * Tier 1 (spec §5.4): record exit metadata; if the child already reported a
-     * determinate outcome, do nothing more — otherwise force a terminal state.
+     * determinate outcome, do nothing more — otherwise force a terminal state
+     * and synthesize the error artifacts the dead child could not write.
      */
     private function finalize(ChildHandle $handle): void
     {
@@ -581,17 +591,70 @@ final class Supervisor
             }
 
             $this->stateMachine->applyAttemptTransition($attempt, AttemptState::Failed, (clone $context)->because('child died without reporting'));
+            $death = $this->deathMessage($handle);
+            $this->recordDeath($attempt, $job, $handle, $death);
             if ($job !== null) {
-                $this->recovery->afterAttemptFailure(
-                    $job,
-                    ActorType::Supervisor,
-                    sprintf('child died: exit=%s signal=%s', $handle->exitCode ?? 'n/a', $handle->termSignal ?? 'n/a')
-                );
+                $this->recovery->afterAttemptFailure($job, ActorType::Supervisor, $death);
             }
         } catch (\JobWarden\StateMachine\Exceptions\StaleFencingTokenException|\JobWarden\StateMachine\Exceptions\IllegalTransitionException) {
             // A reaper/operator already took over this epoch or resolved the job —
             // leave that decision intact (and never let it crash the run loop).
         }
+    }
+
+    /**
+     * The child never reported, so nothing wrote `job_attempts.error` /
+     * `jobs.last_error` (only the child writes those, on a caught exception) and
+     * the job's own log has no line for the death. Synthesize the same artifacts
+     * a child-reported failure leaves — a structured error and a warning log
+     * line — so a SIGKILLed/OOMed job is diagnosable from its row and its log,
+     * not a forensic dig through events. A child-reported error keeps precedence
+     * (it names the actual throw site); the log line is written regardless.
+     */
+    private function recordDeath(JobAttempt $attempt, ?Job $job, ChildHandle $handle, string $death): void
+    {
+        if ($attempt->error === null) {
+            $error = [
+                'class' => ProcessDied::class,
+                'message' => $death,
+                'context' => [
+                    'attempt' => (string) $attempt->id,
+                    'pid' => $handle->pid,
+                    'duration_ms' => $handle->durationMs(),
+                ],
+            ];
+            $attempt->forceFill(['error' => $error])->save();
+            $job?->forceFill(['last_error' => $error])->saveQuietly();
+        }
+
+        try {
+            $this->jobLogger->write($handle->jobId, $handle->attemptId, 'warning',
+                'supervisor: '.$death.'; attempt failed',
+                ['source' => 'supervisor', 'pid' => $handle->pid], 'reaped');
+        } catch (\Throwable) {
+            // best-effort — a log failure must never break finalize
+        }
+    }
+
+    private function deathMessage(ChildHandle $handle): string
+    {
+        $secs = (int) round($handle->durationMs() / 1000);
+
+        if ($handle->termSignal !== null) {
+            $name = self::SIGNAL_NAMES[$handle->termSignal] ?? null;
+            $message = sprintf(
+                'child killed by signal %d%s after %ds without reporting',
+                $handle->termSignal,
+                $name === null ? '' : " ({$name})",
+                $secs,
+            );
+
+            return $handle->termSignal === self::SIGKILL
+                ? $message.' — possible OOM or external kill'
+                : $message;
+        }
+
+        return sprintf('child exited with code %s after %ds without reporting', $handle->exitCode ?? 'unknown', $secs);
     }
 
     /**

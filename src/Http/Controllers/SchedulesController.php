@@ -5,9 +5,11 @@ declare(strict_types=1);
 namespace JobWarden\Http\Controllers;
 
 use JobWarden\JobWarden;
+use JobWarden\Jobs\RunArtisanCommand;
 use JobWarden\Models\Schedule;
 use Cron\CronExpression;
 use Illuminate\Http\Request;
+use Illuminate\Validation\ValidationException;
 
 /**
  * Read + manage schedules, including creating job- and artisan-command schedules.
@@ -43,7 +45,7 @@ final class SchedulesController
             'params' => 'array',
             'idempotent' => 'boolean',
             'max_attempts' => 'integer|min:1',
-            'timezone' => 'string',
+            'timezone' => 'timezone',
             'missed_policy' => 'in:run_all,run_latest,skip,coalesce',
             'overlap_policy' => 'in:allow,skip,queue',
         ]);
@@ -63,19 +65,31 @@ final class SchedulesController
         return response()->json($schedule, 201);
     }
 
-    /** Toggle enabled, or tweak cron / policies / idempotency. */
+    /** Toggle enabled, or edit name / target (command or job_class) / cron / timezone / policies / idempotency. */
     public function update(Request $request, string $schedule)
     {
         $model = Schedule::findOrFail($schedule);
 
         $data = $request->validate([
             'enabled' => 'boolean',
+            'name' => 'string',
             'cron_expression' => ['string', $this->cronRule()],
+            'timezone' => 'timezone',
+            'job_class' => 'string',
+            'command' => 'string',
             'idempotent' => 'boolean',
             'max_attempts' => 'nullable|integer|min:1',
             'missed_policy' => 'in:run_all,run_latest,skip,coalesce',
             'overlap_policy' => 'in:allow,skip,queue',
         ]);
+
+        if (array_key_exists('command', $data)) {
+            if (($data['job_class'] ?? $model->job_class) !== RunArtisanCommand::class) {
+                throw ValidationException::withMessages(['command' => 'command applies only to artisan-command schedules.']);
+            }
+            $model->params = array_merge((array) $model->params, ['command' => $data['command']]);
+            unset($data['command']);
+        }
 
         $model->fill($data)->save();
 

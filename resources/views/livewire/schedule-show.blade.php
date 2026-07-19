@@ -78,9 +78,30 @@
                 </div>
                 <div class="modal-body">
                     <div>
-                        <div class="f-label">Cron (5-field)</div>
-                        <input class="f-input mono" type="text" wire:model="cron" placeholder="0 3 * * *">
-                        @error('cron')<div class="f-err">{{ $message }}</div>@enderror
+                        <div class="f-label">Name</div>
+                        <input class="f-input" type="text" wire:model="name" placeholder="nightly-reconcile">
+                        @error('name')<div class="f-err">{{ $message }}</div>@enderror
+                    </div>
+                    <div class="f-2col">
+                        <div>
+                            <div class="f-label">Cron (5-field)</div>
+                            <input class="f-input mono" type="text" wire:model="cron" placeholder="0 3 * * *">
+                            @error('cron')<div class="f-err">{{ $message }}</div>@enderror
+                        </div>
+                        <div>
+                            <div class="f-label">Timezone</div>
+                            <select class="f-select mono" wire:model="timezone">
+                                @foreach (timezone_identifiers_list() as $tz)
+                                    <option value="{{ $tz }}">{{ $tz }}</option>
+                                @endforeach
+                            </select>
+                            @error('timezone')<div class="f-err">{{ $message }}</div>@enderror
+                        </div>
+                    </div>
+                    <div>
+                        <div class="f-label">{{ $schedule->job_class === \JobWarden\Jobs\RunArtisanCommand::class ? 'Artisan command' : 'Job class' }}</div>
+                        <input class="f-input mono" type="text" wire:model="target">
+                        @error('target')<div class="f-err">{{ $message }}</div>@enderror
                     </div>
                     <div class="f-3col">
                         <div>
@@ -113,7 +134,6 @@
                         <input class="f-input mono" type="text" wire:model="max_attempts" placeholder="derived from idempotent">
                         @error('max_attempts')<div class="f-err">{{ $message }}</div>@enderror
                     </div>
-                    <div class="footnote" style="margin:0">Name, target, and timezone are fixed at creation — a different target is a different schedule.</div>
                 </div>
                 <div class="modal-foot">
                     <button type="button" class="btn" wire:click="$set('showEdit', false)">Cancel</button>

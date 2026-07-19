@@ -1,7 +1,7 @@
 {
     "name": "kpconnell/laravel-jobwarden",
     "description": "A database-backed alternative to Horizon & Laravel Queues — durable jobs, sophisticated batches, high observability & scheduling that survive worker and host crashes, with no Redis to operate.",
-    "keywords": ["laravel", "jobs", "queue", "batch", "scheduler", "durable", "state-machine", "workers", "orphan-recovery"],
+    "keywords": ["laravel", "jobs", "queue", "batch", "scheduler", "cron", "dag", "workflow", "durable", "state-machine", "workers", "orphan-recovery", "horizon-alternative", "background-jobs", "dashboard", "process-supervision"],
     "type": "library",
     "license": "MIT",
     "homepage": "https://github.com/kpconnell/laravel-jobwarden",

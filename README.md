@@ -2,19 +2,22 @@
 
 [![Tests](https://github.com/kpconnell/laravel-jobwarden/actions/workflows/tests.yml/badge.svg)](https://github.com/kpconnell/laravel-jobwarden/actions/workflows/tests.yml)
 [![Latest Version](https://img.shields.io/packagist/v/kpconnell/laravel-jobwarden.svg)](https://packagist.org/packages/kpconnell/laravel-jobwarden)
+[![Total Downloads](https://img.shields.io/packagist/dt/kpconnell/laravel-jobwarden.svg)](https://packagist.org/packages/kpconnell/laravel-jobwarden)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 **Durable, process-aware jobs, batches, DAGs, and scheduling for Laravel.**
 
-JobWarden is a database-backed execution engine for Laravel jobs that are too long-running, expensive, operationally important, or unsafe to treat as anonymous queue payloads.
+JobWarden is a complete background-work engine on the database you already run: queue, batch/DAG runner, cron scheduler, operator API, and dashboard in one coordinated system — with no Redis, no Horizon, and no crontab to operate.
 
-It gives Laravel applications **positive control** over running work: every job attempt is tied to a real Linux child process with verifiable process identity, fencing tokens, durable state transitions, and idempotency-gated recovery.
+It gives Laravel applications **positive control** over running work: every job attempt is tied to a real Linux child process with verifiable process identity, fencing tokens, durable state transitions, and idempotency-gated recovery — for jobs that are too long-running, expensive, operationally important, or unsafe to treat as anonymous queue payloads.
 
-Use Horizon for ordinary short jobs. Use JobWarden when correctness, recovery, and operator control matter.
+> **Status: stable.** `1.11.0` is the first stable release. JobWarden runs entire
+> production background tiers today — six-figure job counts, dependency DAGs hundreds
+> of nodes wide, 100+ live schedules, multi-host fleets — on MariaDB/RDS.
 
-> **Status: `beta`**
->
-> The distributed-correctness core and full feature set are implemented and tested against SQLite, MariaDB/MySQL, and PostgreSQL. APIs may shift slightly before `1.0.0`.
+![The JobWarden operator console — a live production fleet](docs/images/dashboard-overview.png)
+
+*The operator console watching a live production fleet — including the failures it caught, parked, and offered back for retry.*
 
 ---
 
@@ -33,13 +36,11 @@ Once a job is handed to a worker, Redis, SQS, Horizon, and traditional queue bac
 - whether a PID has been reused,
 - or whether it is safe to retry the work.
 
-For many jobs, that is fine.
+For many jobs, that is fine. A quick email, notification, or cache refresh can live happily behind a visibility timeout.
 
-For a quick email, notification, cache refresh, webhook fan-out, or idempotent background task, Laravel's queue system is usually the right tool.
+But for jobs that run for minutes or hours, mutate external systems, generate expensive reports, sync marketplaces, bill customers, reconcile inventory, import large datasets, or coordinate business-critical workflows, blind at-least-once delivery is a problem.
 
-But for jobs that run for minutes or hours, mutate external systems, generate expensive reports, sync marketplaces, bill customers, reconcile inventory, import large datasets, or coordinate business-critical workflows, blind at-least-once delivery can be a problem.
-
-JobWarden was built for that class of work.
+JobWarden was built for that class of work — and once it was running, it turned out to handle the quick jobs just as well.
 
 ---
 
@@ -121,9 +122,9 @@ Examples:
 - multi-step operational workflows,
 - and any job where "it might run twice" is not acceptable.
 
-Stick with Laravel Queue / Horizon when your jobs are short, cheap, naturally idempotent, and queue timeouts are good enough.
+That was the class of work JobWarden was designed for. In the field it ended up running everything else too: the prefork execution model makes a dedicated child process cheap enough for ordinary short jobs, and lanes keep mission-critical work ahead of the routine. Production deployments run their entire background tier — thousands of short jobs a day alongside hour-long syncs — on JobWarden alone, with no Redis and no crontab.
 
-JobWarden is designed to **coexist** with Laravel's Bus and Queue systems. It does not hijack `dispatch()`. You can adopt it selectively for the jobs that need stronger guarantees.
+JobWarden also **coexists** cleanly with Laravel's Bus and Queue systems. It does not hijack `dispatch()`, so you can adopt it selectively and migrate at your own pace.
 
 ---
 
@@ -175,11 +176,17 @@ If it is not idempotent, JobWarden parks it for operator review instead of silen
 
 Dispatch JSON-serializable job parameters into durable database state.
 
-Each job records its lifecycle, attempts, failures, retries, cancellation requests, and recovery decisions.
+Each job records its lifecycle, attempts, failures, retries, cancellation requests, recovery decisions, its own log stream, and an optional completion result that commits atomically with the succeeded transition — so a poller can never observe `succeeded` without its result.
+
+Jobs carry **searchable tags** (explicit maps plus config-promoted params on an indexed table), so operators can filter 100k+ jobs by `storeid:WMT` instead of scrolling.
 
 ### Process-aware execution
 
 Every attempt runs in a dedicated Linux child process and records enough OS identity to verify that process later.
+
+### Prefork throughput
+
+Isolation does not cost you boot time. The supervisor `pcntl_fork()`s each child from its own already-booted framework — roughly **5.7× the throughput** of exec-per-job in production measurement — and periodically recycles itself through the drain path to rebaseline. Short jobs stay cheap; every job still gets its own process.
 
 ### Verified orphan detection
 
@@ -239,20 +246,21 @@ JobWarden includes durable workflow primitives:
 - arbitrary dependency graphs,
 - dependency-gated admission,
 - failure policies,
-- and batch-level observability.
+- batch-level observability,
+- and revival: retrying a failed upstream reopens the batch and revives the dependents that were canceled as unreachable.
 
 ### Scheduling
 
-JobWarden includes durable cron and one-off scheduling.
+JobWarden includes durable cron and one-off scheduling with missed-run catch-up and overlap policies.
 
-Schedules can dispatch JobWarden jobs or Artisan commands.
+Schedules can dispatch JobWarden jobs or Artisan commands, and are created, edited, enabled, and run on demand from the dashboard or API.
 
 ### Operator API and dashboard
 
 JobWarden includes:
 
-- a gated JSON API,
-- server-rendered Livewire dashboard,
+- a gated JSON API with a complete [OpenAPI 3.1 spec](docs/openapi.yaml),
+- a server-rendered Livewire operator console: overview KPIs, filterable job lists with bulk retry/restart/cancel/stop, live log tails, batch DAG visualization, schedule and fleet management,
 - read models,
 - operator actions,
 - scheduling endpoints,
@@ -433,6 +441,10 @@ Failure policies:
 - `fail_fast`
 - `threshold(N)`
 
+The dashboard draws every batch as a dependency graph — lanes are the independent sub-chains, columns are dependency depth, failed nodes stay loud while the work canceled downstream of them dims:
+
+![A 239-node production batch rendered as a dependency DAG](docs/images/dashboard-batch-dag.png)
+
 ---
 
 ## Scheduling
@@ -463,7 +475,9 @@ $jw->scheduleOnce(
 );
 ```
 
-Schedules are durable and evaluated by the JobWarden scheduler daemon.
+Schedules are durable and evaluated by the JobWarden scheduler daemon. Missed runs follow a catch-up policy, overlaps follow an overlap policy, and every occurrence is recorded in `schedule_runs` — this replaces both `schedule:run` and the crontab that drives it.
+
+![Production schedules — cron expressions, next-due, policies, per-schedule toggles](docs/images/dashboard-schedules.png)
 
 ---
 
@@ -577,6 +591,14 @@ The same drain mechanism is also used by prefork recycling to periodically rebas
 
 JobWarden includes a gated JSON API and a Livewire dashboard.
 
+The Jobs screen filters by state, lane, and indexed tags, with bulk retry/restart/cancel/stop across a selection:
+
+![The Jobs screen filtering 139k production jobs](docs/images/dashboard-jobs.png)
+
+Job detail shows the bound constructor params, tags, attempts, an event timeline, the completion result, and a live log tail:
+
+![Job detail with params, tags, and a live log tail](docs/images/dashboard-job-detail.png)
+
 The API mounts under:
 
 ```php
@@ -627,41 +649,36 @@ The test matrix covers SQLite, MariaDB/MySQL, and PostgreSQL.
 
 ---
 
-## Comparison with Laravel Queue and Horizon
+## JobWarden vs Laravel Queue + Horizon
 
-JobWarden is not a replacement for every Laravel queue use case.
+JobWarden began as a companion to Horizon, built for the jobs a queue couldn't hold safely. After running entire production background tiers on it, the honest summary is simpler: for most Laravel applications, JobWarden replaces the queue driver, Horizon, `Bus::batch`, and the crontab behind `schedule:run` — on infrastructure you already operate.
 
-Laravel Queue and Horizon are excellent for high-throughput, short-lived, naturally idempotent background jobs.
+| | Laravel Queue + Horizon | JobWarden |
+|---|---|---|
+| Infrastructure | Redis, plus cron for `schedule:run` | the relational database you already run |
+| A job in flight is | an opaque payload behind a timeout | a verified Linux process: host, supervisor PID, child PID, start time, fencing token |
+| Dead-worker recovery | wait out the timeout, redeliver blindly | three-tier verified liveness, then idempotency-gated retry or park |
+| Non-idempotent work | at-least-once — double-run risk | parked for an operator instead of silently re-run |
+| Workflows | `Bus::batch` and chains | fan-out, chains, arbitrary DAGs, failure policies, batch revival |
+| Scheduling | `schedule:run` driven by cron | durable scheduler daemon: catch-up, overlap policies, live editing, run history |
+| Cancel one running job | no targeted process handle | verified SIGTERM → SIGKILL of the exact child |
+| History and audit | ephemeral Redis metrics | SQL-queryable jobs, attempts, events, logs, and results |
+| Crash isolation | one bad job can poison a long-lived worker | one job = one child process |
+| Raw throughput | Redis wins for floods of sub-second jobs | prefork makes isolation cheap, but a database claim is still not a Redis `BRPOP` |
 
-JobWarden is for jobs where execution control matters more than raw queue throughput.
+The last row is the honest carve-out. If your workload is hundreds of thousands of sub-second, fire-and-forget, naturally idempotent jobs per hour — and you don't need per-job history — a Redis queue remains the right tool. For everything else, and especially for the work your business actually depends on, the database-backed model buys durability, verifiable recovery, and operator control that a visibility timeout cannot express.
 
-| Use case | Prefer |
-|---|---|
-| Emails, notifications, cache warming | Laravel Queue / Horizon |
-| Short idempotent webhook fan-out | Laravel Queue / Horizon |
-| High-throughput generic background work | Laravel Queue / Horizon |
-| Long-running imports or syncs | JobWarden |
-| Non-idempotent or hard-to-retry workflows | JobWarden |
-| Jobs that need exact operator cancellation | JobWarden |
-| Jobs that must survive dead hosts without blind double-run | JobWarden |
-| Batches, chains, DAGs, and schedules needing durable auditability | JobWarden |
-
-A common deployment pattern is to use both:
-
-- Horizon for ordinary application jobs,
-- JobWarden for the operationally sensitive workflows.
+Migration can be incremental: JobWarden does not touch `dispatch()`, so it coexists with an existing Horizon deployment and can absorb it lane by lane, job by job.
 
 ---
 
 ## Current status
 
-JobWarden is currently `1.0.0-beta`.
+JobWarden is **stable** as of `1.11.0`.
 
-The core execution, recovery, batching, scheduling, dashboard, and API features are complete.
+The execution core, three-tier recovery, batching/DAGs, scheduling, dashboard, and API shipped and hardened across ten public betas, driven by production fleets — the dashboards in this README are screenshots of one. The distributed-correctness core is exercised against SQLite, MariaDB/MySQL, and PostgreSQL in CI, plus chaos testing (kill -9, OOM, dead hosts, deploy drains) against the real process supervisor.
 
-The project is beta because public APIs may still receive minor adjustments before `1.0.0`.
-
-Feedback, design review, and real-world testing are welcome.
+Feedback, issues, and real-world reports are welcome.
 
 ---
 

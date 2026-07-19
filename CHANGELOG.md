@@ -6,6 +6,14 @@ All notable changes to `laravel-jobwarden` are documented here. The format follo
 
 ## [Unreleased]
 
+## [1.11.0] - 2026-07-19
+
+JobWarden is out of beta. This is the first stable release; it consolidates everything
+shipped across the `v1.1.0-beta` … `v1.10.0-beta` pre-release tags since [1.0.0-beta].
+Upgrading from any beta: require `^1.11` and run `php artisan migrate` (three
+migrations landed after 1.0.0-beta: the wider `job_events.reason`, the admit-pass
+index, and the searchable-tags table).
+
 ### Added
 - **A supervisor-observed child death now leaves real error artifacts.** Previously
   `job_attempts.error` / `jobs.last_error` were written only by the child itself (on a
@@ -117,6 +125,14 @@ All notable changes to `laravel-jobwarden` are documented here. The format follo
   exactly as before; correctness never depends on it. `JobContext` is now the slim
   per-attempt capability handle: identity, `result()`, `artifact()`, `stopRequested()` —
   job data lives in the constructor.
+- **Reconciliation backstop (Tier-3, leader-only).** The global reaper now heals any
+  job stranded in `running` with a settled current attempt, regardless of how it arose —
+  gated by a grace window (`JOBWARDEN_RECONCILE_GRACE`, default 30s) so it never races a
+  healthy worker mid-completion.
+- **`JobWarden\Health\JobWardenHealth`** — an invariant tripwire (`invariantViolations()`
+  / `isConsistent()`) covering *no running job with a settled current attempt*, *no
+  dangling `current_attempt_id`*, and *`attempt_count ≥ max(attempt_number)`*. Assert it
+  is empty at the end of chaos tests.
 
 ### Fixed
 - **Dashboard: a verbose `last_error` no longer buries the job-detail tabs.** The
@@ -187,16 +203,6 @@ All notable changes to `laravel-jobwarden` are documented here. The format follo
   entities (previously it could report `from == to` when `state` wasn't already an enum).
 - **Operator retry/restart is atomic** — the eligibility resets (`available_at`,
   cancellation withdrawal) and the audited `→ queued` transition now commit together.
-
-### Added
-- **Reconciliation backstop (Tier-3, leader-only).** The global reaper now heals any
-  job stranded in `running` with a settled current attempt, regardless of how it arose —
-  gated by a grace window (`JOBWARDEN_RECONCILE_GRACE`, default 30s) so it never races a
-  healthy worker mid-completion.
-- **`JobWarden\Health\JobWardenHealth`** — an invariant tripwire (`invariantViolations()`
-  / `isConsistent()`) covering *no running job with a settled current attempt*, *no
-  dangling `current_attempt_id`*, and *`attempt_count ≥ max(attempt_number)`*. Assert it
-  is empty at the end of chaos tests.
 
 ### Changed
 - **Dashboard Jobs list: the Job column leads with the class.** The FQCN now sits on
@@ -284,5 +290,6 @@ complete and proven against SQLite, MariaDB/MySQL, and PostgreSQL.
 - **Deployment**: a single "host" image (init baked in) that runs any set of roles via
   `JOBWARDEN_ROLES`; systemd unit templates; a Docker Compose dev stack.
 
-[Unreleased]: https://github.com/kpconnell/laravel-jobwarden/compare/v1.6.0-beta...HEAD
+[Unreleased]: https://github.com/kpconnell/laravel-jobwarden/compare/v1.11.0...HEAD
+[1.11.0]: https://github.com/kpconnell/laravel-jobwarden/compare/v1.0.0-beta...v1.11.0
 [1.0.0-beta]: https://github.com/kpconnell/laravel-jobwarden/releases/tag/v1.0.0-beta

@@ -2,6 +2,7 @@
 # so `composer require` pulls only what an app needs at runtime.
 /.github            export-ignore
 /tests              export-ignore
+/docs/images        export-ignore
 /workbench          export-ignore
 /.phpunit.cache     export-ignore
 .gitattributes      export-ignore

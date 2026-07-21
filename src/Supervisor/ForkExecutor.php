@@ -43,6 +43,19 @@ final class ForkExecutor
      */
     private array $heldPdos = [];
 
+    /**
+     * The child's reopened stdout/stderr, held for the life of the process ON PURPOSE:
+     * an unassigned fopen() is refcount-freed at the end of the statement, which closes
+     * the descriptor again and leaves fd 1/2 free for the NEXT open — the child's fresh
+     * DB socket — to claim. See resetAfterFork.
+     *
+     * @var resource|null
+     */
+    private mixed $stdout = null;
+
+    /** @var resource|null */
+    private mixed $stderr = null;
+
     public function __construct(
         private readonly ProcessStampWriter $stampWriter,
         private readonly ProcessProbe $probe,
@@ -74,7 +87,20 @@ final class ForkExecutor
         try {
             $code = $this->runChild($attemptId, $token, $nonce, $logFile);
         } catch (\Throwable $e) {
-            @error_log('jobwarden prefork child fatal: '.$e->getMessage());
+            // The ONLY record of an exception that escapes ChildRunner — the attempt row
+            // carries no error, since only ChildRunner writes that — so record the throw
+            // site and trace, not just the message.
+            //
+            // Written to the REDIRECTED handle, not error_log(): error_log() goes through
+            // the SAPI logger's libc stderr, which resetAfterFork closed and which does
+            // NOT recover when fd 2 is reopened underneath it. This lands in the attempt
+            // log, which the supervisor ingests into job_logs on reap.
+            if (is_resource($this->stderr)) {
+                @fwrite($this->stderr,
+                    'jobwarden prefork child fatal: '.$e::class.': '.$e->getMessage()
+                    .' @ '.$e->getFile().':'.$e->getLine()."\n".$e->getTraceAsString()."\n"
+                );
+            }
         }
         $this->hardExit($code);   // never returns
     }
@@ -128,8 +154,13 @@ final class ForkExecutor
         if (! is_dir($dir)) {
             @mkdir($dir, 0775, true);
         }
-        fopen($logFile, 'a');   // reclaims fd 1
-        fopen($logFile, 'a');   // reclaims fd 2
+        // MUST be held (see the properties): a discarded fopen() handle is freed — and
+        // its fd closed — at the end of the statement, so fd 1/2 would fall right back
+        // open for the DB reconnect below to take. The child would then have no
+        // stdout/stderr (a fatal's dying words vanish) AND every write to
+        // php://stdout/php://stderr would land in its database socket.
+        $this->stdout = fopen($logFile, 'a');   // reclaims fd 1
+        $this->stderr = fopen($logFile, 'a');   // reclaims fd 2
     }
 
     /**
@@ -172,8 +203,18 @@ final class ForkExecutor
         // error handler. As a last resort SIGKILL ourselves — still destructor-free, unlike
         // exit(), which would fire the inherited PDO destructor and COM_QUIT the master's
         // shared socket.
-        for ($i = 0; $i < 8; $i++) {
-            @pcntl_exec('/bin/true');
+        //
+        // The exec'd image's status IS this child's exit status, so the code has to be
+        // carried by the thing we exec. '/bin/true' reported a clean 0 for every outcome,
+        // including a child that died mid-flight — which the supervisor then renders to an
+        // operator as "child exited with code 0 without reporting", the one signal that
+        // would have distinguished an escaped exception from an unreported success.
+        // /bin/true remains the fallback (and macOS has no /bin/true, only /usr/bin/true,
+        // so the fallback chain matters for dev boxes too).
+        foreach (['/bin/sh', '/bin/true', '/usr/bin/true'] as $image) {
+            for ($i = 0; $i < 8; $i++) {
+                @pcntl_exec($image, $image === '/bin/sh' ? ['-c', 'exit '.$code] : []);
+            }
         }
         posix_kill((int) (function_exists('posix_getpid') ? posix_getpid() : getmypid()), SIGKILL);
         exit($code); // unreachable

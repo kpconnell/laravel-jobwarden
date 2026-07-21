@@ -22,6 +22,7 @@ use JobWarden\Tests\Concerns\RefreshesJobWardenSchema;
 use JobWarden\Tests\TestCase;
 use Illuminate\Support\Facades\DB;
 use Workbench\App\Jobs\CrashJob;
+use Workbench\App\Jobs\FailingJob;
 use Workbench\App\Jobs\MarkerJob;
 
 /**
@@ -162,6 +163,59 @@ final class PreforkE2ETest extends TestCase
         $this->assertSame(1, (int) DB::connection('jobwarden')->select('SELECT 1 AS x')[0]->x, 'master survived the child crash');
 
         @unlink($marker);
+    }
+
+    /**
+     * REGRESSION (field report, prefork cutover): 15% of failed jobs lost their error
+     * on the first full prefork day. The host application's default log channel — a
+     * php://stderr handler that does not swallow its own exceptions — was inherited
+     * across the fork into a child whose fd 1/2 had been released, so the first log
+     * call threw, unwound past the child's error report, and left the attempt with
+     * error=NULL. The supervisor then synthesized `ProcessDied: child exited with code
+     * 0 after Ns without reporting` over a perfectly diagnosable exception.
+     *
+     * This drives the real supervisor under exactly that hostile channel: the child
+     * must still report its own failure, with the real exception on the row.
+     */
+    public function test_a_forked_failure_reports_the_real_exception_under_a_hostile_host_log_channel(): void
+    {
+        config([
+            'logging.default' => 'host_app',
+            'logging.channels.host_app' => [
+                'driver' => 'monolog',
+                'handler' => \Monolog\Handler\StreamHandler::class,
+                'with' => ['stream' => 'php://stderr', 'level' => \Monolog\Level::Error],
+            ],
+        ]);
+
+        $job = $this->app->make(JobWarden::class)->dispatch(
+            FailingJob::class,
+            ['message' => 'AWD eligibility check failed'],
+            ['idempotent' => false, 'max_attempts' => 1],
+        );
+
+        $supervisor = $this->supervisor();
+        $supervisor->boot();
+        $final = $this->driveUntil($supervisor, [$job->id]);
+
+        $this->assertSame(JobState::Failed, $final[$job->id]->state);
+
+        $attempt = JobAttempt::where('job_id', $job->id)->first();
+        $this->assertSame(AttemptState::Failed, $attempt->state);
+
+        $error = $attempt->error;
+        $this->assertNotNull($error, 'the child never got its error onto the row — the supervisor will bury it under a synthesized ProcessDied');
+        $this->assertSame(\RuntimeException::class, $error['class'], 'the corpse was described instead of the exception');
+        $this->assertStringContainsString('AWD eligibility check failed', $error['message']);
+        $this->assertStringContainsString('FailingJob', $error['file'], 'the throw site is recorded');
+
+        $this->assertStringContainsString('AWD eligibility check failed', $final[$job->id]->last_error['message']);
+
+        // ...and the child's own step=failed line is in the log, not just the
+        // supervisor's step=reaped epitaph.
+        $steps = DB::connection('jobwarden')->table('jobwarden_job_logs')
+            ->where('attempt_id', $attempt->id)->pluck('step')->all();
+        $this->assertContains('failed', $steps, 'the child died before it could log the failure');
     }
 
     /**

@@ -49,6 +49,8 @@ final class ChildRunner
 
     public function run(string $attemptId, int $token, string $nonce): int
     {
+        $this->silenceHostLogChannel();
+
         // --- instrumentation: separate framework-boot cost from starvation wait ---
         // boot_wall = time from PHP process start (REQUEST_TIME_FLOAT) to here;
         // boot_cpu  = CPU actually consumed to get here (getrusage). If boot_cpu is
@@ -132,11 +134,14 @@ final class ChildRunner
             app()->call([$handler, 'handle'], [JobContext::class => $context]);
             $handlerWallMs = (microtime(true) - $handlerStart) * 1000.0;
         } catch (\Throwable $e) {
-            Log::error('Job failed: '.$e->getMessage(), ['step' => 'failed', 'exception' => $e::class]);
-            $this->logs->end();
-
             return $this->fail($attempt, $job, $token, $e, $handler ?? null);
         }
+
+        // OUTCOME BEFORE NARRATION (see fail()): commit the success first. A throw from
+        // inside the logging stack here would otherwise strand the attempt non-terminal
+        // AFTER the handler already did its work — the supervisor would force-fail a job
+        // that genuinely succeeded, which is the worst outcome this system can produce.
+        $code = $this->succeed($attempt, $job, $token, $context->bufferedResult());
 
         Log::info('child timing', [
             'step' => 'timing',
@@ -149,7 +154,29 @@ final class ChildRunner
         Log::info('Job finished successfully', ['step' => 'finished']);
         $this->logs->end();
 
-        return $this->succeed($attempt, $job, $token, $context->bufferedResult());
+        return $code;
+    }
+
+    /**
+     * The child's structured Log:: output goes to job_logs (via the capture bridge)
+     * only — NOT to the process stdout/stderr. That keeps the per-attempt
+     * stdout/stderr file holding ONLY raw output (a fatal/OOM's dying words), which
+     * the supervisor drains into job_logs on reap. So everything ends up queryable in
+     * the DB; nobody hunts for files.
+     *
+     * This lives HERE, not in RunCommand, because it must hold for BOTH execution
+     * modes: a prefork child never runs the console command, so it would otherwise
+     * keep logging through the HOST application's default channel — inherited across
+     * the fork, pointed at handlers (php://stderr, a file, a remote sink) that a
+     * forked child has no business writing to and that can throw on the way, taking
+     * the failure report down with them.
+     */
+    private function silenceHostLogChannel(): void
+    {
+        config([
+            'logging.default' => 'jobwarden_child',
+            'logging.channels.jobwarden_child' => ['driver' => 'monolog', 'handler' => \Monolog\Handler\NullHandler::class],
+        ]);
     }
 
     /** Total CPU (user+system) this process has consumed so far, in ms. */
@@ -199,7 +226,17 @@ final class ChildRunner
 
     private function fail(JobAttempt $attempt, $job, int $token, \Throwable $e, ?JobWardenJob $handler): int
     {
+        // DURABLE BEFORE LOUD. recordError() runs before the log line, not after it,
+        // because the log line is the fragile one: it travels the host application's
+        // logging stack, and a throw anywhere in there (dead handler, unwritable
+        // stream, a listener of its own) used to unwind past recordError and leave
+        // the attempt with error=NULL. The supervisor then synthesizes a ProcessDied
+        // that describes the corpse instead of the exception — a diagnosable failure
+        // traded for an undiagnosable one.
         $this->recordError($attempt, $job, $e);
+
+        Log::error('Job failed: '.$e->getMessage(), ['step' => 'failed', 'exception' => $e::class]);
+        $this->logs->end();
 
         try {
             // ONE transaction: the attempt failing and the job's recovery decision

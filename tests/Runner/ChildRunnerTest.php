@@ -140,6 +140,66 @@ final class ChildRunnerTest extends TestCase
         $this->assertNotEmpty($lastError['trace'] ?? '');
     }
 
+    /**
+     * REGRESSION (field report, prefork cutover): the child logs through whatever
+     * `logging.default` names. In exec mode the console command swapped that for a
+     * job_logs-only channel; a prefork child never runs the command, so it kept
+     * logging through the HOST application's channel — inherited across the fork and
+     * pointed at handlers a forked child has no business writing to. When one of them
+     * threw, it unwound the failure report and the attempt kept error=NULL, which is
+     * exactly the condition that makes the supervisor synthesize a ProcessDied and
+     * bury the real exception.
+     *
+     * The child must never touch the host's channel, and the error artifact must
+     * survive a logging stack that throws either way.
+     */
+    public function test_the_host_applications_log_channel_cannot_bury_the_failure(): void
+    {
+        config([
+            'logging.default' => 'host_app',
+            'logging.channels.host_app' => [
+                'driver' => 'monolog',
+                'handler' => \Monolog\Handler\StreamHandler::class,
+                // Unopenable (a closed fd 2 in the field): Monolog throws on first write.
+                'with' => ['stream' => '/dev/null/not-a-directory'],
+            ],
+        ]);
+
+        [$job, $attempt] = $this->dispatched(FailingJob::class, ['message' => 'the real error'], idempotent: false, maxAttempts: 1);
+
+        $code = $this->runner()->run($attempt->id, 1, 'n');
+
+        $this->assertSame(ExitCode::FAILURE, $code);
+        $this->assertSame('the real error', JobAttempt::find($attempt->id)->error['message'], 'the diagnosable error was lost to the logging stack');
+        $this->assertSame('the real error', Job::find($job->id)->last_error['message']);
+        $this->assertSame(AttemptState::Failed, JobAttempt::find($attempt->id)->state);
+        $this->assertSame(JobState::Failed, Job::find($job->id)->state, 'the child must report its own outcome, not leave it for the supervisor to force');
+    }
+
+    /** The success path has the same exposure, with a worse ending: a job that really
+     *  ran would be left non-terminal for the supervisor to force-FAIL. */
+    public function test_the_host_applications_log_channel_cannot_bury_a_success(): void
+    {
+        config([
+            'logging.default' => 'host_app',
+            'logging.channels.host_app' => [
+                'driver' => 'monolog',
+                'handler' => \Monolog\Handler\StreamHandler::class,
+                'with' => ['stream' => '/dev/null/not-a-directory'],
+            ],
+        ]);
+
+        $marker = $this->runtime.'/survived.txt';
+        [$job, $attempt] = $this->dispatched(MarkerJob::class, ['marker' => $marker], idempotent: true);
+
+        $code = $this->runner()->run($attempt->id, 1, 'nonce-abc');
+
+        $this->assertSame(ExitCode::SUCCESS, $code);
+        $this->assertSame(AttemptState::Succeeded, JobAttempt::find($attempt->id)->state);
+        $this->assertSame(JobState::Succeeded, Job::find($job->id)->state, 'a job that did its work was left for the supervisor to force-fail');
+        $this->assertStringStartsWith('done:', (string) @file_get_contents($marker));
+    }
+
     public function test_idempotent_failure_within_budget_schedules_a_retry(): void
     {
         [$job, $attempt] = $this->dispatched(FailingJob::class, [], idempotent: true, maxAttempts: 3);

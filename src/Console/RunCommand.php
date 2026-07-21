@@ -20,16 +20,9 @@ final class RunCommand extends Command
 
     public function handle(ChildRunner $runner): int
     {
-        // The child's structured Log:: output goes to job_logs (via the capture
-        // bridge) only — NOT to the process stdout/stderr. That keeps the
-        // per-attempt stdout/stderr file holding ONLY raw output (a fatal/OOM's
-        // dying words), which the supervisor drains into job_logs on reap. So
-        // everything ends up queryable in the DB; nobody hunts for files.
-        config([
-            'logging.default' => 'jobwarden_child',
-            'logging.channels.jobwarden_child' => ['driver' => 'monolog', 'handler' => \Monolog\Handler\NullHandler::class],
-        ]);
-
+        // NB: the child's log channel is swapped to the job_logs-only sink by
+        // ChildRunner itself — it has to hold for the prefork mode too, which never
+        // reaches this command.
         $attemptId = (string) $this->argument('attempt');
         $token = (int) $this->option('token');
         $nonce = (string) $this->option('nonce');

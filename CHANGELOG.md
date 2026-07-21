@@ -4,7 +4,45 @@ All notable changes to `laravel-jobwarden` are documented here. The format follo
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.11.1] - 2026-07-21
+
+Prefork-only bug fixes. A field report on the first full day of `execution_mode=prefork`
+showed **15% of failed jobs losing their error entirely**: the job row carried a
+synthesized `ProcessDied: child exited with code 0 … without reporting` instead of the
+real exception, which was visible only in `job_logs`. Exec mode was never affected.
+No migrations; no configuration changes.
+
+### Fixed
+- **A forked child no longer runs with its stdout/stderr closed.** `ForkExecutor` closed
+  the inherited `STDOUT`/`STDERR` and reopened them onto the attempt log with the
+  `fopen()` handles discarded — PHP frees an unassigned resource at the end of the
+  statement, closing the descriptor again. Two consequences: a fatal's dying words went
+  nowhere (the supervisor always ingested a 0-byte file), and fd 1/2 were left free for
+  the **next** descriptor the child opened — its own fresh DB socket — so anything in
+  the host application writing to `php://stderr` wrote into the database connection.
+- **The child no longer logs through the host application's channel.** The swap to the
+  job_logs-only channel lived in `jobwarden:run`, which a prefork child never executes,
+  so it logged through whatever `logging.default` named — inherited across the fork,
+  pointed at handlers (a `php://stderr` stream, a remote sink) that a fork has no
+  business writing to. With `ignore_exceptions=false` such a handler *throws*, and the
+  throw unwound the child's failure report. The swap now lives in `ChildRunner`, which
+  both execution modes go through.
+- **The outcome is now committed before it is narrated.** `ChildRunner` wrote its
+  `Job failed:` log line before `recordError()`, so a throw anywhere in the logging
+  stack cost the attempt its `error` — the exact condition under which the supervisor
+  synthesizes a `ProcessDied` over a diagnosable exception. The success path had the
+  same exposure with a worse ending: a job that had genuinely done its work could be
+  left non-terminal for the supervisor to force-**fail**.
+- **A prefork exit code is meaningful again.** `hardExit()` terminated via
+  `pcntl_exec('/bin/true')`, which always exits 0 — discarding the `ExitCode` the runner
+  returned, and telling an operator that a child which died mid-flight "exited with
+  code 0". It now carries the real code (`/bin/sh -c 'exit N'`, falling back to
+  `/bin/true` / `/usr/bin/true`).
+- **An exception escaping `ChildRunner` leaves a record.** Its only trace was an
+  `error_log()` call — which writes through the SAPI logger's libc stderr and does *not*
+  recover when fd 2 is reopened underneath it. The child now writes the class, message,
+  throw site, and trace to the redirected handle, which the supervisor ingests into
+  `job_logs` on reap.
 
 ## [1.11.0] - 2026-07-19
 
@@ -290,6 +328,6 @@ complete and proven against SQLite, MariaDB/MySQL, and PostgreSQL.
 - **Deployment**: a single "host" image (init baked in) that runs any set of roles via
   `JOBWARDEN_ROLES`; systemd unit templates; a Docker Compose dev stack.
 
-[Unreleased]: https://github.com/kpconnell/laravel-jobwarden/compare/v1.11.0...HEAD
+[1.11.1]: https://github.com/kpconnell/laravel-jobwarden/compare/v1.11.0...v1.11.1
 [1.11.0]: https://github.com/kpconnell/laravel-jobwarden/compare/v1.0.0-beta...v1.11.0
 [1.0.0-beta]: https://github.com/kpconnell/laravel-jobwarden/releases/tag/v1.0.0-beta

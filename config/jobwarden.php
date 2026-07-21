@@ -96,7 +96,7 @@ return [
         //             COW slate) minus the boot. Requires the pcntl extension; falls back
         //             to 'child' where it is unavailable.
         //   in_process (deferred).
-        'execution_mode' => env('JOBWARDEN_EXECUTION_MODE', 'child'),
+        'execution_mode' => env('JOBWARDEN_EXECUTION_MODE', 'prefork'),
         'graceful_timeout' => (int) env('JOBWARDEN_GRACEFUL_TIMEOUT', 10),
         'poll_interval_ms' => (int) env('JOBWARDEN_POLL_INTERVAL_MS', 500),
         // Adaptive poll cadence: the supervisor senses demand from each claim's fill ratio

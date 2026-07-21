@@ -4,6 +4,22 @@ All notable changes to `laravel-jobwarden` are documented here. The format follo
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.12.0] - 2026-07-21
+
+### Changed
+- **`supervisor.execution_mode` now defaults to `prefork`** (was `child`). The supervisor
+  forks per job from its already-booted image instead of `proc_open`ing a fresh
+  `php artisan jobwarden:run`, removing a ~144ms framework boot from every job. Isolation
+  is unchanged: each job still runs in its own killable PID, reaped by Tier-1 `waitpid`,
+  starting from the pristine copy-on-write baseline.
+
+  **Upgrading:** this takes effect on upgrade unless you set it. Exec-per-job remains
+  fully supported — `JOBWARDEN_EXECUTION_MODE=child`, or pin `execution_mode` in the
+  published config. Hosts without the `pcntl` extension fall back to `child`
+  automatically. Note that a prefork child's exit code is `0`/the runner's `ExitCode`
+  rather than exec mode's, and its stdout/stderr go to the per-attempt log — see 1.11.1,
+  which this release requires for correct prefork error reporting.
+
 ## [1.11.1] - 2026-07-21
 
 Prefork-only bug fixes. A field report on the first full day of `execution_mode=prefork`
@@ -328,6 +344,7 @@ complete and proven against SQLite, MariaDB/MySQL, and PostgreSQL.
 - **Deployment**: a single "host" image (init baked in) that runs any set of roles via
   `JOBWARDEN_ROLES`; systemd unit templates; a Docker Compose dev stack.
 
+[1.12.0]: https://github.com/kpconnell/laravel-jobwarden/compare/v1.11.1...v1.12.0
 [1.11.1]: https://github.com/kpconnell/laravel-jobwarden/compare/v1.11.0...v1.11.1
 [1.11.0]: https://github.com/kpconnell/laravel-jobwarden/compare/v1.0.0-beta...v1.11.0
 [1.0.0-beta]: https://github.com/kpconnell/laravel-jobwarden/releases/tag/v1.0.0-beta

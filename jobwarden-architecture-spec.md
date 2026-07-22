@@ -379,9 +379,17 @@ Index: `(state, heartbeat_at)` for the global reaper's expiry scan. `heartbeat_a
 ```
 job_id            uuid fk -> jobs
 depends_on_job_id uuid fk -> jobs
+edge_condition    varchar(16) default 'on_success'   -- on_success | on_completion
 PRIMARY KEY (job_id, depends_on_job_id)
 ```
-A job is admitted (`pending → queued`) only when **all** `depends_on` jobs are `succeeded` (or satisfy the configured dependency mode, e.g. allow-on-skip). This implements the Job machine's admit gate for chains and dependent jobs.
+A job is admitted (`pending → queued`) only when **all** `depends_on` jobs are satisfied. `edge_condition` decides what satisfies one — per edge, not per job:
+
+- **`on_success`** (default) — the upstream must be `succeeded`. An upstream that ends any other way makes the dependent **unreachable**: the coordinator cancels it so the batch can complete instead of hanging, and revives it if that upstream is later retried.
+- **`on_completion`** — the upstream need only be **terminal** (`succeeded|failed|canceled|stopped`). Such an edge never dooms its dependent, never strands it, and never blocks its revival; `finally` semantics (cleanup / reporting that must run on both paths) are expressible in the graph rather than in a `BatchStateChanged` listener outside it.
+
+`orphaned` is not terminal and therefore satisfies neither condition — a parked orphan awaits an operator verdict. A dependent with a mix of both edge kinds is unreachable only when one of its **on_success** upstreams is doomed.
+
+The predicate is evaluated in two places that must agree: the `DepsSatisfiedGuard` on the transition itself, and the admit pass's window query (which pre-filters candidate rows so a dep-blocked backlog cannot monopolize the LIMIT).
 
 ---
 
@@ -560,6 +568,7 @@ A batch is a first-class object with its own lifecycle, params, progress, summar
 - **Fan-out** — N independent jobs under one batch; progress = counts by state.
 - **Chain** — linear `job_dependencies` edges; each step admitted only when its predecessor succeeds.
 - **DAG / dependent jobs** — arbitrary `depends_on` edges; a job is admitted when all dependencies are satisfied.
+- **`finally` members** — an `on_completion` edge (§4.10) admits its dependent once the upstream ENDS, whatever the verdict, so end-of-batch cleanup/reporting stays a first-class member (retries, attempts, artifacts, cancellation, reaper reconciliation) instead of moving out to a listener.
 
 ### 8.2 Failure handling
 `batches.failure_policy`:
@@ -568,7 +577,9 @@ A batch is a first-class object with its own lifecycle, params, progress, summar
 - **`threshold`** — tolerate up to `failure_threshold` failures before failing the batch.
 
 ### 8.3 Progress, completion, and artifacts
-Member transitions update the batch's denormalized counters in-transaction. When all members reach a terminal state, the batch coordinator runs **completion logic** (success/failure/partial determination + an optional batch-completion callback) and writes a batch `summary` and any batch-level artifacts. Cancellation propagates: canceling a batch sets `cancel_requested` on all non-terminal members.
+Member transitions update the batch's denormalized counters in-transaction. When all members reach a terminal state, the batch coordinator runs **completion logic** (success/failure/partial determination + an optional batch-completion callback) and writes a batch `summary` and any batch-level artifacts. Cancellation propagates: canceling a batch sets `cancel_requested` on all non-terminal members — **including** members joined by `on_completion` edges, since cancelling the batch is an operator verdict to stop everything.
+
+An **eager** policy (`fail_fast`, `threshold`) is the exception: its sweep spares any member joined by an `on_completion` edge, and everything downstream of one, so `finally` work runs in exactly the case it exists for. The batch verdict is still recorded immediately; the spared subtree runs on afterwards (admission and claiming are batch-state-agnostic), the same way a `running` member the sweep could only FLAG keeps running until its supervisor honors the flag. Inside the spared subtree the ordinary DAG rules resume — a finalizer that itself fails cancels its own `on_success` dependents — and its outcome lands in the counters like any other member's.
 
 ### 8.4 Retryable steps
 Per-job `max_attempts`/`idempotent`/`backoff` apply within a batch exactly as for standalone jobs; a transient step failure retries without failing the batch, subject to the batch policy.

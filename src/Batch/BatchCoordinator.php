@@ -35,10 +35,19 @@ use Illuminate\Support\Facades\Log;
  * (operator retry/restart), a partial/failed batch reopens and the dependents
  * the system canceled as unreachable are revived to `pending` — back to
  * waiting on their dependencies.
+ *
+ * Every unreachability rule below is scoped to `on_success` edges. A member
+ * joined by an `on_completion` edge is reachable BECAUSE its upstream ended:
+ * it is never canceled as unreachable, never counts as stranded, and never
+ * blocks a revival. A dependent with a mix of both is unreachable only when one
+ * of its on_success upstreams is doomed.
  */
 final class BatchCoordinator
 {
-    /** Terminal member states that make dependents unreachable (deps are strict). */
+    /**
+     * Terminal member states that make dependents unreachable — across an
+     * `on_success` edge only (see the class note).
+     */
     private const DOOMED = [JobState::Failed, JobState::Canceled, JobState::Stopped];
 
     /**
@@ -83,6 +92,17 @@ final class BatchCoordinator
         }
 
         if ($batch->state->isTerminal()) {
+            // A terminal batch can still have members in flight — a finalizer
+            // subtree the eager sweep spared, or a running member whose
+            // supervisor hasn't honored its cancel flag yet. The batch verdict
+            // is settled, but the DAG rules INSIDE those members still apply:
+            // without this, a dependent of a failed finalizer would sit pending
+            // forever behind an upstream that can never succeed, on a batch
+            // nothing will ever complete again.
+            if (in_array($event->to, self::DOOMED, true)) {
+                $this->cancelUnreachableDependents($event->job->id, $batch);
+            }
+
             return;
         }
 
@@ -90,7 +110,7 @@ final class BatchCoordinator
             // Fail the batch FIRST so the member cancellations below (which fire
             // their own completion checks) see a terminal batch and no-op.
             $this->transitionBatch($batch, BatchState::Failed, "member failed ({$batch->failure_policy})");
-            $this->cancelRemainingMembers($batch, "batch member failed under {$batch->failure_policy}");
+            $this->cancelRemainingMembers($batch, "batch member failed under {$batch->failure_policy}", sparingFinalizers: true);
 
             return;
         }
@@ -184,7 +204,7 @@ final class BatchCoordinator
 
             if ($this->shouldEagerFail($batch)) {
                 $this->transitionBatch($batch, BatchState::Failed, "member failed ({$batch->failure_policy})");
-                $this->cancelRemainingMembers($batch, "batch member failed under {$batch->failure_policy}");
+                $this->cancelRemainingMembers($batch, "batch member failed under {$batch->failure_policy}", sparingFinalizers: true);
 
                 continue;
             }
@@ -232,21 +252,82 @@ final class BatchCoordinator
         $this->transitionBatch($batch, $clean ? BatchState::Succeeded : BatchState::Partial, 'all members terminal');
     }
 
-    private function cancelRemainingMembers(Batch $batch, string $reason): void
+    /**
+     * @param  bool  $sparingFinalizers  exempt the finalizer closure (see below).
+     *                                    Set by the EAGER-FAILURE sweep only: an
+     *                                    operator canceling the whole batch means
+     *                                    "stop everything", finalizers included.
+     */
+    private function cancelRemainingMembers(Batch $batch, string $reason, bool $sparingFinalizers = false): void
     {
         $terminal = [JobState::Succeeded->value, JobState::Failed->value, JobState::Canceled->value, JobState::Stopped->value];
+        $spared = $sparingFinalizers ? $this->finalizerClosure($batch) : [];
 
         $members = Job::query()->where('batch_id', $batch->id)->whereNotIn('state', $terminal)->get();
         foreach ($members as $job) {
+            if (isset($spared[(string) $job->id])) {
+                continue;
+            }
             $this->cancelMember($job, $reason);
         }
+    }
+
+    /**
+     * Members an eager failure policy must NOT cancel: those joined by an
+     * `on_completion` edge — a finalizer exists precisely to run when its
+     * upstream did not succeed, so cancelling it would withhold the feature in
+     * the one case it is most needed — plus everything downstream of one, so a
+     * "clean up, then notify" tail survives with it.
+     *
+     * The batch still fails IMMEDIATELY; a spared finalizer runs on afterwards
+     * (admission and claiming are batch-state-agnostic), exactly as a running
+     * member that was only flagged does today. Inside the spared subtree the
+     * ordinary DAG rules resume: if the finalizer itself ends non-success, the
+     * unreachable-cascade cancels its on_success dependents like any other.
+     *
+     * @return array<string,true> job id => true
+     */
+    private function finalizerClosure(Batch $batch): array
+    {
+        $edges = $this->connection()->table($this->tbl('job_dependencies').' as d')
+            ->join($this->tbl('jobs').' as j', 'j.id', '=', 'd.job_id')
+            ->where('j.batch_id', $batch->id)
+            ->get(['d.job_id', 'd.depends_on_job_id', 'd.edge_condition']);
+
+        $children = [];
+        $closure = [];
+        foreach ($edges as $edge) {
+            $children[(string) $edge->depends_on_job_id][] = (string) $edge->job_id;
+            if ($edge->edge_condition === 'on_completion') {
+                $closure[(string) $edge->job_id] = true;
+            }
+        }
+
+        // BFS the descendants of every finalizer (pure PHP over the batch's own
+        // edges, like BatchDag — no recursive CTE, identical on every engine).
+        $queue = array_keys($closure);
+        for ($i = 0; $i < count($queue); $i++) {
+            foreach ($children[$queue[$i]] ?? [] as $child) {
+                if (! isset($closure[$child])) {
+                    $closure[$child] = true;
+                    $queue[] = $child;
+                }
+            }
+        }
+
+        return $closure;
     }
 
     /** Cancel the direct dependents of a non-succeeding job; each cascades further via its own event. */
     private function cancelUnreachableDependents(mixed $upstreamId, Batch $batch): void
     {
+        // Everything EXCEPT on_completion, rather than on_success explicitly, so
+        // an unrecognized edge_condition behaves as on_success here just as it
+        // does in DepsSatisfiedGuard — a condition that gated admission but
+        // escaped this cascade would strand its dependent and hang the batch.
         $dependentIds = $this->connection()->table($this->tbl('job_dependencies'))
             ->where('depends_on_job_id', $upstreamId)
+            ->where('edge_condition', '!=', 'on_completion')
             ->pluck('job_id');
 
         foreach ($dependentIds as $id) {
@@ -296,6 +377,7 @@ final class BatchCoordinator
     {
         $dependentIds = $this->connection()->table($this->tbl('job_dependencies'))
             ->where('depends_on_job_id', $upstreamId)
+            ->where('edge_condition', '!=', 'on_completion')
             ->pluck('job_id');
 
         foreach ($dependentIds as $id) {
@@ -370,6 +452,7 @@ final class BatchCoordinator
         return $this->connection()->table($this->tbl('job_dependencies').' as d')
             ->join($this->tbl('jobs').' as dep', 'dep.id', '=', 'd.depends_on_job_id')
             ->where('d.job_id', $jobId)
+            ->where('d.edge_condition', '!=', 'on_completion')
             ->whereIn('dep.state', array_map(static fn (JobState $s): string => $s->value, self::DOOMED))
             ->exists();
     }
@@ -444,6 +527,13 @@ final class BatchCoordinator
      * — so any in-flight member of a completed batch implies a re-entry, even
      * one already claimed to running before this sweep got to it.
      *
+     * Batches whose failure policy is STILL tripped are excluded: reopenBatch
+     * refuses them anyway, and under an eager policy in-flight work on a failed
+     * batch is now also the NORMAL state of affairs (a spared finalizer, or a
+     * flagged member whose supervisor hasn't caught up). Without this the window
+     * would refill with the same unreopenable ids every tick — and a finalizer
+     * blocked behind an orphan would hold its slot indefinitely.
+     *
      * @return string[]
      */
     private function reopenableBatchIds(int $limit): array
@@ -451,6 +541,14 @@ final class BatchCoordinator
         return $this->connection()->table($this->tbl('batches'))
             ->whereIn('state', [BatchState::Partial->value, BatchState::Failed->value])
             ->whereRaw('pending_count + running_count > 0')
+            ->whereNot(function ($q): void {   // the SQL twin of shouldEagerFail()
+                $q->where(function ($q): void {
+                    $q->where('failure_policy', 'fail_fast')->where('failed_count', '>', 0);
+                })->orWhere(function ($q): void {
+                    $q->where('failure_policy', 'threshold')
+                        ->whereRaw('failed_count > COALESCE(failure_threshold, 0)');
+                });
+            })
             ->orderBy('id')
             ->limit($limit)
             ->pluck('id')
@@ -479,6 +577,7 @@ final class BatchCoordinator
                     ->from($this->tbl('job_dependencies').' as d')
                     ->join($this->tbl('jobs').' as dep', 'dep.id', '=', 'd.depends_on_job_id')
                     ->whereColumn('d.job_id', 'j.id')
+                    ->where('d.edge_condition', '!=', 'on_completion')
                     ->whereIn('dep.state', $doomed);
             })
             ->orderBy('j.id')
@@ -517,11 +616,12 @@ final class BatchCoordinator
     }
 
     /**
-     * Pending members of running batches with an upstream dependency that is
-     * terminally non-succeeded — they can never be admitted (deps are strict) and
-     * a lost cascade event means nobody canceled them. `orphaned` upstreams are
-     * deliberately NOT doomed: a parked orphan awaits an operator verdict and may
-     * still be restarted.
+     * Pending members of live batches with an on_success upstream that is
+     * terminally non-succeeded — they can never be admitted and a lost cascade
+     * event means nobody canceled them. `orphaned` upstreams are deliberately
+     * NOT doomed: a parked orphan awaits an operator verdict and may still be
+     * restarted. A member whose only doomed upstreams are on_completion ones is
+     * not stranded at all — it is admissible right now.
      *
      * @return string[]
      */
@@ -531,13 +631,17 @@ final class BatchCoordinator
 
         return $this->connection()->table($this->tbl('jobs').' as j')
             ->join($this->tbl('batches').' as b', 'b.id', '=', 'j.batch_id')
-            ->where('b.state', BatchState::Running->value)
+            // `failed` too, not just `running`: an eagerly-failed batch keeps its
+            // spared finalizer subtree in flight, and a lost event inside that
+            // subtree strands a dependent exactly as it would in a live batch.
+            ->whereIn('b.state', [BatchState::Running->value, BatchState::Failed->value])
             ->where('j.state', JobState::Pending->value)
             ->whereExists(function ($q) use ($doomed): void {
                 $q->selectRaw('1')
                     ->from($this->tbl('job_dependencies').' as d')
                     ->join($this->tbl('jobs').' as dep', 'dep.id', '=', 'd.depends_on_job_id')
                     ->whereColumn('d.job_id', 'j.id')
+                    ->where('d.edge_condition', '!=', 'on_completion')
                     ->whereIn('dep.state', $doomed);
             })
             ->orderBy('j.id')

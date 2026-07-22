@@ -441,6 +441,48 @@ Failure policies:
 - `fail_fast`
 - `threshold(N)`
 
+### `finally` members
+
+`dependsOn` is strict: the dependent runs only if every upstream **succeeded**, and an
+upstream that ends any other way cancels it as unreachable. For end-of-batch work that
+has to run on the failure path too — release a lock, drop a temp table, post the
+outcome — declare the edge with `dependsOnCompletion` instead. It is satisfied when the
+upstream merely **ends**, whatever the verdict:
+
+```php
+app(JobWarden::class)->batch('nightly-sync', failurePolicy: 'fail_fast')
+    ->add('extract', ExtractJob::class, ['store_id' => 42])
+    ->add('load', LoadJob::class, ['store_id' => 42], dependsOn: ['extract'])
+    ->add('report', ReportJob::class, [], dependsOn: ['load'])
+    ->add('release', ReleaseLockJob::class, [], dependsOnCompletion: ['load'])
+    ->dispatch();
+```
+
+If `extract` fails: `load` and `report` are canceled as unreachable, but `release` runs.
+An eager failure policy (`fail_fast`, `threshold`) still fails the batch immediately — it
+just spares the members joined by a `dependsOnCompletion` edge, and anything downstream of
+them, so the cleanup tail still runs. Cancelling the *batch* cancels them too: that is an
+operator saying stop everything.
+
+A finalizer is an ordinary member — it retries, records attempts and artifacts, honors
+cancellation, and is reconciled by the reaper like everything else — so its own failure
+lands in the batch verdict like any other member's. It reads the outcome it is reacting
+to from its `JobContext`:
+
+```php
+public function handle(JobContext $context): void
+{
+    $batch = $context->batch();     // null for a standalone job
+
+    foreach ($batch['failures'] as $member) {
+        // $member: id, name, job_class, state, error
+    }
+}
+```
+
+An upstream sitting in `orphaned` does **not** satisfy the edge: its outcome is still
+unknown and awaits an operator verdict.
+
 The dashboard draws every batch as a dependency graph — lanes are the independent sub-chains, columns are dependency depth, failed nodes stay loud while the work canceled downstream of them dims:
 
 ![A 239-node production batch rendered as a dependency DAG](docs/images/dashboard-batch-dag.png)

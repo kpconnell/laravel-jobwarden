@@ -182,6 +182,11 @@ carries no job data (that's the constructor's job):
   (request/response pair, file on a disk, dump) to this attempt; bundled by
   `jobwarden:logs --export`.
 - `$context->result([...])` — store the job's completion payload (see Results).
+- `$context->batchId`, `$context->batch()` — for a batch member, the batch id and
+  a live read of the batch around it: its state, failure policy, progress counts,
+  and the members that did not succeed (with each one's error message or cancel
+  reason). `null` for a standalone job. This is what a finalizer reacts to — see
+  Batches in the README.
 
 ## Results
 

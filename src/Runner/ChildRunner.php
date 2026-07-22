@@ -124,6 +124,7 @@ final class ChildRunner
                 $attemptId,
                 (int) $attempt->attempt_number,
                 fn (): bool => $this->stopRequested,
+                $job->batch_id === null ? null : (string) $job->batch_id,
             );
 
             // handle() is invoked THROUGH the container: class-typed parameters

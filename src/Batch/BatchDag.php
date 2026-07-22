@@ -35,22 +35,27 @@ final class BatchDag
 
         $edges = $ids === [] ? collect() : JobDependency::query()
             ->whereIn('job_id', $ids)
-            ->get(['job_id', 'depends_on_job_id']);
+            ->get(['job_id', 'depends_on_job_id', 'edge_condition']);
 
         // Adjacency restricted to batch members (a dependency can point outside).
+        // Layout uses every edge; the doomed-tail walk uses only the on_success
+        // ones, since a failure does not doom what waits on mere completion.
         $member = array_flip($ids);
-        $parents = $children = [];  // node => list of nodes
+        $parents = $children = $successChildren = [];  // node => list of nodes
         foreach ($edges as $e) {
             if (! isset($member[$e->job_id], $member[$e->depends_on_job_id])) {
                 continue;
             }
             $parents[$e->job_id][] = $e->depends_on_job_id;
             $children[$e->depends_on_job_id][] = $e->job_id;
+            if ($e->edge_condition !== 'on_completion') {
+                $successChildren[$e->depends_on_job_id][] = $e->job_id;
+            }
         }
 
         $depth = self::depths($ids, $parents, $children);
         $lane = self::components($ids, $parents, $children);
-        $dimmed = self::downstreamOfFailure($jobs, $children);
+        $dimmed = self::downstreamOfFailure($jobs, $successChildren);
         $labels = self::laneLabels($jobs, $lane, $ids);
 
         $lanes = [];
@@ -156,7 +161,9 @@ final class BatchDag
 
     /**
      * Nodes strictly downstream of a failed member — the tail a fail_fast
-     * cascade canceled. The view dims them to tell that story.
+     * cascade canceled. The view dims them to tell that story. Walks on_success
+     * children only: a finalizer (and its own tail) runs precisely because the
+     * upstream ended, so dimming it would tell the wrong story.
      *
      * @param  array<string, list<string>>  $children
      * @return array<string, true>

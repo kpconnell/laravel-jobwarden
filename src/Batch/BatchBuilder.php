@@ -19,11 +19,12 @@ use RuntimeException;
  * Topologies fall out of how dependsOn is used: none → fan-out; a single chain →
  * chain; arbitrary edges → DAG. A member with no deps starts `queued` (eligible
  * now); one with deps starts `pending` and is admitted by the Admitter when all
- * its deps have succeeded (the DepsSatisfiedGuard).
+ * its deps are satisfied (the DepsSatisfiedGuard) — every dependency having
+ * succeeded for a dependsOn edge, merely having ENDED for dependsOnCompletion.
  */
 final class BatchBuilder
 {
-    /** @var array<string, array{jobClass:string, params:array, dependsOn:string[], options:array}> */
+    /** @var array<string, array{jobClass:string, params:array, dependsOn:string[], dependsOnCompletion:string[], options:array}> */
     private array $specs = [];
 
     public function __construct(
@@ -39,16 +40,38 @@ final class BatchBuilder
      * @param  array<string,mixed>  $options  idempotent, max_attempts, priority,
      *                                         available_at (delay/stagger), name,
      *                                         backoff_strategy, tags, …
+     * @param  string[]  $dependsOnCompletion  local keys of jobs that must merely
+     *                                          END first, whatever their outcome —
+     *                                          `finally` semantics for cleanup /
+     *                                          reporting members. Such a member is
+     *                                          NOT canceled as unreachable when its
+     *                                          upstream fails, and an eager failure
+     *                                          policy spares it (and its own tail).
+     *                                          Trails $options to keep positional
+     *                                          calls source-compatible.
      */
-    public function add(string $key, string $jobClass, array $params = [], array $dependsOn = [], array $options = []): self
+    public function add(string $key, string $jobClass, array $params = [], array $dependsOn = [], array $options = [], array $dependsOnCompletion = []): self
     {
-        $this->specs[$key] = compact('jobClass', 'params', 'dependsOn', 'options');
+        $this->specs[$key] = compact('jobClass', 'params', 'dependsOn', 'dependsOnCompletion', 'options');
 
         return $this;
     }
 
     public function dispatch(): Batch
     {
+        // One edge, one condition — the edge row is keyed (job_id, depends_on_job_id),
+        // so a key in both lists has no representable meaning (and would collide on
+        // the primary key). Reject it at the dispatch site rather than half-writing.
+        foreach ($this->specs as $key => $spec) {
+            $both = array_intersect($spec['dependsOn'], $spec['dependsOnCompletion']);
+            if ($both !== []) {
+                throw new RuntimeException(
+                    "batch '{$this->name}': job '{$key}' lists '".implode("', '", $both).
+                    "' under both dependsOn and dependsOnCompletion — an edge carries one condition"
+                );
+            }
+        }
+
         $this->assertAcyclic();
 
         // Validate every member's explicit tags BEFORE the transaction — a bad
@@ -93,7 +116,7 @@ final class BatchBuilder
                 $delaySeconds = isset($spec['options']['available_at'])
                     ? (int) ceil($dbNow->diffInSeconds(Carbon::parse($spec['options']['available_at']), false))
                     : 0;
-                $eligible = $spec['dependsOn'] === [] && $delaySeconds <= 0;
+                $eligible = self::upstreams($spec) === [] && $delaySeconds <= 0;
                 $job = Job::create([
                     'batch_id' => $batch->id,
                     'job_class' => $spec['jobClass'],
@@ -118,14 +141,18 @@ final class BatchBuilder
             }
 
             foreach ($this->specs as $key => $spec) {
-                foreach ($spec['dependsOn'] as $depKey) {
-                    if (! isset($ids[$depKey])) {
-                        throw new RuntimeException("batch '{$this->name}': job '{$key}' depends on unknown '{$depKey}'");
+                $edges = ['on_success' => $spec['dependsOn'], 'on_completion' => $spec['dependsOnCompletion']];
+                foreach ($edges as $condition => $depKeys) {
+                    foreach ($depKeys as $depKey) {
+                        if (! isset($ids[$depKey])) {
+                            throw new RuntimeException("batch '{$this->name}': job '{$key}' depends on unknown '{$depKey}'");
+                        }
+                        $conn->table($prefix.'job_dependencies')->insert([
+                            'job_id' => $ids[$key],
+                            'depends_on_job_id' => $ids[$depKey],
+                            'edge_condition' => $condition,
+                        ]);
                     }
-                    $conn->table($prefix.'job_dependencies')->insert([
-                        'job_id' => $ids[$key],
-                        'depends_on_job_id' => $ids[$depKey],
-                    ]);
                 }
             }
 
@@ -133,14 +160,30 @@ final class BatchBuilder
         });
     }
 
-    /** Kahn's algorithm: a DAG must have a topological order; a cycle would hang. */
+    /**
+     * Every upstream key of a member, whatever the edge condition — the edge
+     * condition decides WHEN a dependency is satisfied, never whether it exists.
+     *
+     * @param  array{dependsOn:string[], dependsOnCompletion:string[], ...}  $spec
+     * @return string[]
+     */
+    private static function upstreams(array $spec): array
+    {
+        return [...$spec['dependsOn'], ...$spec['dependsOnCompletion']];
+    }
+
+    /**
+     * Kahn's algorithm: a DAG must have a topological order; a cycle would hang.
+     * Both edge kinds count — an on_completion cycle deadlocks exactly as an
+     * on_success one does.
+     */
     private function assertAcyclic(): void
     {
         $indegree = [];
         $edges = [];
         foreach ($this->specs as $key => $spec) {
             $indegree[$key] ??= 0;
-            foreach ($spec['dependsOn'] as $dep) {
+            foreach (self::upstreams($spec) as $dep) {
                 $edges[$dep][] = $key;
                 $indegree[$key] = ($indegree[$key] ?? 0) + 1;
             }

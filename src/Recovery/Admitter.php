@@ -58,11 +58,18 @@ final class Admitter
         // (deps already succeeded before the first run), see JobTransitions.
         if ($from === JobState::Pending) {
             $prefix = (string) config('jobwarden.table_prefix');
+            $terminal = [JobState::Succeeded->value, JobState::Failed->value, JobState::Canceled->value, JobState::Stopped->value];
+            // MUST stay identical to DepsSatisfiedGuard's unmet-edge predicate:
+            // a window that admits rows the guard rejects wastes the LIMIT, and
+            // one that rejects rows the guard would admit strands them.
             $query->whereNotExists(fn ($q) => $q
                 ->from($prefix.'job_dependencies as d')
                 ->join($prefix.'jobs as dep', 'dep.id', '=', 'd.depends_on_job_id')
                 ->whereColumn('d.job_id', $prefix.'jobs.id')
-                ->where('dep.state', '!=', JobState::Succeeded->value));
+                ->where('dep.state', '!=', JobState::Succeeded->value)
+                ->where(fn ($q) => $q
+                    ->where('d.edge_condition', '!=', 'on_completion')
+                    ->orWhereNotIn('dep.state', $terminal)));
         }
 
         $jobs = $query->get();

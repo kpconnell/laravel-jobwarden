@@ -4,6 +4,45 @@ All notable changes to `laravel-jobwarden` are documented here. The format follo
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.13.0] - 2026-07-22
+
+### Added
+- **Dependency edges with a completion condition — `finally` semantics inside a batch.**
+  `jobwarden_job_dependencies` gains `edge_condition` (`on_success` | `on_completion`).
+  An `on_success` edge is the existing strict rule: the dependent is admitted only when
+  its upstream **succeeded**, and an upstream ending any other way cancels it as
+  unreachable. An `on_completion` edge is satisfied when the upstream reaches **any**
+  terminal state, so end-of-batch work that must run on the failure path too stays a
+  first-class member — retries, attempt tracking, cancel semantics, artifacts, and reaper
+  reconciliation all still apply — instead of moving out to a `BatchStateChanged`
+  listener where none of those hold. Declared with `BatchBuilder::add(...,
+  dependsOnCompletion: ['upstream'])`; a key listed under both conditions is rejected at
+  `dispatch()`.
+
+  An `on_completion` edge never dooms its dependent, never counts it as stranded, and
+  never blocks its revival; a dependent with a mix of both is unreachable only when one
+  of its **on_success** upstreams is doomed. An `orphaned` upstream satisfies neither
+  condition — its outcome is still unknown and awaits an operator verdict.
+- **`JobContext::batch()`** — a member can read the batch around it: state, failure
+  policy, progress counts, and the members that did not succeed, each with its error
+  message or cancel reason (`null` for a standalone job). Running after a failure is only
+  useful if the handler can see what failed. `JobContext::$batchId` is exposed alongside.
+
+### Changed
+- **An eager failure policy (`fail_fast`, `threshold`) no longer cancels finalizers.** Its
+  sweep now spares members joined by an `on_completion` edge and everything downstream of
+  them, so `finally` work runs in exactly the case it is most needed. The batch verdict is
+  still recorded immediately; the spared subtree runs on afterwards, as a `running` member
+  the sweep could only flag already does. Cancelling the **batch** still cancels
+  everything, finalizers included — that is an operator saying stop everything. Batches
+  with no `on_completion` edges are unaffected.
+
+### Upgrading
+Run `php artisan migrate`. The new column defaults to `on_success`, so every existing edge
+keeps today's behavior and no batch changes shape on upgrade. The column is named
+`edge_condition` rather than `condition` because `CONDITION` is a reserved word on
+MySQL/MariaDB.
+
 ## [1.12.0] - 2026-07-21
 
 ### Changed

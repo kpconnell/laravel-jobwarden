@@ -14,7 +14,8 @@ use Symfony\Component\Uid\Uuid;
  * execution identity, lets a handler attach support-case artifacts
  * (request/response pairs, files, dumps) that get bundled into
  * `jobwarden:logs --export` (spec §9.3), buffers the completion payload set via
- * result(), and exposes the cooperative stop flag. The job's DATA does not live
+ * result(), exposes the cooperative stop flag, and — for a batch member — the
+ * state of the batch around it (see batch()). The job's DATA does not live
  * here — params bind to the handler's constructor (see Runner\HandlerFactory);
  * services are injected into handle() by the container.
  */
@@ -23,12 +24,87 @@ final class JobContext
     /** Buffered completion payload — committed by ChildRunner with the succeeded transition. */
     private ?array $result = null;
 
+    /** Cap on the member list returned by batch(); the counts stay exact regardless. */
+    private const MAX_REPORTED_FAILURES = 100;
+
     public function __construct(
         public readonly string $jobId,
         public readonly string $attemptId,
         public readonly int $attemptNumber,
         private readonly ?Closure $stopSignal = null,
+        public readonly ?string $batchId = null,
     ) {
+    }
+
+    /**
+     * How this job's batch stands RIGHT NOW: the transactional progress counters
+     * plus the members that ended non-success (failed/canceled/stopped, capped at
+     * MAX_REPORTED_FAILURES, newest last). Null for a standalone job.
+     *
+     * This is what makes a finalizer — a member joined by a `dependsOnCompletion`
+     * edge — useful: running after failure is only worth anything if the handler
+     * can see WHAT failed. The read is live, so a finalizer spared by a fail_fast
+     * sweep sees the cancellations that sweep just made, and a batch that already
+     * reached a terminal verdict reports it in `state`.
+     *
+     * The caller's own job is included in the counters (as `running`) — it is a
+     * member like any other.
+     *
+     * @return array{id:string, name:?string, state:string, failure_policy:string,
+     *               counts:array<string,int>,
+     *               failures:list<array{id:string, name:?string, job_class:string, state:string, error:?string}>}|null
+     */
+    public function batch(): ?array
+    {
+        if ($this->batchId === null) {
+            return null;
+        }
+
+        $conn = DB::connection(config('jobwarden.connection'));
+        $prefix = (string) config('jobwarden.table_prefix');
+
+        $batch = $conn->table($prefix.'batches')->where('id', $this->batchId)->first();
+        if ($batch === null) {
+            return null;
+        }
+
+        $failures = $conn->table($prefix.'jobs')
+            ->where('batch_id', $this->batchId)
+            ->whereIn('state', ['failed', 'canceled', 'stopped'])
+            ->orderBy('finished_at')
+            ->orderBy('id')
+            ->limit(self::MAX_REPORTED_FAILURES)
+            ->get(['id', 'name', 'job_class', 'state', 'cancel_reason', 'last_error'])
+            ->map(static function (object $job): array {
+                $error = json_decode((string) ($job->last_error ?? ''), true);
+
+                return [
+                    'id' => (string) $job->id,
+                    'name' => $job->name,
+                    'job_class' => $job->job_class,
+                    'state' => $job->state,
+                    // The failure's message, or the verdict that canceled it.
+                    'error' => is_array($error) ? ($error['message'] ?? null) : ($job->cancel_reason ?: null),
+                ];
+            })
+            ->all();
+
+        return [
+            'id' => (string) $batch->id,
+            'name' => $batch->name,
+            'state' => $batch->state,
+            'failure_policy' => $batch->failure_policy,
+            'counts' => [
+                'total' => (int) $batch->total_jobs,
+                'pending' => (int) $batch->pending_count,
+                'running' => (int) $batch->running_count,
+                'succeeded' => (int) $batch->succeeded_count,
+                // `stopped` members roll into canceled_count (JobStateBuckets).
+                'failed' => (int) $batch->failed_count,
+                'canceled' => (int) $batch->canceled_count,
+            ],
+            'failures' => $failures,
+        ];
     }
 
     /**

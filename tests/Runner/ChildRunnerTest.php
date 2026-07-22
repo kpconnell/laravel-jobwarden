@@ -4,14 +4,17 @@ declare(strict_types=1);
 
 namespace JobWarden\Tests\Runner;
 
+use JobWarden\Models\Batch;
 use JobWarden\Models\Job;
 use JobWarden\Models\JobAttempt;
 use JobWarden\Runner\ChildRunner;
 use JobWarden\Runner\ExitCode;
 use JobWarden\States\AttemptState;
+use JobWarden\States\BatchState;
 use JobWarden\States\JobState;
 use JobWarden\Tests\Concerns\RefreshesJobWardenSchema;
 use JobWarden\Tests\TestCase;
+use Workbench\App\Jobs\BatchAwareJob;
 use Workbench\App\Jobs\FailingJob;
 use Workbench\App\Jobs\MarkerJob;
 use Workbench\App\Jobs\ResultJob;
@@ -52,6 +55,40 @@ final class ChildRunnerTest extends TestCase
         $this->assertSame(JobState::Succeeded, Job::find($job->id)->state);
         $this->assertStringStartsWith('done:', (string) @file_get_contents($marker));
         $this->assertNull(Job::find($job->id)->result, 'a handler that never calls result() leaves it null');
+    }
+
+    public function test_a_batch_members_context_carries_its_batch(): void
+    {
+        // The ONLY wiring between a real member and JobContext::batch(): without
+        // it every finalizer sees null and the feature is dead in production
+        // while a hand-constructed JobContext test still passes.
+        $batch = Batch::create([
+            'name' => 'nightly-sync',
+            'state' => BatchState::Running,
+            'failure_policy' => 'continue',
+            'total_jobs' => 1,
+            'running_count' => 1,
+        ]);
+        [$job, $attempt] = $this->dispatched(BatchAwareJob::class, [], idempotent: true, batchId: $batch->id);
+
+        $this->assertSame(ExitCode::SUCCESS, $this->runner()->run($attempt->id, 1, 'n'));
+
+        $result = Job::find($job->id)->result;
+        $this->assertSame((string) $batch->id, $result['batch_id']);
+        $this->assertSame('nightly-sync', $result['batch']['name']);
+        $this->assertSame('continue', $result['batch']['failure_policy']);
+        $this->assertSame(1, $result['batch']['counts']['running'], 'the member reads its batch mid-run');
+    }
+
+    public function test_a_standalone_job_has_no_batch_in_its_context(): void
+    {
+        [$job, $attempt] = $this->dispatched(BatchAwareJob::class, [], idempotent: true);
+
+        $this->assertSame(ExitCode::SUCCESS, $this->runner()->run($attempt->id, 1, 'n'));
+
+        $result = Job::find($job->id)->result;
+        $this->assertNull($result['batch_id']);
+        $this->assertNull($result['batch']);
     }
 
     public function test_result_set_by_the_handler_commits_with_success(): void
@@ -266,10 +303,11 @@ final class ChildRunnerTest extends TestCase
     }
 
     /** @return array{0: Job, 1: JobAttempt} */
-    private function dispatched(string $jobClass, array $params, bool $idempotent, int $maxAttempts = 1): array
+    private function dispatched(string $jobClass, array $params, bool $idempotent, int $maxAttempts = 1, ?string $batchId = null): array
     {
         $job = Job::create([
             'job_class' => $jobClass,
+            'batch_id' => $batchId,
             'state' => JobState::Running,
             'params' => $params,
             'idempotent' => $idempotent,

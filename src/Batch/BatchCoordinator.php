@@ -57,6 +57,20 @@ final class BatchCoordinator
      */
     private const UNREACHABLE_REASON = 'unreachable: an upstream dependency did not succeed';
 
+    /**
+     * Batch states in which a member canceled as unreachable may be revived —
+     * the EXACT inverse of the states strandedMemberIds() cancels in, and it
+     * must stay that way. `failed` belongs here for the same reason it belongs
+     * there: an eagerly-failed batch keeps its spared finalizer subtree in
+     * flight, so a retried member inside that subtree has to be able to bring
+     * its own dependents back. Cancel reachable but revive not would strand
+     * them permanently, on a batch whose tripped policy stops it reopening.
+     */
+    private static function acceptsRevival(BatchState $state): bool
+    {
+        return in_array($state, [BatchState::Running, BatchState::Failed], true);
+    }
+
     public function __construct(private readonly StateMachine $stateMachine)
     {
     }
@@ -84,7 +98,7 @@ final class BatchCoordinator
             // dependents its doom canceled back to waiting on it. Each revival
             // cascades transitively via its own event.
             $this->reopenBatch($batch);
-            if (! $batch->state->isTerminal()) {
+            if (self::acceptsRevival($batch->state)) {
                 $this->reviveUnreachableDependents($event->job->id, $batch);
             }
 
@@ -92,14 +106,17 @@ final class BatchCoordinator
         }
 
         if ($batch->state->isTerminal()) {
-            // A terminal batch can still have members in flight — a finalizer
-            // subtree the eager sweep spared, or a running member whose
-            // supervisor hasn't honored its cancel flag yet. The batch verdict
-            // is settled, but the DAG rules INSIDE those members still apply:
-            // without this, a dependent of a failed finalizer would sit pending
-            // forever behind an upstream that can never succeed, on a batch
-            // nothing will ever complete again.
-            if (in_array($event->to, self::DOOMED, true)) {
+            // `failed` ONLY: that is the one terminal state that can still have
+            // members in flight, because the eager sweep spared a finalizer
+            // subtree. The verdict is settled but the DAG rules INSIDE that
+            // subtree still apply — without this a dependent of a failed
+            // finalizer would sit pending forever on a batch nothing will ever
+            // complete again. Every other terminal state is excluded on
+            // purpose: cancel/stop already cancel every member, so the cascade
+            // would find nothing to do and would only re-walk the whole graph
+            // one synchronous event-recursion per edge (measured: +66% queries
+            // and recursion to chain depth on a cancelBatch of a long chain).
+            if ($batch->state === BatchState::Failed && in_array($event->to, self::DOOMED, true)) {
                 $this->cancelUnreachableDependents($event->job->id, $batch);
             }
 
@@ -415,7 +432,7 @@ final class BatchCoordinator
                     ->where('id', $job->batch_id)
                     ->lockForUpdate()
                     ->value('state');
-                if ($batchState !== BatchState::Running->value) {
+                if ($batchState === null || ! self::acceptsRevival(BatchState::from($batchState))) {
                     return;
                 }
 
@@ -557,9 +574,10 @@ final class BatchCoordinator
     }
 
     /**
-     * Members of running batches still canceled by the unreachable-cascade even
+     * Members of live batches still canceled by the unreachable-cascade even
      * though no doomed upstream remains — the revival event that should have
-     * restored them was lost. The inverse of strandedMemberIds().
+     * restored them was lost. The inverse of strandedMemberIds(), and its batch
+     * states must match it exactly (see acceptsRevival).
      *
      * @return string[]
      */
@@ -569,7 +587,7 @@ final class BatchCoordinator
 
         return $this->connection()->table($this->tbl('jobs').' as j')
             ->join($this->tbl('batches').' as b', 'b.id', '=', 'j.batch_id')
-            ->where('b.state', BatchState::Running->value)
+            ->whereIn('b.state', [BatchState::Running->value, BatchState::Failed->value])
             ->where('j.state', JobState::Canceled->value)
             ->where('j.cancel_reason', self::UNREACHABLE_REASON)
             ->whereNotExists(function ($q) use ($doomed): void {

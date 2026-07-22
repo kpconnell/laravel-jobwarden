@@ -260,7 +260,57 @@ final class BatchCompletionEdgeTest extends TestCase
         $this->assertSame(JobState::Pending, $this->member($batch, 'JobJoin')->state, 'revived: only u1 doomed it');
     }
 
+    public function test_retrying_a_failed_finalizer_revives_the_tail_it_doomed(): void
+    {
+        // The spared subtree is live work on a batch that can NEVER reopen (the
+        // fail_fast policy is still tripped). Cancellation reaches into it, so
+        // revival must too — otherwise the tail is stranded canceled forever.
+        $batch = $this->jobwarden()->batch('ff', 'fail_fast')
+            ->add('a', 'JobA')
+            ->add('cleanup', 'JobCleanup', dependsOnCompletion: ['a'])
+            ->add('notify', 'JobNotify', dependsOn: ['cleanup'])
+            ->dispatch();
+
+        $this->complete($this->member($batch, 'JobA'), JobState::Failed);
+        $this->admit();
+        $this->complete($this->member($batch, 'JobCleanup'), JobState::Failed);
+        $this->assertSame(JobState::Canceled, $this->member($batch, 'JobNotify')->state);
+
+        $this->app->make(OperatorActions::class)->retry($this->member($batch, 'JobCleanup'), 'retry cleanup', 'op-1');
+
+        $this->assertSame(BatchState::Failed, $batch->refresh()->state, 'the batch verdict still stands');
+        $this->assertSame(JobState::Pending, $this->member($batch, 'JobNotify')->state, 'revived with its upstream');
+
+        $this->complete($this->member($batch, 'JobCleanup'), JobState::Succeeded);
+        $this->admit();
+        $this->assertSame(JobState::Queued, $this->member($batch, 'JobNotify')->state, 'and the tail runs');
+    }
+
     // -- the event-loss backstop -------------------------------------------
+
+    public function test_reconcile_revives_a_finalizer_tail_on_a_failed_batch(): void
+    {
+        // The same rule through the backstop: revivableMemberIds must reach the
+        // spared subtree of a failed batch, exactly as strandedMemberIds does.
+        $batch = $this->jobwarden()->batch('ff', 'fail_fast')
+            ->add('a', 'JobA')
+            ->add('cleanup', 'JobCleanup', dependsOnCompletion: ['a'])
+            ->add('notify', 'JobNotify', dependsOn: ['cleanup'])
+            ->dispatch();
+
+        $this->complete($this->member($batch, 'JobA'), JobState::Failed);
+        $this->admit();
+        $this->complete($this->member($batch, 'JobCleanup'), JobState::Failed);
+        $this->assertSame(JobState::Canceled, $this->member($batch, 'JobNotify')->state);
+
+        $this->loseBatchEvents();
+        $this->app->make(OperatorActions::class)->retry($this->member($batch, 'JobCleanup'), 'retry cleanup', 'op-1');
+        $this->assertSame(JobState::Canceled, $this->member($batch, 'JobNotify')->state, 'the revival event was lost');
+
+        $this->coordinator()->reconcile();
+
+        $this->assertSame(JobState::Pending, $this->member($batch, 'JobNotify')->state);
+    }
 
     public function test_reconcile_does_not_strand_a_completion_dependent(): void
     {

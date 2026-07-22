@@ -287,6 +287,53 @@ proceeds from the idempotency guard as usual. Correctness never depends on the
 handler checking it. Set `max_runtime_sec` so a hung run is reaped rather than
 trusted forever.
 
+## Events
+
+JobWarden emits three plain Laravel events. Registration is ordinary Laravel —
+there is no JobWarden-specific hook to install:
+
+```php
+use Illuminate\Support\Facades\Event;
+use JobWarden\Events\BatchStateChanged;
+
+Event::listen(BatchStateChanged::class, function (BatchStateChanged $event): void {
+    if ($event->to->isTerminal()) {
+        Slack::notify("batch {$event->batch->name} finished {$event->to->value}");
+    }
+});
+```
+
+A listener class registered in your `EventServiceProvider` works the same way.
+The package itself consumes `JobStateChanged` exactly like this — see
+`JobWardenServiceProvider`, which registers `BatchCoordinator::onJobStateChanged`.
+
+| Event | Payload |
+| --- | --- |
+| `JobWarden\Events\JobStateChanged` | `$job` (Job), `$from`, `$to` (JobState), `$context` (TransitionContext: `actorType`, `actorId`, `reason`), `$eventId` (the `job_events` row id) |
+| `JobWarden\Events\AttemptStateChanged` | `$attempt` (JobAttempt), `$from`, `$to` (AttemptState), `$context`, `$eventId` |
+| `JobWarden\Events\BatchStateChanged` | `$batch` (Batch), `$from`, `$to` (BatchState), `$reason` (nullable string) |
+
+**They fire after commit.** The state machine dispatches through the connection's
+`afterCommit` hook, so a listener never observes a transition that later rolls
+back. It also means the listener runs **inline on the committing process**,
+synchronously — a slow listener slows the worker that made the transition, and a
+listener that throws propagates into that process. Queue your own work
+(`ShouldQueue`, or dispatch a JobWarden job) rather than doing anything expensive
+in the handler body.
+
+**An event can be lost.** A process that dies between the commit and the listener
+never delivers it, and nothing replays it. Everything JobWarden itself derives
+from these events is also re-derivable from durable state by the reaper's
+reconcile sweep — that is why the sweep exists. Your listener has no such
+backstop, so treat it as best-effort: metrics, notifications, cache busting. Do
+not put anything load-bearing behind one.
+
+> **Prefer a batch member over a listener.** If the work is "run something when
+> this batch finishes", express it in the graph with `dependsOnCompletion` (see
+> Batches in the README) rather than in a `BatchStateChanged` listener. A member
+> gets retries, attempt tracking, artifacts, cancellation, and reaper
+> reconciliation; a listener gets none of them and is dropped on process death.
+
 ## Dispatching reference
 
 ### `JobClass::dispatch(...)` — the Dispatchable trait

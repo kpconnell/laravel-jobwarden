@@ -48,7 +48,7 @@ class JobWarden
     /** Start building a batch (fan-out / chain / DAG) — see BatchBuilder. */
     public function batch(string $name, string $failurePolicy = 'continue', ?int $failureThreshold = null, string $type = 'batch'): BatchBuilder
     {
-        return new BatchBuilder($name, $failurePolicy, $failureThreshold, $type);
+        return new BatchBuilder($name, $failurePolicy, $failureThreshold, $type, $this->batchCoordinator);
     }
 
     /** Cancel a batch — propagates to every non-terminal member (spec §8.3). */
@@ -150,20 +150,49 @@ class JobWarden
 
     /**
      * Create a job. Eligible immediately → `queued`; gated by a future
-     * available_at → `pending` (the admit pass promotes it when due).
+     * available_at or a cross-batch dependency → `pending` (the admit pass
+     * promotes it when due/satisfied).
      *
      * @param  array<string,mixed>  $params
      * @param  array<string,mixed>  $options  idempotent, max_attempts, priority,
      *                                         delay (seconds), available_at,
      *                                         backoff_strategy, max_runtime_sec,
      *                                         name, idempotency_key, tags,
-     *                                         batch_id, created_by
+     *                                         batch_id, created_by,
+     *                                         depends_on_batches,
+     *                                         depends_on_batch_completion
      */
     public function dispatch(string $jobClass, array $params = [], array $options = []): Job
     {
         // Validate explicit tags BEFORE the transaction — a bad tag is the
         // dispatcher's bug and must fail loudly at the dispatch site.
         $tags = TagWriter::assertValid($options['tags'] ?? null);
+
+        // Cross-batch deps: `depends_on_batches` requires each upstream batch to
+        // reach `succeeded` (strictly — partial dooms); `depends_on_batch_completion`
+        // requires terminal AND quiescent. Same one-edge-one-condition rule as
+        // BatchBuilder. Ids are validated inside the transaction below.
+        // A bare Batch model is wrapped rather than (array)-cast — the cast would
+        // iterate its property bag and yield garbage ids.
+        $successRefs = $options['depends_on_batches'] ?? [];
+        $completionRefs = $options['depends_on_batch_completion'] ?? [];
+        $batchDeps = [];
+        foreach (($successRefs instanceof Batch ? [$successRefs] : (array) $successRefs) as $ref) {
+            $batchDeps[$ref instanceof Batch ? (string) $ref->id : (string) $ref] = 'on_success';
+        }
+        foreach (($completionRefs instanceof Batch ? [$completionRefs] : (array) $completionRefs) as $ref) {
+            $id = $ref instanceof Batch ? (string) $ref->id : (string) $ref;
+            if (($batchDeps[$id] ?? null) === 'on_success') {
+                throw new \InvalidArgumentException(
+                    "Batch '{$id}' listed under both depends_on_batches and depends_on_batch_completion"
+                    .' — an edge carries one condition.'
+                );
+            }
+            $batchDeps[$id] = 'on_completion';
+        }
+        if (isset($options['batch_id'], $batchDeps[(string) $options['batch_id']])) {
+            throw new \InvalidArgumentException('A job cannot depend on the batch it is dispatched into.');
+        }
 
         $conn = DB::connection(config('jobwarden.connection'));
 
@@ -177,9 +206,28 @@ class JobWarden
             isset($options['available_at']) => (int) ceil(SqlTime::now($conn)->diffInSeconds(Carbon::parse($options['available_at']), false)),
             default => 0,
         };
-        $eligible = $delaySeconds <= 0;
+        // Batch deps gate eligibility even when every upstream already succeeded
+        // — one admit-tick of latency beats a TOCTOU check (see BatchBuilder).
+        $eligible = $delaySeconds <= 0 && $batchDeps === [];
 
-        return $conn->transaction(function () use ($conn, $jobClass, $params, $options, $tags, $eligible, $delaySeconds): Job {
+        $job = $conn->transaction(function () use ($conn, $jobClass, $params, $options, $tags, $eligible, $delaySeconds, $batchDeps): Job {
+            // Validate the referenced batches BEFORE creating anything — an
+            // unknown id is the dispatcher's bug and must fail with no row.
+            $prefix = (string) config('jobwarden.table_prefix');
+            if ($batchDeps !== []) {
+                $known = $conn->table($prefix.'batches')
+                    ->whereIn('id', array_keys($batchDeps))
+                    ->pluck('id')
+                    ->map(static fn ($id): string => (string) $id)
+                    ->all();
+                $missing = array_diff(array_keys($batchDeps), $known);
+                if ($missing !== []) {
+                    throw new \InvalidArgumentException(
+                        "Job depends on unknown batch '".implode("', '", $missing)."'."
+                    );
+                }
+            }
+
             $job = Job::create([
                 'job_class' => $jobClass,
                 'name' => $options['name'] ?? null,
@@ -200,6 +248,14 @@ class JobWarden
 
             TagWriter::write($job, $tags);
 
+            foreach ($batchDeps as $batchId => $condition) {
+                $conn->table($prefix.'job_batch_dependencies')->insert([
+                    'job_id' => $job->id,
+                    'depends_on_batch_id' => $batchId,
+                    'edge_condition' => $condition,
+                ]);
+            }
+
             // Stamp the DB-clock timestamps via the query builder (Eloquent's datetime cast
             // rejects a raw CURRENT_TIMESTAMP, and a stored Carbon would be re-serialized in
             // the app timezone). available_at = now (or now + delay); queued_at = now if it
@@ -213,5 +269,17 @@ class JobWarden
 
             return $job->refresh();
         });
+
+        // Ergonomic fast path, NOT load-bearing: an already-doomed upstream
+        // cancels this job now instead of on the reaper's next stranded sweep —
+        // which remains the correctness guarantee for any race this read loses.
+        foreach (array_keys($batchDeps) as $upstreamId) {
+            $upstream = Batch::find($upstreamId);
+            if ($upstream !== null) {
+                $this->batchCoordinator->cancelBatchDependents($upstream);
+            }
+        }
+
+        return $job;
     }
 }

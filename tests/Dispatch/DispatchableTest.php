@@ -6,6 +6,7 @@ namespace JobWarden\Tests\Dispatch;
 
 use JobWarden\Contracts\JobWardenJob;
 use JobWarden\Dispatch\Dispatchable;
+use JobWarden\JobWarden;
 use JobWarden\Models\Job;
 use JobWarden\Models\Worker;
 use JobWarden\Runner\JobContext;
@@ -156,6 +157,22 @@ final class DispatchableTest extends TestCase
         $this->assertSame(['cadence' => 'nightly', 'team' => 'reports'], $job->tags->sortBy('name')->pluck('value', 'name')->all());
         $this->assertSame('fixed', $job->backoff_strategy);
         $this->assertSame('tester', $job->created_by);
+    }
+
+    public function test_the_builder_gates_on_batches(): void
+    {
+        $upstream = $this->app->make(JobWarden::class)->batch('up')->add('u', 'JobU')->dispatch();
+
+        $strict = TraitedJob::dependsOnBatches([$upstream])->dispatch('store-1');
+        $finally = TraitedJob::dependsOnBatchCompletion([$upstream])->dispatch('store-2');
+
+        $this->assertSame(JobState::Pending, $strict->state, 'gated, not queued');
+        $this->assertSame(JobState::Pending, $finally->state);
+
+        $edges = $this->jobwarden()->table($this->tbl('job_batch_dependencies'))
+            ->pluck('edge_condition', 'job_id');
+        $this->assertSame('on_success', $edges[(string) $strict->id]);
+        $this->assertSame('on_completion', $edges[(string) $finally->id]);
     }
 
     public function test_delay_in_seconds_gates_the_job_as_pending(): void

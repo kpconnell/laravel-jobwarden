@@ -1356,6 +1356,22 @@ components:
               type: array
               items:
                 $ref: "#/components/schemas/Job"
+            upstream_batches:
+              type: array
+              description: Cross-batch dependencies — upstream batches this batch's members wait on, deduped across the root members carrying the edges.
+              items:
+                type: object
+                properties:
+                  id:
+                    type: string
+                    format: uuid
+                  name:
+                    type: [string, "null"]
+                  state:
+                    $ref: "#/components/schemas/BatchState"
+                  edge_condition:
+                    type: string
+                    enum: [on_success, on_completion]
 
     Schedule:
       type: object

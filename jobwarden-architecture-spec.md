@@ -391,6 +391,20 @@ A job is admitted (`pending → queued`) only when **all** `depends_on` jobs are
 
 The predicate is evaluated in two places that must agree: the `DepsSatisfiedGuard` on the transition itself, and the admit pass's window query (which pre-filters candidate rows so a dep-blocked backlog cannot monopolize the LIMIT).
 
+### 4.11 `job_batch_dependencies` (cross-batch DAG edges)
+```
+job_id              uuid fk -> jobs
+depends_on_batch_id uuid fk -> batches
+edge_condition      varchar(16) default 'on_success'   -- on_success | on_completion
+PRIMARY KEY (job_id, depends_on_batch_id)
+```
+The cross-batch analogue of §4.10: a job gated on a whole **batch**. The conditions mirror the member-level ones with one deliberate strengthening:
+
+- **`on_success`** — the upstream batch must reach `succeeded`, strictly: `partial` dooms like `failed`/`canceled`/`stopped`. A doomed dependent is canceled as unreachable (its own cascade reason, distinct from the job-edge one) and revived if the upstream batch reopens.
+- **`on_completion`** — the upstream batch must be terminal **and quiescent** (`pending_count + running_count = 0`). Terminal alone is not enough: an eagerly-failed batch keeps its spared finalizer subtree (§8.3) in flight, and "run after that batch" must wait for that work to drain. `succeeded` is quiescent by construction.
+
+Edges are written by `BatchBuilder` (the batch-level declaration fans down to the batch's **root** members, so doom/revive propagates through the ordinary intra-batch cascade and `finally` members keep their contract) and by `JobWarden::dispatch` for standalone jobs. Dependencies may only reference already-dispatched batches, so cross-batch cycles are impossible by construction. The same two admission sites as §4.10 carry the predicate's SQL twin; the coordinator's doom/revive cascades and two dedicated reconcile passes (stranded and revivable cross-batch dependents) carry the failure-path twins.
+
 ---
 
 ## 5. Coordination & Concurrency
@@ -583,6 +597,18 @@ An **eager** policy (`fail_fast`, `threshold`) is the exception: its sweep spare
 
 ### 8.4 Retryable steps
 Per-job `max_attempts`/`idempotent`/`backoff` apply within a batch exactly as for standalone jobs; a transient step failure retries without failing the batch, subject to the batch policy.
+
+### 8.5 Cross-batch dependencies
+A batch (or standalone job) can wait on other, already-dispatched batches: `dependsOnBatches` (upstreams must reach `succeeded`, strictly) and `dependsOnBatchCompletion` (terminal and quiescent) on the builder; `depends_on_batches` / `depends_on_batch_completion` options on `dispatch()`. Edges live in `job_batch_dependencies` (§4.11), fanned down to the dependent batch's root members at dispatch.
+
+Runtime behavior is the batch-level mirror of the member-level machinery:
+
+- **Admission** is pull-based — the same guard/admit-window pair evaluates the batch predicate; nothing pushes work when an upstream completes.
+- **Doom** — when a batch's terminal transition lands on anything but `succeeded`, the coordinator synchronously cancels cross-batch success-edge dependents (their own reason string), and each canceled root re-enters the intra-batch cascade, so a chain of batches dooms hop by hop and each dependent batch settles `partial`.
+- **Revival** — when a doomed upstream reopens (§8.3 re-entry), the coordinator revives dependents it doomed — reopening a completed dependent batch first — provided no other doomed upstream (job or batch) remains. Operator cancel verdicts are never undone.
+- **Backstop** — two reconcile passes re-derive lost doom/revive events from durable state, ordered with the existing sweep so one pass converges one hop of a chain.
+
+Dispatch against an already-doomed upstream is legal (the work is doomed immediately after commit — or by the sweep, which is the correctness guarantee for the race); dispatch against an unknown batch id throws.
 
 ---
 

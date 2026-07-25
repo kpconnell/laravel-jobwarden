@@ -4,6 +4,34 @@ All notable changes to `laravel-jobwarden` are documented here. The format follo
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.14.0] - 2026-07-25
+
+### Added
+- **Cross-batch dependencies — a batch (or job) gated on other batches.** A new
+  `jobwarden_job_batch_dependencies` table holds job → batch edges with the same two
+  conditions as member-level edges. `BatchBuilder::dependsOnBatches([...])` requires every
+  referenced (already-dispatched) batch to reach **`succeeded`** — strictly: `partial`
+  dooms like `failed`/`canceled`/`stopped`. `dependsOnBatchCompletion([...])` is the
+  cross-batch `finally`: satisfied once the upstream is terminal **and quiescent**, i.e.
+  an eagerly-failed upstream's spared finalizer subtree has drained too. Standalone jobs
+  use the `depends_on_batches` / `depends_on_batch_completion` dispatch options (or the
+  same-named `PendingJob` builder methods). Because dependencies reference batches that
+  already exist, cross-batch cycles are impossible by construction.
+
+  The batch-level declaration fans down to the dependent batch's **root** members, so the
+  failure path is the ordinary machinery one level up: a doomed upstream cancels the roots
+  as unreachable (a dedicated cancel reason names the batch cascade), the intra-batch
+  cascade dooms their `on_success` descendants while sparing `finally` members, and each
+  dependent batch settles `partial` — hop by hop through chains of batches. Reopening a
+  repaired upstream revives everything its doom canceled, reopening completed dependent
+  batches along the way; operator cancel verdicts are never undone. Two new reconcile
+  passes re-derive lost doom/revive events, so the guarantees hold across crashes.
+  `GET /batches/{id}` now lists `upstream_batches`.
+
+### Upgrading
+Run `php artisan migrate`. The new table is only written when the new API surface is used;
+existing batches and jobs change in no way on upgrade.
+
 ## [1.13.0] - 2026-07-22
 
 ### Added

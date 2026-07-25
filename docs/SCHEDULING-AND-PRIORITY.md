@@ -111,7 +111,10 @@ facts worth knowing:
   (they simply wait in `queued`).
 - Dependency-blocked `pending` rows are excluded from the window entirely, so
   a long chain's blocked members can't monopolize the LIMIT and starve an
-  eligible successor sorted past it.
+  eligible successor sorted past it. This covers both edge kinds: job
+  dependencies and cross-batch dependencies (`job_batch_dependencies` — a job
+  gated on a whole upstream batch reaching `succeeded`, or terminal-and-
+  quiescent for a completion edge).
 
 ## Lanes: partitions, not priority tiers
 
@@ -165,7 +168,7 @@ SQLite always support them).
 | `priority` | ordering | strict, intra-lane, claim + admission |
 | `created_at` | ordering | in-band FIFO at claim; survives retries |
 | `available_at` | gate | not claimable/admittable before this; never a sort key at claim |
-| dependencies | gate | `pending` until every dependency `succeeded` |
+| dependencies | gate | `pending` until every job/batch upstream satisfies its edge condition |
 | backoff | gate | pushes `available_at` on retry |
 | lane | partition | which fleet may claim it, ever |
 | capacity / poll cadence | throughput | claim latency, never order |

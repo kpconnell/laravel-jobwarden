@@ -27,12 +27,62 @@ final class BatchBuilder
     /** @var array<string, array{jobClass:string, params:array, dependsOn:string[], dependsOnCompletion:string[], options:array}> */
     private array $specs = [];
 
+    /** @var array<string, string> upstream batch id => on_success|on_completion */
+    private array $batchDeps = [];
+
     public function __construct(
         private readonly string $name,
         private readonly string $failurePolicy = 'continue',
         private readonly ?int $failureThreshold = null,
         private readonly string $type = 'batch',
+        private readonly ?BatchCoordinator $coordinator = null,
     ) {
+    }
+
+    /**
+     * Gate every ROOT member on ALREADY-DISPATCHED upstream batches reaching
+     * `succeeded` — strictly: `partial` dooms just like failed/canceled/stopped.
+     * A doomed root is canceled as unreachable (and revived if the upstream
+     * batch reopens); non-roots follow transitively through the intra-batch DAG,
+     * so `finally` members still run. Cycles are impossible by construction —
+     * an upstream must already exist when this batch is dispatched.
+     *
+     * @param  array<Batch|string>  $batches  batch models or ids
+     */
+    public function dependsOnBatches(array $batches): self
+    {
+        return $this->recordBatchDeps($batches, 'on_success');
+    }
+
+    /**
+     * Cross-batch `finally`: gate the roots on the upstream batches merely
+     * FINISHING — terminal whatever the verdict, and quiescent (a failed
+     * upstream's spared finalizer subtree must drain first). Never doomed by
+     * the upstream's outcome.
+     *
+     * @param  array<Batch|string>  $batches  batch models or ids
+     */
+    public function dependsOnBatchCompletion(array $batches): self
+    {
+        return $this->recordBatchDeps($batches, 'on_completion');
+    }
+
+    /** @param  array<Batch|string>  $batches */
+    private function recordBatchDeps(array $batches, string $condition): self
+    {
+        foreach ($batches as $batch) {
+            $id = $batch instanceof Batch ? (string) $batch->id : (string) $batch;
+            // One edge, one condition — same rule as the member-level lists.
+            if (($this->batchDeps[$id] ?? $condition) !== $condition) {
+                throw new RuntimeException(
+                    "batch '{$this->name}': upstream batch '{$id}' listed under both dependsOnBatches"
+                    .' and dependsOnBatchCompletion — an edge carries one condition'
+                );
+            }
+            $this->batchDeps[$id] = $condition;
+        }
+
+        return $this;
     }
 
     /**
@@ -72,6 +122,14 @@ final class BatchBuilder
             }
         }
 
+        // A memberless batch has no roots to carry the edges — the declaration
+        // would silently evaporate. Reject it rather than half-honoring it.
+        if ($this->batchDeps !== [] && $this->specs === []) {
+            throw new RuntimeException(
+                "batch '{$this->name}': declares batch dependencies but has no members to gate"
+            );
+        }
+
         $this->assertAcyclic();
 
         // Validate every member's explicit tags BEFORE the transaction — a bad
@@ -84,7 +142,25 @@ final class BatchBuilder
         $conn = DB::connection(config('jobwarden.connection'));
         $prefix = (string) config('jobwarden.table_prefix');
 
-        return $conn->transaction(function () use ($conn, $prefix, $tagsByKey): Batch {
+        $batch = $conn->transaction(function () use ($conn, $prefix, $tagsByKey): Batch {
+            // Cross-batch deps reference batches that must already exist — an
+            // unknown id is the dispatcher's bug and fails the whole dispatch,
+            // creating nothing. An already-terminal upstream is fine: succeeded
+            // reads as satisfied, doomed is handled after commit / by the sweep.
+            if ($this->batchDeps !== []) {
+                $known = $conn->table($prefix.'batches')
+                    ->whereIn('id', array_keys($this->batchDeps))
+                    ->pluck('id')
+                    ->map(static fn ($id): string => (string) $id)
+                    ->all();
+                $missing = array_diff(array_keys($this->batchDeps), $known);
+                if ($missing !== []) {
+                    throw new RuntimeException(
+                        "batch '{$this->name}': depends on unknown batch '".implode("', '", $missing)."'"
+                    );
+                }
+            }
+
             $batch = Batch::create([
                 'name' => $this->name,
                 'type' => $this->type,
@@ -116,7 +192,10 @@ final class BatchBuilder
                 $delaySeconds = isset($spec['options']['available_at'])
                     ? (int) ceil($dbNow->diffInSeconds(Carbon::parse($spec['options']['available_at']), false))
                     : 0;
-                $eligible = self::upstreams($spec) === [] && $delaySeconds <= 0;
+                // Batch deps gate the roots too — even against an upstream that
+                // already succeeded (one admit-tick of latency beats a TOCTOU
+                // check whose answer can be stale by commit time).
+                $eligible = self::upstreams($spec) === [] && $delaySeconds <= 0 && $this->batchDeps === [];
                 $job = Job::create([
                     'batch_id' => $batch->id,
                     'job_class' => $spec['jobClass'],
@@ -156,8 +235,45 @@ final class BatchBuilder
                 }
             }
 
+            // Fan the batch-level deps down to the ROOTS only: a doomed upstream
+            // batch cancels the roots, and the ordinary intra-batch cascade dooms
+            // their on_success descendants while sparing `finally` members —
+            // exactly as if the upstream batch were a virtual upstream of every
+            // root. Fanning to ALL members would cancel the finalizers too and
+            // break the finally contract.
+            if ($this->batchDeps !== []) {
+                foreach ($this->specs as $key => $spec) {
+                    if (self::upstreams($spec) !== []) {
+                        continue;
+                    }
+                    foreach ($this->batchDeps as $batchId => $condition) {
+                        $conn->table($prefix.'job_batch_dependencies')->insert([
+                            'job_id' => $ids[$key],
+                            'depends_on_batch_id' => $batchId,
+                            'edge_condition' => $condition,
+                        ]);
+                    }
+                }
+            }
+
             return $batch;
         });
+
+        // Ergonomic fast path, NOT load-bearing: an upstream that was already
+        // (or just went) terminal-not-succeeded dooms the fresh dependents now
+        // instead of on the reaper's next stranded sweep — which remains the
+        // correctness guarantee for any race this read loses.
+        if ($this->batchDeps !== []) {
+            $coordinator = $this->coordinator ?? app(BatchCoordinator::class);
+            foreach (array_keys($this->batchDeps) as $upstreamId) {
+                $upstream = Batch::find($upstreamId);
+                if ($upstream !== null) {
+                    $coordinator->cancelBatchDependents($upstream);
+                }
+            }
+        }
+
+        return $batch;
     }
 
     /**

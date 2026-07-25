@@ -24,6 +24,25 @@ final class OperatorApiTest extends TestCase
         JobWarden::auth(fn ($request) => true); // allow in tests
     }
 
+    public function test_batch_detail_lists_its_upstream_batches(): void
+    {
+        $jw = $this->app->make(JobWarden::class);
+        $up = $jw->batch('etl-up')->add('u', 'JobU')->dispatch();
+        $down = $jw->batch('report')->dependsOnBatches([$up])->add('w', 'JobW')->dispatch();
+
+        $this->getJson("jobwarden/api/batches/{$down->id}")
+            ->assertOk()
+            ->assertJsonCount(1, 'upstream_batches')
+            ->assertJsonPath('upstream_batches.0.id', (string) $up->id)
+            ->assertJsonPath('upstream_batches.0.name', 'etl-up')
+            ->assertJsonPath('upstream_batches.0.state', 'running')
+            ->assertJsonPath('upstream_batches.0.edge_condition', 'on_success');
+
+        $this->getJson("jobwarden/api/batches/{$up->id}")
+            ->assertOk()
+            ->assertJsonCount(0, 'upstream_batches');
+    }
+
     public function test_the_gate_blocks_unauthorized_requests(): void
     {
         JobWarden::auth(fn ($request) => false);

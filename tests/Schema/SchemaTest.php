@@ -26,7 +26,8 @@ final class SchemaTest extends TestCase
 
         foreach ([
             'batches', 'schedules', 'workers', 'jobs', 'job_attempts', 'job_events',
-            'job_logs', 'job_artifacts', 'schedule_runs', 'job_dependencies', 'leader_leases',
+            'job_logs', 'job_artifacts', 'schedule_runs', 'job_dependencies',
+            'job_batch_dependencies', 'leader_leases',
         ] as $t) {
             $this->assertTrue($schema->hasTable($this->tbl($t)), "missing table {$t}");
         }

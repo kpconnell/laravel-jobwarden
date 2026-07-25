@@ -31,9 +31,9 @@ trait RefreshesJobWardenSchema
 
         // Child-before-parent ordering for the non-cascading engines.
         $tables = [
-            'job_dependencies', 'schedule_runs', 'job_logs', 'job_artifacts',
-            'job_events', 'job_attempts', 'job_tags', 'jobs', 'schedules',
-            'workers', 'batches', 'leader_leases',
+            'job_batch_dependencies', 'job_dependencies', 'schedule_runs', 'job_logs',
+            'job_artifacts', 'job_events', 'job_attempts', 'job_tags', 'jobs',
+            'schedules', 'workers', 'batches', 'leader_leases',
         ];
 
         if ($conn->getDriverName() === 'pgsql') {

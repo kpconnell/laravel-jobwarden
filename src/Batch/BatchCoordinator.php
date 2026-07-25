@@ -58,6 +58,23 @@ final class BatchCoordinator
     private const UNREACHABLE_REASON = 'unreachable: an upstream dependency did not succeed';
 
     /**
+     * Terminal batch states that doom cross-batch success-edge dependents —
+     * everything terminal but succeeded. `partial` dooms strictly, like a
+     * non-succeeded upstream JOB does (spec §8.5); a partial-tolerant chain
+     * uses an on_completion edge instead.
+     */
+    private const DOOMED_BATCH = [BatchState::Failed, BatchState::Partial, BatchState::Canceled, BatchState::Stopped];
+
+    /**
+     * The cancel_reason stamped by the cross-batch cascade — distinct from
+     * UNREACHABLE_REASON so an operator can tell the two dooms apart.
+     */
+    private const BATCH_UNREACHABLE_REASON = 'unreachable: an upstream batch did not succeed';
+
+    /** Both system-cascade sentinels — revival may undo either, never an operator verdict. */
+    private const CASCADE_REASONS = [self::UNREACHABLE_REASON, self::BATCH_UNREACHABLE_REASON];
+
+    /**
      * Batch states in which a member canceled as unreachable may be revived —
      * the EXACT inverse of the states strandedMemberIds() cancels in, and it
      * must stay that way. `failed` belongs here for the same reason it belongs
@@ -190,6 +207,23 @@ final class BatchCoordinator
             $this->reviveMember($job);
         }
 
+        // Cross-batch dependents whose upstream-batch reopen event was lost.
+        // reviveDependent reopens the dependent's own completed batch first,
+        // which re-fires the live revive cascade for the next batch in a chain.
+        foreach ($this->revivableBatchDependentIds($limit) as $id) {
+            $job = Job::find($id);
+            if ($job === null) {
+                continue;
+            }
+
+            Log::warning('batch reconcile: reviving a dependent whose upstream batch is viable again', [
+                'role' => 'batch_reconcile',
+                'job_id' => (string) $job->id,
+                'batch_id' => $job->batch_id === null ? null : (string) $job->batch_id,
+            ]);
+            $this->reviveDependent($job);
+        }
+
         // Stranded dependents next: their cancellation updates the counters that
         // the completion sweep below reads, so one pass converges a lost-event
         // chain (upstream failed → dependent canceled → batch partial).
@@ -205,6 +239,23 @@ final class BatchCoordinator
                 'batch_id' => (string) $job->batch_id,
             ]);
             $this->cancelMember($job, self::UNREACHABLE_REASON);
+        }
+
+        // Same, for jobs stranded behind a doomed upstream BATCH — the lost-doom
+        // twin of cancelBatchDependents, and the backstop for the dispatch-time
+        // race (an upstream already terminal when its dependent was dispatched).
+        foreach ($this->strandedBatchDependentIds($limit) as $id) {
+            $job = Job::find($id);
+            if ($job === null) {
+                continue;
+            }
+
+            Log::warning('batch reconcile: canceling a dependent stranded behind a non-succeeded batch', [
+                'role' => 'batch_reconcile',
+                'job_id' => (string) $job->id,
+                'batch_id' => $job->batch_id === null ? null : (string) $job->batch_id,
+            ]);
+            $this->cancelMember($job, self::BATCH_UNREACHABLE_REASON);
         }
 
         foreach ($this->reconcilableBatchIds($limit) as $id) {
@@ -358,6 +409,39 @@ final class BatchCoordinator
         }
     }
 
+    /**
+     * Cancel the cross-batch dependents of a batch that ended non-succeeded —
+     * the batch twin of cancelUnreachableDependents, WITHOUT its own-batch
+     * scoping: dependents live in other batches or in none. Canceling a
+     * dependent batch's root fires JobStateChanged, and the ordinary intra-batch
+     * cascade dooms its on_success descendants, spares finalizers, and lands
+     * that batch on `partial` — whose own transitionBatch re-enters this method,
+     * so doom propagates through chains of batches. Public because the dispatch
+     * fast path calls it for an upstream that was already terminal; idempotent
+     * and guarded, so racing the live cascade or the sweep is harmless.
+     * Lockstep twin: strandedBatchDependentIds() in reconcile().
+     */
+    public function cancelBatchDependents(Batch $batch): void
+    {
+        if (! in_array($batch->state, self::DOOMED_BATCH, true)) {
+            return; // fast-path caller raced a reopen — nothing to doom
+        }
+
+        // Everything EXCEPT on_completion, same carve-out and same reason as
+        // cancelUnreachableDependents: an unknown condition must not strand.
+        $dependentIds = $this->connection()->table($this->tbl('job_batch_dependencies'))
+            ->where('depends_on_batch_id', $batch->id)
+            ->where('edge_condition', '!=', 'on_completion')
+            ->pluck('job_id');
+
+        foreach ($dependentIds as $id) {
+            $dep = Job::find($id);
+            if ($dep !== null && in_array($dep->state, [JobState::Pending, JobState::Queued, JobState::Retrying], true)) {
+                $this->cancelMember($dep, self::BATCH_UNREACHABLE_REASON);
+            }
+        }
+    }
+
     private function cancelMember(Job $job, string $reason): void
     {
         $conn = $this->connection();
@@ -385,7 +469,9 @@ final class BatchCoordinator
     /**
      * Undo the unreachable-cascade for the direct dependents of a member that
      * re-entered the DAG. Only members the system itself canceled (matched by
-     * cancel_reason) revive, and only once NO doomed upstream remains — a
+     * cancel_reason — either cascade sentinel, so a dependent doomed by the
+     * batch cascade whose job upstream heals last revives here rather than a
+     * reaper tick later) revive, and only once NO doomed upstream remains — a
      * dependent behind a second, still-failed upstream stays canceled until
      * that one is retried too (reviving it early would just see the stranded
      * sweep cancel it again).
@@ -402,7 +488,8 @@ final class BatchCoordinator
             if ($dep === null || (string) $dep->batch_id !== (string) $batch->id) {
                 continue;
             }
-            if ($dep->state !== JobState::Canceled || (string) $dep->cancel_reason !== self::UNREACHABLE_REASON) {
+            if ($dep->state !== JobState::Canceled
+                || ! in_array((string) $dep->cancel_reason, self::CASCADE_REASONS, true)) {
                 continue;
             }
             if ($this->hasDoomedDependency($dep->id)) {
@@ -410,6 +497,56 @@ final class BatchCoordinator
             }
             $this->reviveMember($dep);
         }
+    }
+
+    /**
+     * Undo the cross-batch cascade for the dependents of a batch that reopened —
+     * the batch twin of reviveUnreachableDependents, without its own-batch
+     * scoping. Either cascade sentinel revives (a job doomed by one cascade and
+     * healed in the other order is caught by reconcile within a tick), and only
+     * once NO doomed upstream — job or batch — remains.
+     * Lockstep twin: revivableBatchDependentIds() in reconcile().
+     */
+    private function reviveBatchDependents(Batch $batch): void
+    {
+        $dependentIds = $this->connection()->table($this->tbl('job_batch_dependencies'))
+            ->where('depends_on_batch_id', $batch->id)
+            ->where('edge_condition', '!=', 'on_completion')
+            ->pluck('job_id');
+
+        foreach ($dependentIds as $id) {
+            $dep = Job::find($id);
+            if ($dep === null || $dep->state !== JobState::Canceled
+                || ! in_array((string) $dep->cancel_reason, self::CASCADE_REASONS, true)) {
+                continue;
+            }
+            if ($this->hasDoomedDependency($dep->id)) {
+                continue;
+            }
+            $this->reviveDependent($dep);
+        }
+    }
+
+    /**
+     * Reopen the dependent's own completed batch first, then revive it — the
+     * cross-batch analogue of the reopen-before-revive order in
+     * onJobStateChanged(): when the roots of a batch were doomed, that batch
+     * completed `partial`, and reviveMember's acceptsRevival check would refuse
+     * until it is running again. Reopening recursively revives ITS dependents
+     * via the hook in reopenBatch(), so revival propagates through chains;
+     * termination is guaranteed because cross-batch edges are acyclic by
+     * construction and every write is CAS-guarded.
+     */
+    private function reviveDependent(Job $job): void
+    {
+        if ($job->batch_id !== null) {
+            $own = Batch::find($job->batch_id);
+            if ($own !== null && $own->state->isTerminal()) {
+                $this->reopenBatch($own); // Partial/Failed only — operator verdicts stand
+            }
+        }
+
+        $this->reviveMember($job);
     }
 
     /** Revive a canceled-as-unreachable member back to waiting on its dependencies. */
@@ -428,18 +565,22 @@ final class BatchCoordinator
                 // serializes against this revival instead of interleaving; a
                 // canceler always takes the batch row before the member rows,
                 // and so does this (via the counter update in the transition).
-                $batchState = $conn->table($this->tbl('batches'))
-                    ->where('id', $job->batch_id)
-                    ->lockForUpdate()
-                    ->value('state');
-                if ($batchState === null || ! self::acceptsRevival(BatchState::from($batchState))) {
-                    return;
+                // A standalone cross-batch dependent has no batch verdict to
+                // respect — the guarded update below is its race protection.
+                if ($job->batch_id !== null) {
+                    $batchState = $conn->table($this->tbl('batches'))
+                        ->where('id', $job->batch_id)
+                        ->lockForUpdate()
+                        ->value('state');
+                    if ($batchState === null || ! self::acceptsRevival(BatchState::from($batchState))) {
+                        return;
+                    }
                 }
 
                 $affected = $conn->table($this->tbl('jobs'))
                     ->where('id', $job->id)
                     ->where('state', JobState::Canceled->value)
-                    ->where('cancel_reason', self::UNREACHABLE_REASON)
+                    ->whereIn('cancel_reason', self::CASCADE_REASONS)
                     ->update([
                         'cancel_requested' => false,
                         'cancel_mode' => null,
@@ -464,13 +605,24 @@ final class BatchCoordinator
         }
     }
 
+    /** Any upstream — job OR batch — still doomed across an on_success edge? */
     private function hasDoomedDependency(mixed $jobId): bool
     {
-        return $this->connection()->table($this->tbl('job_dependencies').' as d')
+        $doomedJob = $this->connection()->table($this->tbl('job_dependencies').' as d')
             ->join($this->tbl('jobs').' as dep', 'dep.id', '=', 'd.depends_on_job_id')
             ->where('d.job_id', $jobId)
             ->where('d.edge_condition', '!=', 'on_completion')
             ->whereIn('dep.state', array_map(static fn (JobState $s): string => $s->value, self::DOOMED))
+            ->exists();
+        if ($doomedJob) {
+            return true;
+        }
+
+        return $this->connection()->table($this->tbl('job_batch_dependencies').' as bd')
+            ->join($this->tbl('batches').' as b', 'b.id', '=', 'bd.depends_on_batch_id')
+            ->where('bd.job_id', $jobId)
+            ->where('bd.edge_condition', '!=', 'on_completion')
+            ->whereIn('b.state', array_map(static fn (BatchState $s): string => $s->value, self::DOOMED_BATCH))
             ->exists();
     }
 
@@ -533,6 +685,11 @@ final class BatchCoordinator
         $batch->finished_at = null;
         event(new BatchStateChanged($batch, $from, BatchState::Running, 'member re-entered the DAG'));
 
+        // Cross-batch revive cascade — the undo of the doom hook in
+        // transitionBatch(). Reconcile's revivableBatchDependentIds() is the
+        // lost-event backstop for a crash landing after the CAS above.
+        $this->reviveBatchDependents($batch);
+
         return true;
     }
 
@@ -584,6 +741,7 @@ final class BatchCoordinator
     private function revivableMemberIds(int $limit): array
     {
         $doomed = array_map(static fn (JobState $s): string => $s->value, self::DOOMED);
+        $doomedBatch = array_map(static fn (BatchState $s): string => $s->value, self::DOOMED_BATCH);
 
         return $this->connection()->table($this->tbl('jobs').' as j')
             ->join($this->tbl('batches').' as b', 'b.id', '=', 'j.batch_id')
@@ -597,6 +755,129 @@ final class BatchCoordinator
                     ->whereColumn('d.job_id', 'j.id')
                     ->where('d.edge_condition', '!=', 'on_completion')
                     ->whereIn('dep.state', $doomed);
+            })
+            // The batch-dep arm of hasDoomedDependency(): reviving a member
+            // whose cross-batch upstream is still doomed would only see the
+            // stranded batch-dep pass re-cancel it every tick — a flap.
+            ->whereNotExists(function ($q) use ($doomedBatch): void {
+                $q->selectRaw('1')
+                    ->from($this->tbl('job_batch_dependencies').' as bd')
+                    ->join($this->tbl('batches').' as ub', 'ub.id', '=', 'bd.depends_on_batch_id')
+                    ->whereColumn('bd.job_id', 'j.id')
+                    ->where('bd.edge_condition', '!=', 'on_completion')
+                    ->whereIn('ub.state', $doomedBatch);
+            })
+            ->orderBy('j.id')
+            ->limit($limit)
+            ->pluck('j.id')
+            ->map(static fn ($id): string => (string) $id)
+            ->all();
+    }
+
+    /**
+     * Cross-batch dependents the cascade canceled whose upstream-batch reopen
+     * event was lost — the SQL twin of reviveBatchDependents() + reviveDependent().
+     * Matches EITHER cascade sentinel, like both live revive paths — this pass
+     * is purely the lost-event backstop for them. The own-batch arm
+     * mirrors what reviveDependent() can act on: null (standalone), a state
+     * acceptsRevival() takes directly, or a `partial` that reopenBatch() will
+     * reopen — hence the NOT-eager-tripped block, the third copy of
+     * shouldEagerFail() (see reopenableBatchIds). A `partial` batch here is the
+     * fully-doomed-dependent shape with zero in-flight members, which
+     * reopenableBatchIds can never select — this pass is its only bootstrap.
+     *
+     * @return string[]
+     */
+    private function revivableBatchDependentIds(int $limit): array
+    {
+        $doomed = array_map(static fn (JobState $s): string => $s->value, self::DOOMED);
+        $doomedBatch = array_map(static fn (BatchState $s): string => $s->value, self::DOOMED_BATCH);
+
+        return $this->connection()->table($this->tbl('jobs').' as j')
+            ->join($this->tbl('job_batch_dependencies').' as bd', function ($join): void {
+                $join->on('bd.job_id', '=', 'j.id')->where('bd.edge_condition', '!=', 'on_completion');
+            })
+            ->where('j.state', JobState::Canceled->value)
+            ->whereIn('j.cancel_reason', self::CASCADE_REASONS)
+            ->whereNotExists(function ($q) use ($doomed): void {
+                $q->selectRaw('1')
+                    ->from($this->tbl('job_dependencies').' as d')
+                    ->join($this->tbl('jobs').' as dep', 'dep.id', '=', 'd.depends_on_job_id')
+                    ->whereColumn('d.job_id', 'j.id')
+                    ->where('d.edge_condition', '!=', 'on_completion')
+                    ->whereIn('dep.state', $doomed);
+            })
+            ->whereNotExists(function ($q) use ($doomedBatch): void {
+                $q->selectRaw('1')
+                    ->from($this->tbl('job_batch_dependencies').' as bd2')
+                    ->join($this->tbl('batches').' as ub', 'ub.id', '=', 'bd2.depends_on_batch_id')
+                    ->whereColumn('bd2.job_id', 'j.id')
+                    ->where('bd2.edge_condition', '!=', 'on_completion')
+                    ->whereIn('ub.state', $doomedBatch);
+            })
+            ->where(function ($q): void {
+                $q->whereNull('j.batch_id')
+                    ->orWhereExists(function ($q): void {
+                        $q->selectRaw('1')
+                            ->from($this->tbl('batches').' as ob')
+                            ->whereColumn('ob.id', 'j.batch_id')
+                            ->where(function ($q): void {
+                                $q->whereIn('ob.state', [BatchState::Running->value, BatchState::Failed->value])
+                                    ->orWhere(function ($q): void {
+                                        $q->where('ob.state', BatchState::Partial->value)
+                                            ->whereNot(function ($q): void { // the SQL twin of shouldEagerFail()
+                                                $q->where(function ($q): void {
+                                                    $q->where('ob.failure_policy', 'fail_fast')->where('ob.failed_count', '>', 0);
+                                                })->orWhere(function ($q): void {
+                                                    $q->where('ob.failure_policy', 'threshold')
+                                                        ->whereRaw('ob.failed_count > COALESCE(ob.failure_threshold, 0)');
+                                                });
+                                            });
+                                    });
+                            });
+                    });
+            })
+            ->distinct() // a job may hold several batch edges
+            ->orderBy('j.id')
+            ->limit($limit)
+            ->pluck('j.id')
+            ->map(static fn ($id): string => (string) $id)
+            ->all();
+    }
+
+    /**
+     * Pending jobs behind a doomed upstream BATCH whose cascade event was lost
+     * — the SQL twin of cancelBatchDependents(). Also the correctness guarantee
+     * for the dispatch-time race (an upstream that went terminal during the
+     * dependent's own dispatch). The own-batch scope mirrors
+     * strandedMemberIds(): running or failed — a spared finalizer subtree of a
+     * failed batch can hold a root with a batch dep; members of other terminal
+     * batches were already swept by their own batch's cascade.
+     *
+     * @return string[]
+     */
+    private function strandedBatchDependentIds(int $limit): array
+    {
+        $doomedBatch = array_map(static fn (BatchState $s): string => $s->value, self::DOOMED_BATCH);
+
+        return $this->connection()->table($this->tbl('jobs').' as j')
+            ->where('j.state', JobState::Pending->value)
+            ->whereExists(function ($q) use ($doomedBatch): void {
+                $q->selectRaw('1')
+                    ->from($this->tbl('job_batch_dependencies').' as bd')
+                    ->join($this->tbl('batches').' as ub', 'ub.id', '=', 'bd.depends_on_batch_id')
+                    ->whereColumn('bd.job_id', 'j.id')
+                    ->where('bd.edge_condition', '!=', 'on_completion')
+                    ->whereIn('ub.state', $doomedBatch);
+            })
+            ->where(function ($q): void {
+                $q->whereNull('j.batch_id')
+                    ->orWhereExists(function ($q): void {
+                        $q->selectRaw('1')
+                            ->from($this->tbl('batches').' as ob')
+                            ->whereColumn('ob.id', 'j.batch_id')
+                            ->whereIn('ob.state', [BatchState::Running->value, BatchState::Failed->value]);
+                    });
             })
             ->orderBy('j.id')
             ->limit($limit)
@@ -692,6 +973,15 @@ final class BatchCoordinator
         if ($affected === 1) {
             $batch->state = $to;
             event(new BatchStateChanged($batch, $from, $to, $reason));
+
+            // Cross-batch doom cascade, synchronous like the intra-batch one
+            // (reconcile is the lost-event backstop for a crash after the CAS).
+            // Runs inline in whichever process completed the last member, so a
+            // chain of dependent batches cascades one recursion level per link
+            // — the same accepted shape as the intra-batch edge cascade.
+            if (in_array($to, self::DOOMED_BATCH, true)) {
+                $this->cancelBatchDependents($batch);
+            }
         }
     }
 

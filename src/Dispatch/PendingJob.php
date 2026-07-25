@@ -115,6 +115,33 @@ final class PendingJob
         return $this;
     }
 
+    /**
+     * Gate this job on already-dispatched batches reaching `succeeded` —
+     * strictly: a partial/failed/canceled/stopped upstream cancels the job as
+     * unreachable (revived if the upstream reopens).
+     *
+     * @param  array<\JobWarden\Models\Batch|string>  $batches  batch models or ids
+     */
+    public function dependsOnBatches(array $batches): self
+    {
+        $this->options['depends_on_batches'] = $batches;
+
+        return $this;
+    }
+
+    /**
+     * Gate this job on already-dispatched batches merely FINISHING — terminal
+     * whatever the verdict, and quiescent. Never doomed by the upstream's outcome.
+     *
+     * @param  array<\JobWarden\Models\Batch|string>  $batches  batch models or ids
+     */
+    public function dependsOnBatchCompletion(array $batches): self
+    {
+        $this->options['depends_on_batch_completion'] = $batches;
+
+        return $this;
+    }
+
     public function createdBy(string $actor): self
     {
         $this->options['created_by'] = $actor;

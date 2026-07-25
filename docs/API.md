@@ -55,7 +55,7 @@ Base path below is relative to the configured prefix (`jobwarden/api`).
 | `GET /jobs/{id}` | One job with `attempts`, `events`, `artifacts`, `tags` loaded. This is the completion-polling endpoint: watch `state`; on `succeeded` the handler's completion payload (if it stored one) is in `result`. |
 | `GET /jobs/{id}/logs` | Log lines. `after=<id>` for the live-tail cursor, `limit` (default 200). |
 | `GET /batches` | Paginated. Filter: `state`. |
-| `GET /batches/{id}` | One batch with its member `jobs`. |
+| `GET /batches/{id}` | One batch with its member `jobs`, plus `upstream_batches` (cross-batch dependencies: id, name, state, edge_condition). |
 | `GET /schedules` | Paginated. Filter: `enabled`. |
 | `GET /schedules/{id}` | One schedule with `recent_runs` (last 25 occurrences). |
 | `GET /workers` | Registered processes (supervisors, schedulers, reapers). `all=1` to include stopped/dead, `role` to filter. |

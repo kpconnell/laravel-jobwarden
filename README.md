@@ -245,6 +245,7 @@ JobWarden includes durable workflow primitives:
 - sequential chains,
 - arbitrary dependency graphs,
 - dependency-gated admission,
+- cross-batch chaining (a batch or job gated on other batches),
 - failure policies,
 - batch-level observability,
 - and revival: retrying a failed upstream reopens the batch and revives the dependents that were canceled as unreachable.
@@ -482,6 +483,46 @@ public function handle(JobContext $context): void
 
 An upstream sitting in `orphaned` does **not** satisfy the edge: its outcome is still
 unknown and awaits an operator verdict.
+
+### Chaining batches
+
+A batch (or a standalone job) can depend on the completion of other, **already-dispatched**
+batches — a DAG of DAGs:
+
+```php
+$jw = app(JobWarden::class);
+
+$a = $jw->batch('etl-store-a')->add('sync', SyncJob::class, ['store' => 'a'])->dispatch();
+$b = $jw->batch('etl-store-b')->add('sync', SyncJob::class, ['store' => 'b'])->dispatch();
+
+$jw->batch('cross-store-report')
+    ->dependsOnBatches([$a, $b])            // both must reach `succeeded`
+    ->add('summarize', SummarizeJob::class)
+    ->add('email', EmailJob::class, dependsOn: ['summarize'])
+    ->dispatch();
+```
+
+The two conditions mirror the member-level edges:
+
+- `dependsOnBatches` is strict: every upstream batch must reach **`succeeded`**. `partial`
+  dooms just like `failed`/`canceled`/`stopped` — a partial-tolerant chain should use the
+  completion form instead. A doomed dependent batch has its waiting work canceled as
+  unreachable (its own `finally` members still run), and if the upstream batch is repaired
+  and reopens — an operator retries the failed member — the canceled work is revived and
+  waits again.
+- `dependsOnBatchCompletion` is the cross-batch `finally`: satisfied once the upstream is
+  **terminal and quiescent** — whatever the verdict, but only after an eagerly-failed
+  upstream's spared finalizers have drained too. It never dooms anything.
+
+Because dependencies reference batches that already exist, cross-batch cycles are
+impossible by construction. A waiting batch shows as `running` with its members `pending`;
+`GET /batches/{id}` lists the upstream batches and their states under `upstream_batches`.
+
+Standalone jobs use the same machinery via dispatch options:
+
+```php
+$jw->dispatch(RefreshCacheJob::class, [], ['depends_on_batches' => [$a->id, $b->id]]);
+```
 
 The dashboard draws every batch as a dependency graph — lanes are the independent sub-chains, columns are dependency depth, failed nodes stay loud while the work canceled downstream of them dims:
 

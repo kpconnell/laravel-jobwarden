@@ -10,6 +10,7 @@ use JobWarden\StateMachine\Exceptions\StaleFencingTokenException;
 use JobWarden\StateMachine\StateMachine;
 use JobWarden\StateMachine\TransitionContext;
 use JobWarden\States\ActorType;
+use JobWarden\States\BatchState;
 use JobWarden\States\JobState;
 use JobWarden\Support\SqlTime;
 
@@ -59,9 +60,10 @@ final class Admitter
         if ($from === JobState::Pending) {
             $prefix = (string) config('jobwarden.table_prefix');
             $terminal = [JobState::Succeeded->value, JobState::Failed->value, JobState::Canceled->value, JobState::Stopped->value];
-            // MUST stay identical to DepsSatisfiedGuard's unmet-edge predicate:
-            // a window that admits rows the guard rejects wastes the LIMIT, and
-            // one that rejects rows the guard would admit strands them.
+            // MUST stay identical to DepsSatisfiedGuard's unmet-edge predicates
+            // (BOTH of them — job-dep and batch-dep): a window that admits rows
+            // the guard rejects wastes the LIMIT, and one that rejects rows the
+            // guard would admit strands them.
             $query->whereNotExists(fn ($q) => $q
                 ->from($prefix.'job_dependencies as d')
                 ->join($prefix.'jobs as dep', 'dep.id', '=', 'd.depends_on_job_id')
@@ -70,6 +72,20 @@ final class Admitter
                 ->where(fn ($q) => $q
                     ->where('d.edge_condition', '!=', 'on_completion')
                     ->orWhereNotIn('dep.state', $terminal)));
+
+            $terminalBatch = [
+                BatchState::Succeeded->value, BatchState::Failed->value, BatchState::Partial->value,
+                BatchState::Canceled->value, BatchState::Stopped->value,
+            ];
+            $query->whereNotExists(fn ($q) => $q
+                ->from($prefix.'job_batch_dependencies as bd')
+                ->join($prefix.'batches as b', 'b.id', '=', 'bd.depends_on_batch_id')
+                ->whereColumn('bd.job_id', $prefix.'jobs.id')
+                ->where('b.state', '!=', BatchState::Succeeded->value)
+                ->where(fn ($q) => $q
+                    ->where('bd.edge_condition', '!=', 'on_completion')
+                    ->orWhereNotIn('b.state', $terminalBatch)
+                    ->orWhereRaw('b.pending_count + b.running_count > 0')));
         }
 
         $jobs = $query->get();

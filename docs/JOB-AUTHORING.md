@@ -186,7 +186,9 @@ carries no job data (that's the constructor's job):
   a live read of the batch around it: its state, failure policy, progress counts,
   and the members that did not succeed (with each one's error message or cancel
   reason). `null` for a standalone job. This is what a finalizer reacts to — see
-  Batches in the README.
+  Batches in the README. Always the job's **own** batch: batches the job is
+  merely *gated on* (cross-batch dependencies) are not exposed here — pass their
+  ids in params if the handler needs them (see Gating a job on other batches).
 
 ## Results
 
@@ -330,8 +332,10 @@ not put anything load-bearing behind one.
 
 > **Prefer a batch member over a listener.** If the work is "run something when
 > this batch finishes", express it in the graph with `dependsOnCompletion` (see
-> Batches in the README) rather than in a `BatchStateChanged` listener. A member
-> gets retries, attempt tracking, artifacts, cancellation, and reaper
+> Batches in the README) rather than in a `BatchStateChanged` listener. To run a
+> whole *batch* (or a standalone job) after another batch settles, chain them
+> with `dependsOnBatches` / `dependsOnBatchCompletion` — same idea, one level up.
+> A member gets retries, attempt tracking, artifacts, cancellation, and reaper
 > reconciliation; a listener gets none of them and is dropped on process death.
 
 ## Dispatching reference
@@ -378,7 +382,9 @@ What the trait does for you:
   builder chain dispatches nothing — only `dispatch()` creates the row.
 
 Builder options: `inLane`, `delay`, `availableAt`, `priority`, `maxAttempts`,
-`maxRuntime`, `named`, `idempotencyKey`, `tags`, `backoff`, `createdBy`.
+`maxRuntime`, `named`, `idempotencyKey`, `tags`, `backoff`, `createdBy`,
+`dependsOnBatches`, `dependsOnBatchCompletion` (see Gating a job on other
+batches, below).
 
 Coexistence: nothing global is intercepted — Laravel's Bus/Queue `dispatch()`
 behaves as ever (spec §0). A class using this trait can't also use
@@ -409,3 +415,37 @@ $jw->batch('nightly-sync')
 POST /jobwarden/api/jobs
 {"job_class": "App\\Jobs\\ImportCatalog", "params": {"storeId": "store-42"}, "idempotent": true}
 ```
+
+### Gating a job on other batches
+
+Both PHP dispatch surfaces can gate a standalone job on **already-dispatched**
+batches — the single-job form of cross-batch chaining (a whole batch gates the
+same way via `BatchBuilder::dependsOnBatches`; full semantics under Chaining
+batches in the README). The HTTP API does not take these options.
+
+```php
+// fluent — batch models or ids
+$job = RefreshCache::dependsOnBatches([$etlA, $etlB])->dispatch();
+
+// options array
+$jw->dispatch(RefreshCache::class, [], ['depends_on_batches' => [$etlA->id, $etlB->id]]);
+$jw->dispatch(NotifyOutcome::class, ['batchId' => $etlA->id], ['depends_on_batch_completion' => [$etlA->id]]);
+```
+
+- **`depends_on_batches`** — every upstream must reach `succeeded`, strictly:
+  `partial` counts as failure. An upstream ending any other way cancels the job
+  as unreachable; if that batch is later repaired and reopens, the job is
+  revived automatically and waits again.
+- **`depends_on_batch_completion`** — the job runs once the upstream has merely
+  **finished**: any terminal verdict, and quiescent (an eagerly-failed batch's
+  spared finalizers have drained first). The verdict never dooms it.
+
+The job is born `pending` and promoted by the admit pass — even when every
+upstream already succeeded at dispatch time, expect one admit tick of latency.
+Referencing a batch that does not exist throws at the dispatch site.
+
+**Reading the upstream outcome.** `JobContext::batch()` is the job's *own*
+batch — upstream batches are not in the context. A completion-gated job that
+reacts to the upstream verdict (the `NotifyOutcome` shape above) should take
+the upstream batch id as a constructor param and read the batch — model or
+`GET /batches/{id}` — in `handle()`.

@@ -106,7 +106,9 @@ services:
       POSTGRES_USER: jobwarden
       POSTGRES_PASSWORD: secret
     volumes:
-      - jobwarden-pg-data:/var/lib/postgresql/data
+      # postgres:18+ keeps PGDATA in a versioned subdirectory of /var/lib/postgresql;
+      # mounting the old /var/lib/postgresql/data path makes the entrypoint refuse to boot.
+      - jobwarden-pg-data:/var/lib/postgresql
     ports:
       - "55432:5432"
     healthcheck:

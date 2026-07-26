@@ -112,6 +112,16 @@ return [
         // otherwise be inherited by every fork. 0 disables. Fires rarely at real
         // throughput (~every few minutes), well under the launcher's crash-loop threshold.
         'prefork_recycle_after' => (int) env('JOBWARDEN_PREFORK_RECYCLE_AFTER', 50000),
+        // Crossing that threshold does NOT start the drain — a drain claims nothing until
+        // the last in-flight fork finishes, so doing it mid-flight stalls the box's whole
+        // capacity for as long as its longest running job. Instead the master keeps
+        // claiming and recycles at the first moment it has nothing in flight (under
+        // short-job load, almost immediately). This is how long that wait may last before
+        // it drains anyway: an hour, because a mixed fleet legitimately runs hour-plus
+        // jobs and no such job should ever be worth stalling a box over. 0 = never force,
+        // recycle only on a genuinely idle moment (memory growth then goes unbounded on a
+        // host that never idles; the deferral is logged either way).
+        'prefork_recycle_grace' => (int) env('JOBWARDEN_PREFORK_RECYCLE_GRACE', 3600),
 
         // On SIGTERM the supervisor stops claiming and waits for in-flight
         // children to finish, up to this many seconds. 0 = wait indefinitely

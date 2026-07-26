@@ -186,7 +186,7 @@ Every attempt runs in a dedicated Linux child process and records enough OS iden
 
 ### Prefork throughput
 
-Isolation does not cost you boot time. The supervisor `pcntl_fork()`s each child from its own already-booted framework — roughly **5.7× the throughput** of exec-per-job in production measurement — and periodically recycles itself through the drain path to rebaseline. Short jobs stay cheap; every job still gets its own process.
+Isolation does not cost you boot time. The supervisor `pcntl_fork()`s each child from its own already-booted framework — roughly **5.7× the throughput** of exec-per-job in production measurement — and periodically recycles itself through the drain path to rebaseline — at an idle moment, so it never stalls a busy box. Short jobs stay cheap; every job still gets its own process.
 
 ### Verified orphan detection
 
@@ -666,7 +666,10 @@ Drain behavior:
 
 This makes rolling deploys much safer for long-running jobs.
 
-The same drain mechanism is also used by prefork recycling to periodically rebaseline workers.
+The same drain mechanism is also used by prefork recycling to periodically rebaseline
+workers — but only once a worker has nothing in flight, so rebaselining never stalls a
+busy box waiting on a long job. See
+[HOSTING → Execution model](docs/HOSTING.md#execution-model-child-vs-prefork).
 
 ---
 

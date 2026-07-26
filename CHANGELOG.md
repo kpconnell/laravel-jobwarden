@@ -6,10 +6,31 @@ All notable changes to `laravel-jobwarden` are documented here. The format follo
 
 ## [1.15.0] - 2026-07-26
 
-Dashboard-only — three changes to the log tail on the job detail page. No migrations, no
-configuration changes.
+One supervisor fix — prefork recycling no longer stalls a busy worker — plus three changes
+to the log tail on the job detail page. No migrations. One new configuration knob
+(`JOBWARDEN_PREFORK_RECYCLE_GRACE`), which defaults to the new behavior.
+
+### Fixed
+- **Prefork recycling no longer stalls a busy worker.** Crossing
+  `JOBWARDEN_PREFORK_RECYCLE_AFTER` requested a drain immediately, and a drain claims
+  nothing until the last in-flight fork finishes — so on a host with mixed job durations, a
+  single long job idled *every* slot for that job's entire remaining lifetime, every
+  recycle. Crossing the threshold now only makes the master *want* to recycle: it keeps
+  claiming at full capacity and drains at the first tick with nothing in flight, which
+  under short-job load arrives almost immediately. The decision is evaluated after reaping
+  and before claiming, so an idle moment is taken rather than instantly refilled.
+- **The log tail no longer live-polls a job in a terminal state.** It mounted live for
+  every job, so one that succeeded last week still issued a probe every 2s for a row that
+  can never arrive. It now starts live only while the job can still emit — the database
+  sink writes each line inline (never buffered), so a terminal job's log is already
+  complete when the page opens. The toggle is unchanged, and after a retry or restart from
+  the page the tail stays paused until you click it.
 
 ### Added
+- **`JOBWARDEN_PREFORK_RECYCLE_GRACE`** (default `3600`) — how long a wanted recycle waits
+  for that idle moment before draining anyway, so a permanently busy host still
+  rebaselines. `0` waits indefinitely. Deferral is logged periodically, and the forced
+  drain logs at `warning`.
 - **A time window on the log tail — `All` (default), `Last 5 min`, `Last 30 min`.**
   Reaching the recent end of a long log is a selection rather than a scroll. The window is
   anchored on the **newest line, not on "now"**, so a run that ended hours ago shows its
@@ -22,17 +43,14 @@ configuration changes.
   the DB session zone, and the viewer's browser disagree.
 
 ### Changed
+- **A recycle drain ignores `JOBWARDEN_DRAIN_TIMEOUT`.** Timing out a drain abandons its
+  children, which the Tier-2 local reaper then `SIGKILL`s as reparented orphans — the right
+  trade when the platform is stopping the container, the wrong one for housekeeping the
+  worker chose to do. A recycle drain waits out its own tail; a real `SIGTERM` arriving
+  mid-recycle supersedes it and the timeout applies again from there.
 - **The log view no longer auto-scrolls to the bottom.** It re-pinned the viewport on every
   Livewire morph — including every 2s poll — which fought any attempt to read mid-log. The
   time window replaces the need for it.
-
-### Fixed
-- **The log tail no longer live-polls a job in a terminal state.** It mounted live for
-  every job, so one that succeeded last week still issued a probe every 2s for a row that
-  can never arrive. It now starts live only while the job can still emit — the database
-  sink writes each line inline (never buffered), so a terminal job's log is already
-  complete when the page opens. The toggle is unchanged, and after a retry or restart from
-  the page the tail stays paused until you click it.
 
 ## [1.14.0] - 2026-07-25
 

@@ -219,6 +219,124 @@ final class PreforkE2ETest extends TestCase
     }
 
     /**
+     * Recycling exists to rebaseline the master's memory; it must never be worth stalling
+     * a box for. Crossing the fork threshold used to request a drain immediately, and a
+     * drain claims nothing until the last in-flight fork finishes — so on a mixed host one
+     * hour-long job idled every other slot for that whole hour.
+     *
+     * Past the threshold with work in flight, the master must keep claiming.
+     */
+    public function test_crossing_the_recycle_threshold_does_not_stop_claiming_while_work_is_in_flight(): void
+    {
+        config([
+            'jobwarden.supervisor.prefork_recycle_after' => 1,
+            'jobwarden.supervisor.prefork_recycle_grace' => 3600,
+        ]);
+
+        $slowMarker = $this->storage.'/recycle-slow.txt';
+        $fastMarker = $this->storage.'/recycle-fast.txt';
+        @unlink($slowMarker);
+        @unlink($fastMarker);
+
+        $warden = $this->app->make(JobWarden::class);
+        $slow = $warden->dispatch(MarkerJob::class, ['sleep' => 4, 'marker' => $slowMarker])->id;
+
+        $supervisor = $this->supervisor(capacity: 4);
+        $supervisor->boot();
+
+        // One tick forks the slow job: the master is now PAST its recycle threshold
+        // (1 fork) with a child holding a slot for the next 4 seconds.
+        $supervisor->tick();
+        $this->assertSame(1, $supervisor->load(), 'the slow job should be in flight');
+
+        // A job dispatched now must still be picked up — that is the whole fix.
+        $fast = $warden->dispatch(MarkerJob::class, ['marker' => $fastMarker])->id;
+        $final = $this->driveUntil($supervisor, [$slow, $fast], timeout: 25.0);
+
+        $this->assertSame(JobState::Succeeded, $final[$fast]->state,
+            'the master stalled: it stopped claiming at the threshold instead of waiting for an idle moment');
+        $this->assertSame(JobState::Succeeded, $final[$slow]->state);
+
+        @unlink($slowMarker);
+        @unlink($fastMarker);
+    }
+
+    /**
+     * The other half of the same decision: once nothing is in flight the drain is free,
+     * so the master takes it immediately and stops claiming (run() then returns and the
+     * launcher restarts it on a pristine baseline).
+     */
+    public function test_the_master_recycles_at_the_first_idle_moment_past_the_threshold(): void
+    {
+        config([
+            'jobwarden.supervisor.prefork_recycle_after' => 1,
+            'jobwarden.supervisor.prefork_recycle_grace' => 3600,
+        ]);
+
+        $marker = $this->storage.'/recycle-idle.txt';
+        @unlink($marker);
+
+        $warden = $this->app->make(JobWarden::class);
+        $first = $warden->dispatch(MarkerJob::class, ['marker' => $marker])->id;
+
+        $supervisor = $this->supervisor(capacity: 4);
+        $supervisor->boot();
+        $this->driveUntil($supervisor, [$first]);
+
+        // Threshold crossed and nothing in flight — the next tick recycles, so this job
+        // is left for the supervisor that replaces us.
+        $after = $warden->dispatch(MarkerJob::class, [])->id;
+        for ($i = 0; $i < 5; $i++) {
+            $supervisor->tick();
+            usleep(50_000);
+        }
+
+        $this->assertSame(JobState::Queued, Job::find($after)->state,
+            'the master kept claiming after recycling; it should have drained at the idle moment');
+
+        @unlink($marker);
+    }
+
+    /**
+     * Deferring is not the same as never recycling: a host that stays busy indefinitely
+     * would otherwise grow past its baseline forever. Once the grace window expires the
+     * master drains anyway — the stall we normally avoid, accepted as the rare fallback.
+     */
+    public function test_the_recycle_grace_expiring_drains_even_with_work_in_flight(): void
+    {
+        config([
+            'jobwarden.supervisor.prefork_recycle_after' => 1,
+            'jobwarden.supervisor.prefork_recycle_grace' => 1,
+        ]);
+
+        $slowMarker = $this->storage.'/recycle-grace.txt';
+        @unlink($slowMarker);
+
+        $warden = $this->app->make(JobWarden::class);
+        $warden->dispatch(MarkerJob::class, ['sleep' => 4, 'marker' => $slowMarker]);
+
+        $supervisor = $this->supervisor(capacity: 4);
+        $supervisor->boot();
+        $supervisor->tick();
+        $this->assertSame(1, $supervisor->load());
+
+        // The grace clock starts when the master first NOTICES it is past the threshold,
+        // which is the tick after the one that forked — so tick again to start it.
+        $supervisor->tick();
+
+        // Sit past the 1s grace with the slow job still running, then tick: the master
+        // gives up waiting for an idle moment and drains.
+        sleep(2);
+        $blocked = $warden->dispatch(MarkerJob::class, [])->id;
+        $supervisor->tick();
+
+        $this->assertSame(JobState::Queued, Job::find($blocked)->state,
+            'the grace window expired but the master kept claiming');
+
+        @unlink($slowMarker);
+    }
+
+    /**
      * Drive the supervisor (tick = reap + admit + claim/fork) until every job is
      * terminal and no child is in flight, then return the jobs keyed by id.
      *

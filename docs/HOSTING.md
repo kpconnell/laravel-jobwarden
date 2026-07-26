@@ -258,6 +258,18 @@ seep into the copy-on-write baseline: the worker drains its in-flight forks, exi
 its supervisor (the image launcher, or systemd/k8s for a bare command) brings it right
 back.
 
+**Recycling waits for an idle moment.** A drain claims nothing until the last in-flight
+fork finishes, so recycling *at* the threshold would idle the whole box for as long as its
+longest running job — on a mixed host, an hour-plus job would strand every other slot for
+that entire hour. So crossing the threshold doesn't start the drain; it starts *wanting*
+to. The master keeps claiming at full capacity and recycles at the first tick with nothing
+in flight, which under short-job load arrives almost immediately. Only if that moment never
+comes does it drain anyway, after `JOBWARDEN_PREFORK_RECYCLE_GRACE` (default 1 hour, `0` =
+wait forever); the deferral is logged either way. A recycle drain also ignores
+`JOBWARDEN_DRAIN_TIMEOUT` — timing out abandons children to be `SIGKILL`ed by the local
+reaper, which is the right trade when the platform is stopping the container and the wrong
+one for housekeeping we chose to do.
+
 **The next ceiling is the database.** Once the boot is gone, per-job cost is dominated by
 the handful of small writes each job makes (claim, state transitions, the audit event,
 logs). Throughput then tracks your DB's commit rate, not the workers — size the DB (and,
@@ -275,7 +287,8 @@ to set values (env vs publish, the `config:cache` caveat) — see
 |---|---|---|
 | `JOBWARDEN_CAPACITY` | 6 | Concurrent jobs per supervisor (default lane). |
 | `JOBWARDEN_EXECUTION_MODE` | `child` | `child` = fresh `php` per job (full isolation, per-job boot); `prefork` = fork the booted supervisor per job (same isolation, no boot; needs `pcntl`). See [Execution model](#execution-model-child-vs-prefork). |
-| `JOBWARDEN_PREFORK_RECYCLE_AFTER` | 50000 | `prefork` only: forks before the master drains + restarts for a fresh baseline (0 disables). |
+| `JOBWARDEN_PREFORK_RECYCLE_AFTER` | 50000 | `prefork` only: forks before the master wants a fresh baseline (0 disables). It keeps claiming until it can drain without stalling. |
+| `JOBWARDEN_PREFORK_RECYCLE_GRACE` | 3600 | How long a wanted recycle waits for an idle moment before draining anyway. `0` = wait indefinitely. |
 | `JOBWARDEN_SCHED_CAPACITY` | 4 | Concurrency for the scheduled lane. |
 | `JOBWARDEN_HEARTBEAT_INTERVAL` | 10 | Seconds between worker lease heartbeats. |
 | `JOBWARDEN_MISSED_BEATS` | 3 | Missed beats before a worker is declared dead. |

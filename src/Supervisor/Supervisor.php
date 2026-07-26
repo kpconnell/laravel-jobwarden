@@ -66,6 +66,12 @@ final class Supervisor
 
     private int $forkCount = 0;
 
+    /** PREFORK: when the fork threshold was first crossed — the grace clock's zero. */
+    private ?float $recycleWantedAt = null;
+
+    /** Rate limit for the "recycle deferred" line; the loop ticks far too fast to log each one. */
+    private ?float $recycleDeferLoggedAt = null;
+
     /** Consecutive full-capacity claims — hysteresis for ramping the poll to the floor. */
     private int $fullStreak = 0;
 
@@ -155,14 +161,6 @@ final class Supervisor
                 $this->nextPollMs = $this->absorbTickFailure($e);
             }
 
-            if ($this->shouldRecycle()) {
-                Log::info('prefork: recycling master — draining in-flight forks then restarting for a fresh baseline', [
-                    'role' => 'supervisor',
-                    'forks' => $this->forkCount,
-                ]);
-                $this->signals->requestDrain();
-            }
-
             if ($this->signals->isDraining()) {
                 if ($this->children->isEmpty()) {
                     break; // clean drain: all in-flight work finished
@@ -233,6 +231,16 @@ final class Supervisor
 
     private function drainTimedOut(): bool
     {
+        // A drain that times out ABANDONS its children: they reparent to init, and the
+        // local reaper reads "supervisor gone, child alive" and SIGKILLs them. That is the
+        // right trade when the platform is stopping the container (they were going to die
+        // anyway) and the wrong one for a recycle we chose to do for memory hygiene — so a
+        // recycle drain always waits out its own tail. A real stop clears the recycle flag
+        // (see SignalState::requestDrain) and the timeout applies again from there.
+        if ($this->signals->isRecycleDrain()) {
+            return false;
+        }
+
         $timeout = $this->drainTimeout();
 
         return $timeout > 0
@@ -258,14 +266,24 @@ final class Supervisor
 
         $this->reap();
 
+        // PREFORK recycling decides here — AFTER reaping, BEFORE claiming — so an idle
+        // moment is seen while it exists rather than being immediately refilled.
+        $this->considerRecycle();
+
         if ($this->signals->isDraining()) {
             if (! $this->drainAnnounced) {
                 $this->drainAnnounced = true;
                 $this->drainStartedAt = microtime(true);
-                Log::info('supervisor draining (stop received); no longer claiming', [
-                    'in_flight' => $this->children->count(),
-                    'drain_timeout' => $this->drainTimeout(),
-                ]);
+                Log::info(
+                    $this->signals->isRecycleDrain()
+                        ? 'prefork: recycling master — draining in-flight forks, then the launcher restarts us on a fresh baseline'
+                        : 'supervisor draining (stop received); no longer claiming',
+                    [
+                        'in_flight' => $this->children->count(),
+                        'drain_timeout' => $this->signals->isRecycleDrain() ? 0 : $this->drainTimeout(),
+                        'forks' => $this->forkCount,
+                    ]
+                );
             }
 
             $this->nextPollMs = (int) config('jobwarden.supervisor.poll_min_ms', 50); // drain briskly
@@ -462,19 +480,89 @@ final class Supervisor
     }
 
     /**
-     * PREFORK: has the master forked enough times to warrant a fresh baseline? When it
-     * has, we request a drain — the loop finishes in-flight forks, run() returns, and the
-     * launcher restarts the role — rather than pcntl_exec'ing ourselves, so recovery,
-     * signal handling, and the co-reaper lifecycle all go through the normal path.
+     * PREFORK: the master has forked enough times to warrant a fresh baseline. Recycling
+     * means draining — and a drain claims NOTHING until the last in-flight fork finishes,
+     * so a single long job stalls the host's whole capacity for that job's remaining
+     * lifetime. Crossing the threshold therefore does not start the drain; it starts
+     * WANTING to.
+     *
+     * We then recycle at the first tick where nothing is in flight, so the drain is
+     * instantaneous and the only cost is the restart itself. Under short-job load that
+     * moment comes almost immediately (a tick reaps every fork before it refills). A host
+     * that never goes idle — the mixed workload, where hour-plus jobs sit alongside fast
+     * ones — keeps claiming at full capacity until the grace window expires, and only
+     * then drains. Rebaselining is memory hygiene; it is never worth stalling a box for.
+     *
+     * We drain rather than pcntl_exec ourselves so recovery, signal handling, and the
+     * co-reaper lifecycle all go through the normal path: run() returns and the launcher
+     * (systemd / jobwarden-host / ECS) restarts the role.
      */
-    private function shouldRecycle(): bool
+    private function considerRecycle(): void
+    {
+        if ($this->signals->isDraining() || ! $this->wantsRecycle()) {
+            return;
+        }
+
+        $this->recycleWantedAt ??= microtime(true);
+        $waited = microtime(true) - $this->recycleWantedAt;
+        $grace = (int) config('jobwarden.supervisor.prefork_recycle_grace', 3600);
+
+        if ($this->children->isEmpty()) {
+            Log::info('prefork: recycling master — idle, so the drain costs nothing', [
+                'role' => 'supervisor',
+                'forks' => $this->forkCount,
+                'waited_for_idle_sec' => (int) round($waited),
+            ]);
+            $this->signals->requestRecycleDrain();
+
+            return;
+        }
+
+        if ($grace > 0 && $waited >= $grace) {
+            Log::warning('prefork: recycle grace expired with work still in flight — draining anyway', [
+                'role' => 'supervisor',
+                'forks' => $this->forkCount,
+                'in_flight' => $this->children->count(),
+                'grace_sec' => $grace,
+                'note' => 'the host claims nothing until these finish; raise prefork_recycle_grace if that is worse than the memory growth',
+            ]);
+            $this->signals->requestRecycleDrain();
+
+            return;
+        }
+
+        $this->logRecycleDeferral($waited, $grace);
+    }
+
+    /** Has the master forked enough times to want a fresh baseline? */
+    private function wantsRecycle(): bool
     {
         $after = (int) config('jobwarden.supervisor.prefork_recycle_after', 0);
 
-        return $after > 0
-            && $this->isPrefork()
-            && $this->forkCount >= $after
-            && ! $this->signals->isDraining();
+        return $after > 0 && $this->isPrefork() && $this->forkCount >= $after;
+    }
+
+    /**
+     * A deferred recycle is normal, but a PERMANENTLY deferred one means the master is
+     * growing past its intended baseline — say so periodically (never per tick; the loop
+     * runs at up to 20 Hz) so it is visible before it becomes a memory incident.
+     */
+    private function logRecycleDeferral(float $waited, int $grace): void
+    {
+        $every = 60.0;
+        $now = microtime(true);
+        if ($this->recycleDeferLoggedAt !== null && ($now - $this->recycleDeferLoggedAt) < $every) {
+            return;
+        }
+        $this->recycleDeferLoggedAt = $now;
+
+        Log::info('prefork: recycle deferred — still working, waiting for an idle moment', [
+            'role' => 'supervisor',
+            'forks' => $this->forkCount,
+            'in_flight' => $this->children->count(),
+            'waited_sec' => (int) round($waited),
+            'grace_sec' => $grace, // 0 = never force; defer for as long as it takes
+        ]);
     }
 
     /**

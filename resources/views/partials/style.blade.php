@@ -267,6 +267,8 @@ a{color:inherit;text-decoration:none}
 /* ---------- logs terminal ---------- */
 .logbar{display:flex;align-items:center;gap:10px;margin-bottom:10px}
 .logbar .note{font-family:var(--mono);font-size:10.5px;color:var(--fg-3)}
+.logbar select{height:26px;border:1px solid var(--border-2);border-radius:6px;background:var(--panel);font-family:var(--mono);font-size:11px;padding:0 6px;outline:none}
+.logbar select:focus{border-color:var(--accent)}
 .logview{background:#0c0d10;border:1px solid var(--border-2);border-radius:9px;padding:10px 0;font-family:var(--mono);font-size:11.5px;line-height:1.85;overflow:auto;max-height:60vh}
 .logline{display:grid;grid-template-columns:40px 78px 66px 1fr;gap:10px;padding:0 14px;white-space:nowrap}
 .logline:hover{background:rgba(255,255,255,.03)}

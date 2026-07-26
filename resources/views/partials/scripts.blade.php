@@ -111,18 +111,11 @@
     }
     setInterval(tickUpdated, 5000);
 
-    // ---- log tail autoscroll -------------------------------------------------
-    function autoscroll(root) {
-        var els = (root || document).querySelectorAll('[data-jw-autoscroll]');
-        els.forEach(function (el) { el.scrollTop = el.scrollHeight; });
-        if (root && root.matches && root.matches('[data-jw-autoscroll]')) root.scrollTop = root.scrollHeight;
-    }
-
     // ---- boot ----------------------------------------------------------------
     function boot(root) { renderTimes(root); syncThemeUI(); }
 
-    document.addEventListener('DOMContentLoaded', function () { boot(); autoscroll(); });
-    document.addEventListener('livewire:navigated', function () { boot(); autoscroll(); tickUpdated(); });
+    document.addEventListener('DOMContentLoaded', function () { boot(); });
+    document.addEventListener('livewire:navigated', function () { boot(); tickUpdated(); });
     document.addEventListener('livewire:initialized', function () {
         boot();
         window.Livewire.on('jw-toast', function (payload) {
@@ -130,9 +123,7 @@
             showToast(Array.isArray(payload) ? payload[0] : payload);
         });
         window.Livewire.hook('morphed', function (payload) {
-            var el = payload && payload.el;
-            renderTimes(el);
-            autoscroll(el);
+            renderTimes(payload && payload.el);
         });
         window.Livewire.hook('commit', function (ctx) {
             ctx.succeed(function () { updatedAt = Date.now(); tickUpdated(); });

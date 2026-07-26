@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace JobWarden\Tests\Http;
 
+use Illuminate\Support\Carbon;
 use JobWarden\JobWarden;
 use JobWarden\Http\Livewire\JobLogTail;
 use JobWarden\Http\Livewire\JobShow;
@@ -127,11 +128,11 @@ final class DashboardJobShowTest extends TestCase
 
     // ---- log tail -----------------------------------------------------------
 
-    private function makeLog(Job $job, JobAttempt $attempt, int $seq, string $body, ?array $context = null, ?string $step = null): JobLog
+    private function makeLog(Job $job, JobAttempt $attempt, int $seq, string $body, ?array $context = null, ?string $step = null, ?Carbon $ts = null): JobLog
     {
         return JobLog::create([
             'job_id' => $job->id, 'attempt_id' => $attempt->id, 'seq' => $seq,
-            'ts' => now(), 'level' => 'info', 'body_sink' => 'database', 'body_ref' => $body,
+            'ts' => $ts ?? now(), 'level' => 'info', 'body_sink' => 'database', 'body_ref' => $body,
             'context' => $context, 'step' => $step,
         ]);
     }
@@ -186,5 +187,58 @@ final class DashboardJobShowTest extends TestCase
             ->call('toggleLive')
             ->assertSet('live', false)
             ->assertDontSeeHtml('wire:poll.2s');
+    }
+
+    public function test_log_tail_time_window_is_anchored_on_the_newest_line(): void
+    {
+        $job = Job::create(['job_class' => 'X', 'state' => JobState::Succeeded]);
+        $attempt = JobAttempt::create(['job_id' => $job->id, 'attempt_number' => 1, 'state' => AttemptState::Succeeded, 'fencing_token' => 1]);
+
+        // A run that ended two days ago: anchored on "now" every window would be empty.
+        $base = now()->subDays(2);
+        $this->makeLog($job, $attempt, 1, 'oldest line', ts: $base->copy());
+        $this->makeLog($job, $attempt, 2, 'middle line', ts: $base->copy()->addMinutes(20));
+        $newest = $this->makeLog($job, $attempt, 3, 'newest line', ts: $base->copy()->addMinutes(31));
+
+        $tail = Livewire::test(JobLogTail::class, ['jobId' => $job->id]);
+        $tail->assertSee('oldest line')->assertSee('middle line')->assertSee('newest line');
+
+        // 30m back from the newest line drops the oldest (31m before it), keeps the middle (11m).
+        $tail->set('since', '30m')
+            ->assertDontSee('oldest line')
+            ->assertSee('middle line')
+            ->assertSee('newest line')
+            ->assertSee('1 earlier line outside the window');
+
+        $tail->set('since', '5m')
+            ->assertDontSee('middle line')
+            ->assertSee('newest line')
+            // The cursor tracks what exists, not what's shown — the poll must not stall.
+            ->assertSet('cursor', (int) $newest->id);
+
+        $tail->set('since', 'all')->assertSee('oldest line');
+
+        // A value off the menu falls back to the unfiltered view.
+        $tail->set('since', 'bogus')->assertSet('since', 'all')->assertSee('oldest line');
+    }
+
+    public function test_log_tail_does_not_start_live_for_a_terminal_job(): void
+    {
+        foreach ([JobState::Succeeded, JobState::Failed, JobState::Canceled, JobState::Stopped] as $state) {
+            $job = Job::create(['job_class' => 'X', 'state' => $state]);
+
+            Livewire::test(JobLogTail::class, ['jobId' => $job->id])
+                ->assertSet('live', false)
+                ->assertDontSeeHtml('wire:poll.2s');
+        }
+
+        // ... but a job that can still emit tails from the start.
+        foreach ([JobState::Pending, JobState::Queued, JobState::Running, JobState::Retrying, JobState::Orphaned] as $state) {
+            $job = Job::create(['job_class' => 'X', 'state' => $state]);
+
+            Livewire::test(JobLogTail::class, ['jobId' => $job->id])
+                ->assertSet('live', true)
+                ->assertSeeHtml('wire:poll.2s');
+        }
     }
 }

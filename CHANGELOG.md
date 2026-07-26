@@ -4,6 +4,36 @@ All notable changes to `laravel-jobwarden` are documented here. The format follo
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.15.0] - 2026-07-26
+
+Dashboard-only — three changes to the log tail on the job detail page. No migrations, no
+configuration changes.
+
+### Added
+- **A time window on the log tail — `All` (default), `Last 5 min`, `Last 30 min`.**
+  Reaching the recent end of a long log is a selection rather than a scroll. The window is
+  anchored on the **newest line, not on "now"**, so a run that ended hours ago shows its
+  final minutes instead of an empty pane. It narrows within the existing 500-line render
+  cap — it can only ever hide lines, never fetch more — and leaves the poll cursor tracking
+  what exists rather than what's shown, so a filtered tail still picks up new lines.
+  Filtering is arithmetic on the absolute epoch the display columns already carry
+  (`scopeWithDisplayEpochs`), never a datetime literal in the app's zone; it compares two
+  such epochs, so a constant offset cancels and the window holds wherever `app.timezone`,
+  the DB session zone, and the viewer's browser disagree.
+
+### Changed
+- **The log view no longer auto-scrolls to the bottom.** It re-pinned the viewport on every
+  Livewire morph — including every 2s poll — which fought any attempt to read mid-log. The
+  time window replaces the need for it.
+
+### Fixed
+- **The log tail no longer live-polls a job in a terminal state.** It mounted live for
+  every job, so one that succeeded last week still issued a probe every 2s for a row that
+  can never arrive. It now starts live only while the job can still emit — the database
+  sink writes each line inline (never buffered), so a terminal job's log is already
+  complete when the page opens. The toggle is unchanged, and after a retry or restart from
+  the page the tail stays paused until you click it.
+
 ## [1.14.0] - 2026-07-25
 
 ### Added

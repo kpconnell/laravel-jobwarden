@@ -3,14 +3,22 @@
         <button type="button" class="btn sm" wire:click="toggleLive">
             <span class="sdot {{ $live ? 'h-green pulse' : 'h-gray' }}"></span>Live tail
         </button>
+        <select wire:model.live="since" aria-label="Log time window">
+            @foreach ($windows as $value => $label)
+                <option value="{{ $value }}">{{ $label }}</option>
+            @endforeach
+        </select>
         <span class="note">GET /jobs/{id}/logs?after={cursor} · poll 2s</span>
     </div>
     @if ($logs->isEmpty())
         <div class="empty">No log lines yet.</div>
     @else
-        <div class="logview" data-jw-autoscroll>
+        <div class="logview">
             @if ($truncated)
                 <div class="logmeta">… earlier lines truncated (showing the last {{ $window }})</div>
+            @endif
+            @if ($hidden > 0)
+                <div class="logmeta">… {{ $hidden }} earlier line{{ $hidden === 1 ? '' : 's' }} outside the window ({{ $windows[$since] }}, from the newest line)</div>
             @endif
             @foreach ($logs as $l)
                 <div class="logline">

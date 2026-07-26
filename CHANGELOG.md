@@ -32,15 +32,13 @@ to the log tail on the job detail page. No migrations. One new configuration kno
   rebaselines. `0` waits indefinitely. Deferral is logged periodically, and the forced
   drain logs at `warning`.
 - **A time window on the log tail — `All` (default), `Last 5 min`, `Last 30 min`.**
-  Reaching the recent end of a long log is a selection rather than a scroll. The window is
-  anchored on the **newest line, not on "now"**, so a run that ended hours ago shows its
-  final minutes instead of an empty pane. It narrows within the existing 500-line render
-  cap — it can only ever hide lines, never fetch more — and leaves the poll cursor tracking
-  what exists rather than what's shown, so a filtered tail still picks up new lines.
-  Filtering is arithmetic on the absolute epoch the display columns already carry
-  (`scopeWithDisplayEpochs`), never a datetime literal in the app's zone; it compares two
-  such epochs, so a constant offset cancels and the window holds wherever `app.timezone`,
-  the DB session zone, and the viewer's browser disagree.
+  Reaching the recent end of a long log is a selection rather than a scroll. The cut is
+  made in SQL against the **DB clock** — the same clock that stamps `ts`, since `JobLogger`
+  writes `CURRENT_TIMESTAMP` and never a PHP datetime — so the window lands where the label
+  says regardless of where `app.timezone` points, and it range-scans the existing
+  `(job_id, ts)` index rather than filtering after the fact. A window that has gone quiet
+  says so instead of showing a stale screenful, and the poll follows the window: it
+  re-renders when a line arrives **or** when one ages out of view.
 
 ### Changed
 - **A recycle drain ignores `JOBWARDEN_DRAIN_TIMEOUT`.** Timing out a drain abandons its

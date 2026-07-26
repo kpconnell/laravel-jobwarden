@@ -11,14 +11,11 @@
         <span class="note">GET /jobs/{id}/logs?after={cursor} · poll 2s</span>
     </div>
     @if ($logs->isEmpty())
-        <div class="empty">No log lines yet.</div>
+        <div class="empty">{{ $since === 'all' ? 'No log lines yet.' : 'Nothing logged in the '.strtolower($windows[$since]).'.' }}</div>
     @else
         <div class="logview">
             @if ($truncated)
                 <div class="logmeta">… earlier lines truncated (showing the last {{ $window }})</div>
-            @endif
-            @if ($hidden > 0)
-                <div class="logmeta">… {{ $hidden }} earlier line{{ $hidden === 1 ? '' : 's' }} outside the window ({{ $windows[$since] }}, from the newest line)</div>
             @endif
             @foreach ($logs as $l)
                 <div class="logline">

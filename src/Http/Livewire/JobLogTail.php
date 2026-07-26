@@ -4,10 +4,12 @@ declare(strict_types=1);
 
 namespace JobWarden\Http\Livewire;
 
+use Illuminate\Database\Eloquent\Builder;
 use JobWarden\Logging\Contracts\LogBodySink;
 use JobWarden\Models\Job;
 use JobWarden\Models\JobLog;
 use JobWarden\States\JobState;
+use JobWarden\Support\SqlTime;
 use Livewire\Component;
 
 /**
@@ -49,12 +51,30 @@ final class JobLogTail extends Component
         $this->live = ! $this->live;
     }
 
-    /** wire:poll target: re-render only when a new row landed since the cursor. */
+    /**
+     * The rendered set: this job's lines, narrowed to the selected window.
+     *
+     * The window is cut in SQL against the DB clock — the same clock that stamped `ts`
+     * (JobLogger writes CURRENT_TIMESTAMP, never a PHP datetime). Comparing to a
+     * PHP-side "now" would land the cut wherever app.timezone happened to point, which
+     * is the drift that already cost us a production mass-orphaning; the DB never has
+     * to agree with the app's zone for this to be right. Range-scans (job_id, ts).
+     */
+    private function scoped(): Builder
+    {
+        $query = JobLog::query()->where('job_id', $this->jobId);
+
+        if (($minutes = self::WINDOWS[$this->since] ?? null) !== null) {
+            $query->whereRaw('ts >= '.SqlTime::nowMinus($query->getConnection(), $minutes * 60));
+        }
+
+        return $query;
+    }
+
+    /** wire:poll target: re-render only when what's *shown* changed — a new line, or one aging out. */
     public function poll(): void
     {
-        $latest = (int) JobLog::query()->where('job_id', $this->jobId)->max('id');
-
-        if ($latest === (int) $this->cursor) {
+        if ((int) $this->scoped()->max('id') === (int) $this->cursor) {
             $this->skipRender();
         }
     }
@@ -67,31 +87,14 @@ final class JobLogTail extends Component
 
         $sink = app(LogBodySink::class);
 
-        $logs = JobLog::query()->where('job_id', $this->jobId)
+        $logs = $this->scoped()
             ->orderByDesc('ts')->orderByDesc('id')
             ->limit(self::WINDOW + 1)->withDisplayEpochs()->get();
 
         $truncated = $logs->count() > self::WINDOW;
         $logs = $logs->take(self::WINDOW)->reverse()->values();
 
-        // Cursor before the time filter: it tracks what exists, not what's shown.
         $this->cursor = (int) $logs->max('id');
-
-        $hidden = 0;
-        if (($minutes = self::WINDOWS[$this->since]) !== null && $logs->isNotEmpty()) {
-            // Arithmetic on ts_ms — the absolute epoch SQL already computed
-            // (scopeWithDisplayEpochs) — never a datetime literal in the app's zone.
-            // The window is a *difference* of two of those epochs, so it holds even
-            // where app.timezone, the DB session zone and the viewer all disagree:
-            // a constant offset cancels on both sides of the comparison.
-            // Anchored on the newest line rather than "now": a run that finished
-            // hours ago still shows its final minutes instead of an empty pane.
-            $floor = (int) $logs->last()->ts_ms - $minutes * 60_000;
-            $shown = $logs->filter(fn (JobLog $l) => (int) $l->ts_ms >= $floor)->values();
-
-            $hidden = $logs->count() - $shown->count();
-            $logs = $shown;
-        }
 
         return view('jobwarden::livewire.job-log-tail', [
             'logs' => $logs->map(fn (JobLog $l) => (object) [
@@ -104,7 +107,6 @@ final class JobLogTail extends Component
             ]),
             'truncated' => $truncated,
             'window' => self::WINDOW,
-            'hidden' => $hidden,
             'windows' => self::windowLabels(),
         ]);
     }

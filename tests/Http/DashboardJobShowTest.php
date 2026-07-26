@@ -4,7 +4,6 @@ declare(strict_types=1);
 
 namespace JobWarden\Tests\Http;
 
-use Illuminate\Support\Carbon;
 use JobWarden\JobWarden;
 use JobWarden\Http\Livewire\JobLogTail;
 use JobWarden\Http\Livewire\JobShow;
@@ -13,6 +12,7 @@ use JobWarden\Models\JobAttempt;
 use JobWarden\Models\JobLog;
 use JobWarden\States\AttemptState;
 use JobWarden\States\JobState;
+use JobWarden\Support\SqlTime;
 use JobWarden\Tests\Concerns\RefreshesJobWardenSchema;
 use JobWarden\Tests\TestCase;
 use Livewire\Livewire;
@@ -128,13 +128,22 @@ final class DashboardJobShowTest extends TestCase
 
     // ---- log tail -----------------------------------------------------------
 
-    private function makeLog(Job $job, JobAttempt $attempt, int $seq, string $body, ?array $context = null, ?string $step = null, ?Carbon $ts = null): JobLog
+    private function makeLog(Job $job, JobAttempt $attempt, int $seq, string $body, ?array $context = null, ?string $step = null, ?int $secondsAgo = null): JobLog
     {
-        return JobLog::create([
+        $log = JobLog::create([
             'job_id' => $job->id, 'attempt_id' => $attempt->id, 'seq' => $seq,
-            'ts' => $ts ?? now(), 'level' => 'info', 'body_sink' => 'database', 'body_ref' => $body,
+            'ts' => now(), 'level' => 'info', 'body_sink' => 'database', 'body_ref' => $body,
             'context' => $context, 'step' => $step,
         ]);
+
+        if ($secondsAgo !== null) {
+            // Age it off the DB clock, exactly as JobLogger stamps ts in production —
+            // a PHP timestamp here would test the app's zone, not the window.
+            $conn = JobLog::query()->getConnection();
+            JobLog::query()->whereKey($log->id)->update(['ts' => $conn->raw(SqlTime::nowMinus($conn, $secondsAgo))]);
+        }
+
+        return $log;
     }
 
     public function test_log_tail_renders_lines_and_tracks_the_cursor(): void
@@ -189,37 +198,51 @@ final class DashboardJobShowTest extends TestCase
             ->assertDontSeeHtml('wire:poll.2s');
     }
 
-    public function test_log_tail_time_window_is_anchored_on_the_newest_line(): void
+    public function test_log_tail_time_window_cuts_against_the_db_clock(): void
     {
-        $job = Job::create(['job_class' => 'X', 'state' => JobState::Succeeded]);
-        $attempt = JobAttempt::create(['job_id' => $job->id, 'attempt_number' => 1, 'state' => AttemptState::Succeeded, 'fencing_token' => 1]);
+        $job = Job::create(['job_class' => 'X', 'state' => JobState::Running]);
+        $attempt = JobAttempt::create(['job_id' => $job->id, 'attempt_number' => 1, 'state' => AttemptState::Running, 'fencing_token' => 1]);
 
-        // A run that ended two days ago: anchored on "now" every window would be empty.
-        $base = now()->subDays(2);
-        $this->makeLog($job, $attempt, 1, 'oldest line', ts: $base->copy());
-        $this->makeLog($job, $attempt, 2, 'middle line', ts: $base->copy()->addMinutes(20));
-        $newest = $this->makeLog($job, $attempt, 3, 'newest line', ts: $base->copy()->addMinutes(31));
+        $this->makeLog($job, $attempt, 1, 'line from an hour ago', secondsAgo: 3600);
+        $this->makeLog($job, $attempt, 2, 'line from ten minutes ago', secondsAgo: 600);
+        $newest = $this->makeLog($job, $attempt, 3, 'line from just now', secondsAgo: 30);
 
         $tail = Livewire::test(JobLogTail::class, ['jobId' => $job->id]);
-        $tail->assertSee('oldest line')->assertSee('middle line')->assertSee('newest line');
+        $tail->assertSee('line from an hour ago')
+            ->assertSee('line from ten minutes ago')
+            ->assertSee('line from just now');
 
-        // 30m back from the newest line drops the oldest (31m before it), keeps the middle (11m).
         $tail->set('since', '30m')
-            ->assertDontSee('oldest line')
-            ->assertSee('middle line')
-            ->assertSee('newest line')
-            ->assertSee('1 earlier line outside the window');
+            ->assertDontSee('line from an hour ago')
+            ->assertSee('line from ten minutes ago')
+            ->assertSee('line from just now');
 
         $tail->set('since', '5m')
-            ->assertDontSee('middle line')
-            ->assertSee('newest line')
-            // The cursor tracks what exists, not what's shown — the poll must not stall.
+            ->assertDontSee('line from an hour ago')
+            ->assertDontSee('line from ten minutes ago')
+            ->assertSee('line from just now')
             ->assertSet('cursor', (int) $newest->id);
 
-        $tail->set('since', 'all')->assertSee('oldest line');
+        $tail->set('since', 'all')->assertSee('line from an hour ago');
 
         // A value off the menu falls back to the unfiltered view.
-        $tail->set('since', 'bogus')->assertSet('since', 'all')->assertSee('oldest line');
+        $tail->set('since', 'bogus')->assertSet('since', 'all')->assertSee('line from an hour ago');
+    }
+
+    public function test_log_tail_window_with_nothing_recent_says_so_and_settles_the_poll(): void
+    {
+        $job = Job::create(['job_class' => 'X', 'state' => JobState::Running]);
+        $attempt = JobAttempt::create(['job_id' => $job->id, 'attempt_number' => 1, 'state' => AttemptState::Running, 'fencing_token' => 1]);
+        $this->makeLog($job, $attempt, 1, 'the only line', secondsAgo: 3600);
+
+        $tail = Livewire::test(JobLogTail::class, ['jobId' => $job->id])->set('since', '5m');
+
+        $tail->assertDontSee('the only line')
+            ->assertSee('Nothing logged in the last 5 min.')
+            // An empty window is a settled one: the poll must not re-render forever.
+            ->assertSet('cursor', 0)
+            ->call('poll')
+            ->assertSet('cursor', 0);
     }
 
     public function test_log_tail_does_not_start_live_for_a_terminal_job(): void

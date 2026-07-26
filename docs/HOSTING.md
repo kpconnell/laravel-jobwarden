@@ -49,9 +49,124 @@ JOBWARDEN_ROLES="supervisor,scheduled-worker,scheduler,global-reaper"
 split topology where you run the reaper as its own process.)
 
 On bare metal / a VM, each role is a systemd unit instead (see
-[`packaging/systemd/`](../packaging/systemd)). Either way: **every daemon must be
-supervised by the platform** (systemd `Restart=always`, or a container restart
-policy) — JobWarden assumes a dead process comes back.
+[`packaging/systemd/`](../packaging/systemd)). Either way, **every one of these
+processes must be started and restarted by something outside JobWarden.** Getting
+that right is a short list of properties, not a choice of tool — see the next
+section.
+
+## Running the roles: the launcher contract
+
+**JobWarden recovers work. It never recovers processes.**
+
+That is worth stating plainly, because it decides what your infrastructure is
+responsible for. The Tier-3 global reaper (`jobwarden:reap:global`) recovers **jobs**:
+it orphans a dead supervisor's in-flight attempts, bumps the fencing token so the dead
+process can never write again, and runs recovery — so idempotent work re-runs elsewhere
+and non-idempotent work parks for an operator. The Tier-2 local reaper is the only
+component that touches processes at all, and it only ever *kills* them. **Nothing in the
+package starts a process.**
+
+So a supervisor that dies and never comes back is the quietest failure in the system.
+Recovery does its job perfectly: no failed jobs, no stuck jobs, no invariant violated, a
+completely consistent database. You have simply lost that lane's capacity, and nothing
+in JobWarden will tell you.
+
+Whatever you use to start these processes — systemd, a container restart policy, ECS,
+Kubernetes, supervisord, runit, the image's own `jobwarden-host` script — this guide
+calls **the launcher**. (Not "the supervisor": in JobWarden that word means the
+`jobwarden:work` process itself.) It has to satisfy five properties.
+
+### 1. Restart the process when it exits on its own — including a clean exit 0
+
+This is the one that bites, because a supervisor exits `0` in three normal situations
+and only one of them means "stay down":
+
+| Exit | Cause | Come back? |
+|---|---|---|
+| `0` | SIGTERM drain that **the launcher asked for** — `systemctl stop`, `docker stop`, an ECS task stop, a pod delete | **No.** A deploy or scale-in is completing. |
+| `0` | SIGTERM drain from **anything else** — an operator's `kill -TERM`, `drain_timeout` abandonment | **Yes.** |
+| `0` | **Prefork recycle** — after `prefork_recycle_after` forks the master drains itself and exits, *expecting* a restart on a fresh baseline | **Yes**, or that lane stops for good. |
+| non-zero | Crash, OOM kill, or five consecutive deterministic tick failures (the supervisor exits loudly on purpose so recovery sees an honest death) | **Yes.** |
+
+Every launcher's *default* gets the exit-`0` rows wrong in the same way, because the
+defaults are tuned for one-shot commands:
+
+| Launcher | Default | Use instead |
+|---|---|---|
+| systemd | `Restart=no` | `Restart=always` |
+| Docker / Compose | no restart policy | `restart: unless-stopped` |
+| supervisord | `autorestart=unexpected` (exit `0` counts as *expected*) | `autorestart=true` |
+| Kubernetes | — | `restartPolicy: Always` (the pod default) |
+| ECS | — | run it as a **service** with a maintained desired-count, not a standalone task |
+| `jobwarden-host` (the image) | already correct | — |
+
+**"Always" does not fight your drains.** It reads like it would, so: every one of these
+settings keys on *why the process exited*, not on overriding a stop you asked for.
+`Restart=always` does not restart a unit you `systemctl stop`; Docker's `always` /
+`unless-stopped` do not restart a container you `docker stop`; `autorestart=true` does not
+fight `supervisorctl stop`. A launcher-initiated stop is a stop. A process that exits by
+itself comes back.
+
+### 2. Watch each supervisor process individually
+
+One supervisor dying must trigger one restart of *that* process. The failure mode to
+avoid is N processes started by a single launcher process that only reports its own PID:
+Docker's restart policy, the ECS agent and the Kubernetes liveness probe then all see a
+perfectly healthy container while a third of your capacity is gone. If you write your own
+launcher, [`docker/jobwarden-host`](../docker/jobwarden-host) is the contract to copy — it
+restarts each role in place and escalates to a whole-host exit only on a crash-loop.
+
+### 3. Restart the process; do not sweep its process tree
+
+A crashed supervisor leaves job children running (they reparent to PID 1) and, by design,
+leaves its bundled Tier-2 local reaper running too — that reaper exists as a *separate*
+process precisely so it outlives the crash and can clean up. Let it. It kills the stranded
+children on the documented path (SIGTERM → grace → SIGKILL → confirm dead → orphan the
+attempt with an audit trail and a job-log line → run recovery), which is strictly better
+than the launcher killing them anonymously.
+
+On systemd this needs one non-default line, because the default `KillMode=control-group`
+tears down the whole cgroup when the main process dies — taking the local reaper and every
+job child with it:
+
+```ini
+# /etc/systemd/system/jobwarden-work@.service
+[Service]
+ExecStart=/usr/bin/php artisan jobwarden:work --lane=%i --capacity=10
+Restart=always
+RestartSec=2
+KillSignal=SIGTERM
+KillMode=process       # let the co-resident reaper + job children outlive a crash
+TimeoutStopSec=0       # or ≥ your longest job; see Deploys / draining
+```
+
+```sh
+systemctl enable --now jobwarden-work@default jobwarden-work@reports
+```
+
+### 4. Escalate a crash-loop instead of hammering it
+
+A supervisor that dies on every start is a code or config problem; restarting it every two
+seconds forever just buries the signal. Cap the rate and hand off — systemd's
+`StartLimitBurst`/`StartLimitIntervalSec`, or on the image path
+`JOBWARDEN_MAX_RESTARTS` (8) within `JOBWARDEN_RESTART_WINDOW` (60s), which exits the whole
+host so the runtime surfaces it and backs off.
+
+### 5. The launcher can see a *dead* supervisor — never a *wedged* one
+
+Only `jobwarden:reap:local` implements the systemd watchdog protocol (`Type=notify` +
+`WatchdogSec`, petted only on a healthy scan). A supervisor that is alive and heartbeating
+but claiming nothing looks perfectly fine to every launcher there is. That detection has to
+come from the database — see [What to watch](#what-to-watch).
+
+### Draining: ask the launcher, don't signal the PID
+
+The corollary of property 1. `kill -TERM <supervisor-pid>` looks to the launcher like a
+spontaneous exit: the supervisor drains cleanly, exits 0, and is immediately restarted and
+claiming again. That is correct behaviour — it is exactly how the prefork recycle works —
+but it is not what you wanted if you were trying to quiet the box. **To take a lane down,
+stop it through the launcher** (`systemctl stop`, `docker stop`, scale the service to
+zero). Signal the PID only when you want a drain-and-come-back.
 
 ## The UI: host it alongside your existing app
 
@@ -177,7 +292,9 @@ Two equally valid ways to place the singletons:
 - **More worker boxes** — horizontal throughput. Claims fan out automatically.
 - **Lanes** — the `default` and `scheduled` lanes are separate claim queues. Dedicate a
   pool of `scheduled-worker` hosts if scheduled/cron-triggered work must not compete
-  with business jobs (or vice-versa). Add your own lanes for further isolation.
+  with business jobs (or vice-versa). Add your own lanes for further isolation. Serving
+  several lanes from one box means several supervisors on one box — see
+  [Multiple lanes on one host](#multiple-lanes-on-one-host).
 - **Priority** — per-job `priority` orders the claim within a lane.
 
 ### What does *not* scale by adding boxes
@@ -187,9 +304,11 @@ Two equally valid ways to place the singletons:
 - The **database** is the shared resource. Watch three things as you grow:
   - **Connections.** Each daemon holds a small, steady number. Budget roughly
     `hosts × (roles-per-host)` against your DB's `max_connections` and any pooler.
-  - **Heartbeat writes.** Each worker writes one lease heartbeat every
-    `host_lease.heartbeat_interval` (default 10s) — cheap, but it's `N/interval`
-    writes/sec at scale.
+  - **Heartbeat writes.** Every role writes a lease heartbeat once per loop iteration —
+    for a supervisor that means once per poll, so a *saturated* one beats at
+    `poll_min_ms` (20/sec), not on some fixed interval. `heartbeat_interval` sets the
+    Tier-3 *death threshold*, not the write rate; lowering it will not reduce this
+    traffic. Each beat is small, but budget `supervisors × poll rate` at scale.
   - **Claim contention.** `SKIP LOCKED` is designed for this and scales well. If you see
     idle spin (slots not staying full), the cause is usually per-job **boot cost** or the
     **poll cadence**, not the claim — reach for `prefork` and a lower `poll_interval_ms`
@@ -197,6 +316,123 @@ Two equally valid ways to place the singletons:
   - **Write rate.** Each job makes a handful of small writes (claim, transitions, audit
     event, logs). Under `prefork` — where the framework boot no longer hides it — this
     commit rate, not the workers, becomes the throughput ceiling; size the DB for it.
+
+## Multiple lanes on one host
+
+One supervisor serves one lane. A box serving three lanes runs three supervisors —
+`jobwarden:work --lane=default`, `jobwarden:work --lane=reports`, and
+`jobwarden:scheduled-worker` (which is just `--lane=scheduled` under a friendlier name).
+They are independent processes with independent claim queues that happen to share a box.
+
+### What is per-lane and what is per-host
+
+| | Scope |
+|---|---|
+| Claim queue, priority ordering | per **lane** |
+| `--capacity` | per **supervisor** |
+| Worker row, heartbeat, Tier-3 detection | per **supervisor** (`worker_id`, fresh on every process start) |
+| Tier-1 reap (`waitpid`, exit codes, forcing a crashed child terminal) | per **supervisor**, its own children only |
+| Tier-2 local reaper | **one active per host**, elected by a lease — it scans every in-flight attempt on the box, whatever lane it belongs to |
+| Self-fence on lost DB connectivity | **host-wide** — SIGKILLs every stamped child on the box, all lanes |
+
+Two consequences worth internalising before you add a lane to an existing box:
+
+- **Capacity is additive.** A box's real concurrency is the *sum* of its supervisors'
+  `--capacity`, not the largest one. Adding a lane adds load; size the box for the sum.
+- **Lanes isolate scheduling, not failure.** A lane is a separate queue, not a separate
+  failure domain — the host lease and the self-fence are host-wide. If a lane's work must
+  be untouchable by another lane's incident, give it its own host or container.
+
+### When a supervisor dies outside a drain
+
+"Outside a drain" means SIGKILL, an OOM kill, a segfault, five consecutive deterministic
+tick failures, or the process simply vanishing. No drain, no `stopped` worker row.
+
+**Its children do not die with it.** They reparent to PID 1 and keep running — and keep
+self-reporting their own outcome, because a job child owns its result independently of its
+parent. What is lost is Tier-1: nobody is `waitpid`-ing them, and nobody will force a
+terminal state on one that crashes without reporting.
+
+The other lanes are untouched — different processes, different claim queues, different
+worker rows. Here is the whole sequence at stock defaults:
+
+| When | Who | What |
+|---|---|---|
+| `t=0` | — | Supervisor gone. Job children reparent to PID 1 and keep running. Its worker row stops beating. |
+| `≤ 5s` (`local_scan_interval`) | The host's **Tier-2** local reaper — whichever lane's supervisor happens to have bundled the active one | Verifies every in-flight attempt on this **host**. Sees "supervisor pid dead, child pid alive", then SIGTERM → `graceful_timeout` (10s) → SIGKILL → confirms dead → **only then** orphans the attempt and bumps the fence. Recovery decides: idempotent → retry (possibly on another host), non-idempotent → park. A pending cancel is still honoured. |
+| immediately | **The launcher** | Restarts *that lane's* supervisor. Fresh `worker_id` and incarnation; it claims from scratch. It does not — and cannot — adopt the old children. |
+| `~30s`, only if Tier 2 didn't get there | **Tier-3** global reaper | `heartbeat_interval × missed_beats` past the last beat, orphans the dead supervisor's in-flight attempts by `worker_id` and runs recovery. Jobs only — anything still *running* on that box is Tier-2's problem, not its. |
+
+The crash path is well covered. **The failure mode to design against is the restart never
+happening** — see [the launcher contract](#running-the-roles-the-launcher-contract). Tier 3
+will keep the *jobs* safe indefinitely; nothing will bring the *lane* back.
+
+### Keep a local reaper alive on the box
+
+Because the active Tier-2 reaper is elected per host, a multi-lane box normally has several
+(one bundled per worker) and only one scanning — the rest idle as hot spares, which is
+exactly what you want: any single supervisor's death still leaves the box covered.
+
+Two ways to lose that, both worth checking:
+
+- **The launcher sweeps the crashed supervisor's process tree** (systemd's default
+  `KillMode`, or a custom launcher that kills a process group). The bundled reaper dies with
+  its supervisor. See property 3 of the launcher contract.
+- **You set `JOBWARDEN_BUNDLE_REAPER=false` and forgot the standalone unit.** Then the box
+  has no Tier 2 at all, and every stranded child waits for Tier 3 — which orphans the *job*
+  without ever killing the *process*.
+
+If the elected reaper does die with its supervisor, a spare takes over only after the lease
+expires: up to `local_lease_ttl` (15s) plus a scan (5s), then the kill path (up to 13s) —
+so up to ~33s before the attempt is orphaned, against a Tier-3 budget of 30s. They overlap
+at stock defaults, and when Tier 3 wins the race an *idempotent* job can briefly run twice
+(non-idempotent jobs park and never re-run, so this is never a state-correctness problem —
+it is duplicate side effects and wasted capacity, which on an hour-long job is an hour).
+Keep the margin with either:
+
+```bash
+JOBWARDEN_MISSED_BEATS=6            # 60s Tier-3 budget — noise next to hour-long jobs
+# or shorten Tier-2 takeover instead:
+JOBWARDEN_LOCAL_LEASE_TTL=8
+JOBWARDEN_LOCAL_SCAN_INTERVAL=2
+```
+
+For a mixed fleet running hour-plus jobs, raise `MISSED_BEATS` — 30s versus 60s of
+host-death detection is irrelevant at that job length, and the margin is free.
+
+### One lane per container? Check `host_id` first
+
+Putting each lane in its own container (a k8s pod with N containers, an ECS task with N
+containers) is a clean way to satisfy properties 1, 2 and 4 of the launcher contract — the
+platform restarts each container independently. But Tier 2 finds a box's work by `host_id`
+and verifies it through `/proc`, so **containers sharing a `host_id` must share a PID
+namespace.**
+
+`host_id` is `sha256(machine-id : boot_id)`, and `boot_id` is the *node kernel's* — shared
+by every container on it. So the discriminator is `/etc/machine-id`:
+
+- **The JobWarden image is safe**: its entrypoint mints a per-container machine-id when one
+  isn't already present, so each container gets its own `host_id` and reaps only its own work.
+- **Your own app image may not be.** If a non-empty `/etc/machine-id` is baked in at build
+  time, every container from that image on the same node computes the *same* `host_id`. The
+  one elected local reaper then `/proc`-verifies pids belonging to other containers' PID
+  namespaces, finds nothing, concludes "supervisor and child gone", and orphans healthy
+  running work — silently, and it will re-dispatch idempotent jobs that are still running.
+
+  Fix it by leaving `/etc/machine-id` empty in the image (so it's minted per container), or
+  by sharing the PID namespace across the containers (`shareProcessNamespace: true` on k8s,
+  `pidMode: task` on ECS) so the reaper can genuinely see them all.
+
+### What to watch
+
+Process death is invisible to the engine, so these signals have to come from you:
+
+| Signal | Why |
+|---|---|
+| **Live supervisors per lane** | A lane with zero supervisors fleet-wide is a *perfectly healthy* JobWarden: jobs queue, nothing fails, no invariant breaks. Count `workers` rows with `role='supervisor'`, `state='active'` and a fresh `heartbeat_at`, grouped by `meta->lane`. (The dashboard groups *jobs* by lane, not workers — this one is a query today.) |
+| **Oldest queued-job age per lane** | The lagging indicator for the same thing, and it catches "the lane is up but nowhere near big enough" too. |
+| **Supervisors `active` past the heartbeat budget** | A wedged supervisor no launcher can see. The dashboard's dead-supervisor count surfaces this. |
+| **Launcher restart rate per lane** | Restarts are normal (prefork recycles); a *rising* rate is a crash-loop the launcher is absorbing. |
 
 ## Substrates (deploying the JobWarden image)
 
@@ -290,8 +526,8 @@ to set values (env vs publish, the `config:cache` caveat) — see
 | `JOBWARDEN_PREFORK_RECYCLE_AFTER` | 50000 | `prefork` only: forks before the master wants a fresh baseline (0 disables). It keeps claiming until it can drain without stalling. |
 | `JOBWARDEN_PREFORK_RECYCLE_GRACE` | 3600 | How long a wanted recycle waits for an idle moment before draining anyway. `0` = wait indefinitely. |
 | `JOBWARDEN_SCHED_CAPACITY` | 4 | Concurrency for the scheduled lane. |
-| `JOBWARDEN_HEARTBEAT_INTERVAL` | 10 | Seconds between worker lease heartbeats. |
-| `JOBWARDEN_MISSED_BEATS` | 3 | Missed beats before a worker is declared dead. |
+| `JOBWARDEN_HEARTBEAT_INTERVAL` | 10 | With `MISSED_BEATS`, the Tier-3 budget: how stale a heartbeat must be before a worker is declared dead. It does **not** throttle the heartbeat write — every role beats once per loop iteration. |
+| `JOBWARDEN_MISSED_BEATS` | 3 | Missed beats before a worker is declared dead. Raise it (e.g. 6) on a multi-lane box to keep Tier-2 ahead of Tier-3 — see [Multiple lanes on one host](#multiple-lanes-on-one-host). |
 | `JOBWARDEN_POLL_INTERVAL_MS` | 500 | How often a supervisor polls for work **and refills freed slots**. Jobs that finish faster than this leave slots idle between cycles — lower it for high-rate short jobs (pairs with `prefork`). |
 | `JOBWARDEN_GLOBAL_LEASE_TTL` | 15 | Global-reaper leader lease TTL (failover time). |
 | `JOBWARDEN_LOCAL_SCAN_INTERVAL` | 5 | Tier-2 local reaper scan cadence. |
@@ -308,7 +544,15 @@ between a worker box dying and its jobs being re-queued. Lower it for faster rec
 - **Deploys / draining.** A `SIGTERM` to a supervisor drains it: it stops claiming and
   lets in-flight children finish, then exits. Roll deploys by bringing up new hosts and
   draining old ones; any work that doesn't finish in the grace window is recovered, not
-  lost.
+  lost. **Drain through the launcher** (`systemctl stop`, `docker stop`, scale to zero),
+  never with `kill -TERM` on the PID — a signalled supervisor drains and is then restarted
+  right back into claiming. See
+  [the launcher contract](#running-the-roles-the-launcher-contract).
+- **A supervisor died and nothing restarted it.** Its jobs are safe — Tier 3 orphans and
+  recovers them within the heartbeat budget — but its *lane capacity* is gone and no
+  JobWarden signal fires, because the package recovers work and never processes. This is
+  what the launcher contract and the [per-lane
+  alerts](#what-to-watch) exist to catch.
 - **Database outage.** Workers can't claim or heartbeat, so they idle and retry; nothing
   is lost because the DB is the only source of truth. On recovery they resume; any
   worker that was declared dead during the outage simply loses its claims to the fence.

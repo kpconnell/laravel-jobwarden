@@ -125,9 +125,9 @@ children on the documented path (SIGTERM → grace → SIGKILL → confirm dead 
 attempt with an audit trail and a job-log line → run recovery), which is strictly better
 than the launcher killing them anonymously.
 
-On systemd this needs one non-default line, because the default `KillMode=control-group`
-tears down the whole cgroup when the main process dies — taking the local reaper and every
-job child with it:
+On systemd this takes one non-default line. The default, `KillMode=control-group`, tears
+down the entire cgroup when the main process dies — taking the local reaper and every job
+child with it:
 
 ```ini
 # /etc/systemd/system/jobwarden-work@.service
@@ -136,13 +136,42 @@ ExecStart=/usr/bin/php artisan jobwarden:work --lane=%i --capacity=10
 Restart=always
 RestartSec=2
 KillSignal=SIGTERM
-KillMode=process       # let the co-resident reaper + job children outlive a crash
-TimeoutStopSec=0       # or ≥ your longest job; see Deploys / draining
+KillMode=process           # let the co-resident reaper + job children outlive a crash
+TimeoutStopSec=infinity    # the DRAIN window; only safe with KillMode=process (below)
 ```
 
 ```sh
 systemctl enable --now jobwarden-work@default jobwarden-work@reports
 ```
+
+**What the default actually costs you.** State stays correct either way — Tier 3 backstops
+everything, no invariant breaks, non-idempotent jobs still park. What you lose is that the
+*documented* recovery path stops being the one that runs:
+
+| | `KillMode=control-group` (default) | `KillMode=process` |
+|---|---|---|
+| Bundled Tier-2 reaper | SIGTERMed with its supervisor — the box has no Tier 2 until the restart finishes | survives, keeps scanning |
+| Stranded job children | SIGTERMed by systemd, SIGKILLed at `TimeoutStopSec` | SIGTERMed by Tier 2, SIGKILLed at `graceful_timeout` (10s) |
+| Their attempts | left `running`; swept ~30s later by Tier 3 as "worker dead" | orphaned with a fence bump, an audit event and a job-log line saying why |
+| Restart delay | up to `TimeoutStopSec` — systemd will not restart until the cgroup empties | immediate |
+
+The third row is the one that matters. Tier 3 orphans **jobs**; it never kills processes.
+Under the default, it can therefore orphan a stranded attempt and re-dispatch an idempotent
+job while the original child is *still running on that box*, because the component whose job
+was to kill it first died in the same cgroup. Closing that window is the entire reason the
+local reaper is a separate process.
+
+The fourth row is why `TimeoutStopSec` and `KillMode` have to be set together. Under the
+default, a generous stop timeout — which you want, so a deliberate drain can outlast a long
+job — becomes lane downtime on every crash, and `TimeoutStopSec=infinity` would wedge the
+unit in `deactivating` forever behind a job that ignores SIGTERM. With `KillMode=process`
+the timeout applies only to the main process, so it means "how long a drain may take" and
+nothing else; on a crash that process is already gone and the restart is immediate.
+
+The one thing you give up: a crashed supervisor's reaper is now never cleaned up by systemd,
+and the restarted supervisor bundles a fresh one, so each crash leaves an idle standby
+behind (harmless — a per-host lease means only one ever scans — but it holds a connection
+and a `workers` row). `StartLimitBurst` bounds it.
 
 ### 4. Escalate a crash-loop instead of hammering it
 
@@ -429,7 +458,7 @@ Process death is invisible to the engine, so these signals have to come from you
 
 | Signal | Why |
 |---|---|
-| **Live supervisors per lane** | A lane with zero supervisors fleet-wide is a *perfectly healthy* JobWarden: jobs queue, nothing fails, no invariant breaks. Count `workers` rows with `role='supervisor'`, `state='active'` and a fresh `heartbeat_at`, grouped by `meta->lane`. (The dashboard groups *jobs* by lane, not workers — this one is a query today.) |
+| **Live supervisors per lane** | A lane with zero supervisors fleet-wide is a *perfectly healthy* JobWarden: jobs queue, nothing fails, no invariant breaks. The dashboard's **Workers** page shows a chip per lane (supervisors, total capacity, queued depth) and calls out any lane that has queued work and nobody serving it. To alert on it externally, count `workers` rows with `role='supervisor'`, a live `state` and a fresh `heartbeat_at`, grouped by `meta->lane`. |
 | **Oldest queued-job age per lane** | The lagging indicator for the same thing, and it catches "the lane is up but nowhere near big enough" too. |
 | **Supervisors `active` past the heartbeat budget** | A wedged supervisor no launcher can see. The dashboard's dead-supervisor count surfaces this. |
 | **Launcher restart rate per lane** | Restarts are normal (prefork recycles); a *rising* rate is a crash-loop the launcher is absorbing. |

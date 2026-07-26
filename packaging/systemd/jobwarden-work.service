@@ -1,7 +1,23 @@
-# Per-host supervisor (Tier 1). One per host; size --capacity to the box.
+# Per-host supervisor (Tier 1). One unit per LANE; size --capacity to the box
+# (a box's real concurrency is the sum across its lanes).
+#
 # On SIGTERM it drains: stops claiming, lets in-flight children finish, exits 0.
 # Set TimeoutStopSec ≥ your drain window (and use jobwarden.supervisor.drain_timeout
 # or your orchestrator's task protection for long jobs).
+#
+# Restart=always is REQUIRED, not a preference: the supervisor exits 0 on purpose
+# after a prefork recycle and expects to be restarted on a fresh baseline. Under
+# Restart=on-failure that exit reads as "finished" and the lane stops for good.
+# It does not fight deploys — systemd never restarts a unit you `systemctl stop`.
+#
+# KillMode=process is load-bearing. The default (control-group) tears down the
+# whole cgroup when this process dies, which on a CRASH kills the two things that
+# are supposed to survive it: the co-resident Tier-2 local reaper (a separate
+# child precisely so it outlives a supervisor crash and can clean up) and the job
+# children that reparented to init. With those swept, the box loses Tier-2 until
+# the restart completes, and systemd will not restart until the cgroup empties —
+# so TimeoutStopSec becomes lane downtime on every crash. See docs/HOSTING.md,
+# "Running the roles: the launcher contract".
 [Unit]
 Description=JobWarden supervisor (jobwarden:work)
 After=network-online.target
@@ -15,6 +31,7 @@ ExecStart=/usr/bin/php artisan jobwarden:work --capacity=10
 Restart=always
 RestartSec=2
 KillSignal=SIGTERM
+KillMode=process
 TimeoutStopSec=120
 
 [Install]

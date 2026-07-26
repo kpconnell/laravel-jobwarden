@@ -3,6 +3,10 @@
 # fleet, so a wedged supervisor or a saturated worker fleet can never starve or
 # block scheduled work (incl. scheduled artisan commands). Pair it with a local
 # reaper on the same host for Tier-2 crash recovery.
+#
+# Restart=always and KillMode=process carry the same weight here as in
+# jobwarden-work.service (this IS jobwarden:work --lane=scheduled) — see the
+# comments there before changing either.
 [Unit]
 Description=JobWarden scheduled-tier runner (jobwarden:scheduled-worker)
 After=network-online.target
@@ -16,6 +20,7 @@ ExecStart=/usr/bin/php artisan jobwarden:scheduled-worker --capacity=5
 Restart=always
 RestartSec=2
 KillSignal=SIGTERM
+KillMode=process
 TimeoutStopSec=120
 
 [Install]

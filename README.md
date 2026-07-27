@@ -271,8 +271,8 @@ JobWarden includes:
 
 ## Requirements
 
-- PHP **8.3+**
-- Laravel **11 or 12**
+- PHP **8.3+** (8.3, 8.4, 8.5)
+- Laravel **11, 12, or 13**
 - Linux runtime
 - A relational database
 

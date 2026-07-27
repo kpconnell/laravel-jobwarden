@@ -13,14 +13,21 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        php: ['8.3', '8.4']
-        laravel: ['11.*', '12.*']
+        php: ['8.3', '8.4', '8.5']
+        laravel: ['11.*', '12.*', '13.*']
         db: [sqlite, mysql, pgsql]
+        exclude:
+          # Laravel 11 predates PHP 8.5 and upstream never tested it there; the
+          # 8.5 lane is covered by 12.* and 13.*.
+          - laravel: '11.*'
+            php: '8.5'
         include:
           - laravel: '11.*'
             testbench: '9.*'
           - laravel: '12.*'
             testbench: '10.*'
+          - laravel: '13.*'
+            testbench: '11.*'
 
     services:
       mariadb:

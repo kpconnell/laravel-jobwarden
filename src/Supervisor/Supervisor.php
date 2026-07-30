@@ -490,8 +490,11 @@ final class Supervisor
      * instantaneous and the only cost is the restart itself. Under short-job load that
      * moment comes almost immediately (a tick reaps every fork before it refills). A host
      * that never goes idle — the mixed workload, where hour-plus jobs sit alongside fast
-     * ones — keeps claiming at full capacity until the grace window expires, and only
-     * then drains. Rebaselining is memory hygiene; it is never worth stalling a box for.
+     * ones — keeps claiming at full capacity forever by default (grace 0 = never force;
+     * the deferral is logged every minute). A positive grace opts into draining anyway
+     * once it expires — and that drain waits on its slowest fork with the lane at zero
+     * throughput, so any job that outruns the grace wedges the lane for its remaining
+     * lifetime. Rebaselining is memory hygiene; it is never worth stalling a box for.
      *
      * We drain rather than pcntl_exec ourselves so recovery, signal handling, and the
      * co-reaper lifecycle all go through the normal path: run() returns and the launcher
@@ -505,7 +508,7 @@ final class Supervisor
 
         $this->recycleWantedAt ??= microtime(true);
         $waited = microtime(true) - $this->recycleWantedAt;
-        $grace = (int) config('jobwarden.supervisor.prefork_recycle_grace', 3600);
+        $grace = (int) config('jobwarden.supervisor.prefork_recycle_grace', 0);
 
         if ($this->children->isEmpty()) {
             Log::info('prefork: recycling master — idle, so the drain costs nothing', [
@@ -524,7 +527,7 @@ final class Supervisor
                 'forks' => $this->forkCount,
                 'in_flight' => $this->children->count(),
                 'grace_sec' => $grace,
-                'note' => 'the host claims nothing until these finish; raise prefork_recycle_grace if that is worse than the memory growth',
+                'note' => 'the lane claims NOTHING until these finish — a job that outruns the grace wedges it for that job\'s remaining runtime; set prefork_recycle_grace=0 to never force',
             ]);
             $this->signals->requestRecycleDrain();
 

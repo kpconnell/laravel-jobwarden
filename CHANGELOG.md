@@ -27,10 +27,15 @@ to the log tail on the job detail page. No migrations. One new configuration kno
   the page the tail stays paused until you click it.
 
 ### Added
-- **`JOBWARDEN_PREFORK_RECYCLE_GRACE`** (default `3600`) — how long a wanted recycle waits
-  for that idle moment before draining anyway, so a permanently busy host still
-  rebaselines. `0` waits indefinitely. Deferral is logged periodically, and the forced
-  drain logs at `warning`.
+- **`JOBWARDEN_PREFORK_RECYCLE_GRACE`** (default `0` — never force) — how long a wanted
+  recycle waits for that idle moment before force-draining anyway. The default never
+  forces: a forced drain claims nothing until its last in-flight fork exits, so any job
+  that outruns the grace wedges its lane at zero throughput for the job's remaining
+  runtime — at every recycle, behind a green heartbeat (observed in the field: one slow
+  job held a lane at zero claiming for 3+ hours). A lane that never idles then never
+  rebaselines, which is survivable and visible instead: deferral is logged every minute,
+  and an opted-into forced drain logs at `warning`. Set a positive grace only where the
+  longest job is reliably shorter than it.
 - **A time window on the log tail — `All` (default), `Last 5 min`, `Last 30 min`.**
   Reaching the recent end of a long log is a selection rather than a scroll. The cut is
   made in SQL against the **DB clock** — the same clock that stamps `ts`, since `JobLogger`

@@ -528,12 +528,18 @@ fork finishes, so recycling *at* the threshold would idle the whole box for as l
 longest running job — on a mixed host, an hour-plus job would strand every other slot for
 that entire hour. So crossing the threshold doesn't start the drain; it starts *wanting*
 to. The master keeps claiming at full capacity and recycles at the first tick with nothing
-in flight, which under short-job load arrives almost immediately. Only if that moment never
-comes does it drain anyway, after `JOBWARDEN_PREFORK_RECYCLE_GRACE` (default 1 hour, `0` =
-wait forever); the deferral is logged either way. A recycle drain also ignores
-`JOBWARDEN_DRAIN_TIMEOUT` — timing out abandons children to be `SIGKILL`ed by the local
-reaper, which is the right trade when the platform is stopping the container and the wrong
-one for housekeeping we chose to do.
+in flight, which under short-job load arrives almost immediately. By default that is the
+**only** way a recycle happens (`JOBWARDEN_PREFORK_RECYCLE_GRACE=0` — never force): a lane
+that never idles simply keeps claiming on its grown baseline, and the deferral is logged
+every minute so the growth is visible. Setting a positive grace makes the master drain
+anyway once it has waited that long — and that drain claims **nothing** until its last
+in-flight fork exits, so any job that outruns the grace wedges the lane at zero throughput
+for the job's remaining lifetime, at every recycle, while heartbeats stay green (a field
+incident, not a hypothetical: one pathologically slow job held a lane's claiming at zero
+for 3+ hours). Set a grace only on a lane whose longest job is reliably shorter than it. A
+recycle drain also ignores `JOBWARDEN_DRAIN_TIMEOUT` — timing out abandons children to be
+`SIGKILL`ed by the local reaper, which is the right trade when the platform is stopping
+the container and the wrong one for housekeeping we chose to do.
 
 **The next ceiling is the database.** Once the boot is gone, per-job cost is dominated by
 the handful of small writes each job makes (claim, state transitions, the audit event,
@@ -553,7 +559,7 @@ to set values (env vs publish, the `config:cache` caveat) — see
 | `JOBWARDEN_CAPACITY` | 6 | Concurrent jobs per supervisor (default lane). |
 | `JOBWARDEN_EXECUTION_MODE` | `child` | `child` = fresh `php` per job (full isolation, per-job boot); `prefork` = fork the booted supervisor per job (same isolation, no boot; needs `pcntl`). See [Execution model](#execution-model-child-vs-prefork). |
 | `JOBWARDEN_PREFORK_RECYCLE_AFTER` | 50000 | `prefork` only: forks before the master wants a fresh baseline (0 disables). It keeps claiming until it can drain without stalling. |
-| `JOBWARDEN_PREFORK_RECYCLE_GRACE` | 3600 | How long a wanted recycle waits for an idle moment before draining anyway. `0` = wait indefinitely. |
+| `JOBWARDEN_PREFORK_RECYCLE_GRACE` | 0 | Seconds a wanted recycle waits for an idle moment before force-draining anyway. `0` = never force (recycle only at a truly idle tick). A job that outruns a positive grace wedges its lane at zero throughput for the job's remaining runtime. |
 | `JOBWARDEN_SCHED_CAPACITY` | 4 | Concurrency for the scheduled lane. |
 | `JOBWARDEN_HEARTBEAT_INTERVAL` | 10 | With `MISSED_BEATS`, the Tier-3 budget: how stale a heartbeat must be before a worker is declared dead. It does **not** throttle the heartbeat write — every role beats once per loop iteration. |
 | `JOBWARDEN_MISSED_BEATS` | 3 | Missed beats before a worker is declared dead. Raise it (e.g. 6) on a multi-lane box to keep Tier-2 ahead of Tier-3 — see [Multiple lanes on one host](#multiple-lanes-on-one-host). |

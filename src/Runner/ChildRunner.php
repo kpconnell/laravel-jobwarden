@@ -278,11 +278,29 @@ final class ChildRunner
     {
         $error = $this->describe($e);
 
-        $attempt->forceFill([
-            'error' => $error,
-            // finished_at is stamped by the terminal StateMachine transition (DB clock);
-            // never here on the app clock — the reconcile sweep compares it DB-side.
-        ])->save();
+        // Query builder, not ->save(). Two reasons, and neither is finished_at — that stays
+        // untouched here, stamped by the terminal StateMachine transition.
+        //
+        // 1. ->save() auto-stamps updated_at with Carbon::now() in app.timezone, and the
+        //    reconcile sweep reads this row DB-side as COALESCE(finished_at, updated_at).
+        //    Today the transition that follows overwrites updated_at on the DB clock, so
+        //    the skew never surfaces — but "an app-clock write nothing happens to read" is
+        //    a property of the current call order, not an invariant. One statement in the
+        //    DB frame, like ProcessStampWriter, costs nothing and doesn't depend on it.
+        // 2. The model's array cast THROWS on a payload it can't encode — and it encodes at
+        //    forceFill(), i.e. the FIRST statement of the failure path. An exception message
+        //    is built by userland and routinely carries bytes off a socket or a driver, so
+        //    invalid UTF-8 lands here (the trace is safe; PHP escapes it). That throw
+        //    unwound past this write and left error=NULL — the exact "diagnosable failure
+        //    traded for an undiagnosable one" that fail()'s ordering above exists to
+        //    prevent. Substituting a byte beats losing the record; same flags as JobLogTail.
+        $conn = $this->connection();
+        $conn->table($attempt->getTable())
+            ->where('id', $attempt->id)
+            ->update([
+                'error' => json_encode($error, JSON_INVALID_UTF8_SUBSTITUTE | JSON_PARTIAL_OUTPUT_ON_ERROR),
+                'updated_at' => $conn->raw('CURRENT_TIMESTAMP'),
+            ]);
 
         $job->forceFill(['last_error' => $error])->saveQuietly();
     }

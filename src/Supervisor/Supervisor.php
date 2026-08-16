@@ -714,7 +714,18 @@ final class Supervisor
                     'duration_ms' => $handle->durationMs(),
                 ],
             ];
-            $attempt->forceFill(['error' => $error])->save();
+            // Query builder, not ->save() — see the long note in ChildRunner::recordError().
+            // Here the app-clock updated_at was masked differently: this runs AFTER the
+            // terminal transition, which stamps finished_at, so the sweep's
+            // COALESCE(finished_at, updated_at) never reaches the skewed half. Masked is not
+            // the same as correct, and the DB-frame write is the same single statement.
+            $conn = $this->connection();
+            $conn->table($attempt->getTable())
+                ->where('id', $attempt->id)
+                ->update([
+                    'error' => json_encode($error, JSON_INVALID_UTF8_SUBSTITUTE | JSON_PARTIAL_OUTPUT_ON_ERROR),
+                    'updated_at' => $conn->raw('CURRENT_TIMESTAMP'),
+                ]);
             $job?->forceFill(['last_error' => $error])->saveQuietly();
         }
 

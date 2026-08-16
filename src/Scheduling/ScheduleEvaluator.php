@@ -8,6 +8,7 @@ use JobWarden\Models\Job;
 use JobWarden\Models\Schedule;
 use JobWarden\Search\TagWriter;
 use JobWarden\States\JobState;
+use JobWarden\Support\SqlTime;
 use Illuminate\Database\Connection;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
@@ -19,6 +20,26 @@ use Symfony\Component\Uid\Uuid;
  * applies missed_policy + overlap_policy + catch-up limits, and materializes each
  * via INSERT … ON CONFLICT DO NOTHING on UNIQUE(schedule_id, occurrence_time) —
  * so concurrent schedulers can never double-enqueue an occurrence.
+ *
+ * EVERY instant here lives on the DB clock, both directions (spec §5.3):
+ *
+ *  - WRITES go through SqlTime::nowExpr()/nowPlus(), never a bound Carbon. Laravel
+ *    formats a Carbon binding as 'Y-m-d H:i:s' — the offset is DROPPED — so a
+ *    Carbon::now() under an app.timezone that differs from the DB session zone
+ *    stores local wall-clock as if it were the DB's own frame. That skewed
+ *    `available_at` is compared against CURRENT_TIMESTAMP by the claim, so an
+ *    ahead-of-DB app.timezone made scheduled jobs unclaimable for the offset.
+ *  - READS of the columns we then do window math on (last_evaluated_at, run_at)
+ *    come back as epochs via SqlTime::epochMsExpr(), not through Eloquent's
+ *    datetime cast. MariaDB hands a tz-aware column back as a bare string, which
+ *    the cast parses in app.timezone — so a DB-frame last_evaluated_at read that
+ *    way lands hours off, and an app.timezone ahead of the DB puts it in the
+ *    FUTURE: the window is empty on every tick and the schedule silently stops
+ *    firing. The write fix alone would have introduced exactly that.
+ *
+ * occurrence_time stays as it is: it is the UNIQUE dedup key, so its stored value
+ * must be byte-stable across evaluations, and it is already written in the UTC
+ * frame the rest of the row now shares.
  */
 final class ScheduleEvaluator
 {
@@ -32,8 +53,12 @@ final class ScheduleEvaluator
         $conn = $this->connection();
 
         return (int) $conn->transaction(function () use ($conn, $scheduleId, $evaluatorWorkerId): int {
-            // Skip if another scheduler is already evaluating this schedule.
+            // Skip if another scheduler is already evaluating this schedule. The same
+            // locked read carries the two instants we do window math on, as epochs.
             $locked = $conn->table($this->tbl('schedules'))
+                ->select('*')
+                ->selectRaw(SqlTime::epochMsExpr($conn, 'last_evaluated_at').' as jw_last_evaluated_ms')
+                ->selectRaw(SqlTime::epochMsExpr($conn, 'run_at').' as jw_run_at_ms')
                 ->where('id', $scheduleId)->where('enabled', true)
                 ->lock('for update skip locked')->first();
 
@@ -42,16 +67,27 @@ final class ScheduleEvaluator
             }
 
             $schedule = Schedule::findOrFail($scheduleId);
-            $now = Carbon::now();
-            $after = $schedule->last_evaluated_at ?? $now->copy()->subSecond();
+            $now = SqlTime::now($conn);
 
-            $occurrences = $this->calculator->occurrences($schedule, $after, $now);
+            // The model carries the schedule's CONFIG; its instants come from the epochs
+            // above. Never assign these back onto the model — Eloquent's datetime cast
+            // re-serializes a Carbon through a bare app-timezone string on the way in.
+            $lastEvaluatedAt = $this->instant($locked->jw_last_evaluated_ms ?? null);
+            $runAt = $this->instant($locked->jw_run_at_ms ?? null);
+
+            $after = $lastEvaluatedAt ?? $now->copy()->subSecond();
+
+            $occurrences = $this->calculator->occurrences($schedule, $after, $now, $runAt);
             $enqueued = $occurrences === [] ? 0 : $this->materialize($schedule, $occurrences, $now, $evaluatorWorkerId);
 
-            $schedule->forceFill([
-                'last_evaluated_at' => $now,
-                'next_due_at' => $this->calculator->nextDueAfter($schedule, $now),
-            ])->save();
+            $nextDue = $this->calculator->nextDueAfter($schedule, $now, $runAt);
+            $conn->table($this->tbl('schedules'))->where('id', $scheduleId)->update([
+                'last_evaluated_at' => $conn->raw(SqlTime::nowExpr($conn)),
+                'next_due_at' => $nextDue === null ? null : $conn->raw($this->atExpr($conn, $now, $nextDue)),
+                // Stamped here too: an Eloquent save() would write updated_at with
+                // Carbon::now(), i.e. back in the app frame we just left.
+                'updated_at' => $conn->raw(SqlTime::nowExpr($conn)),
+            ]);
 
             return $enqueued;
         });
@@ -90,20 +126,20 @@ final class ScheduleEvaluator
 
         $enqueued = 0;
         foreach ($toEnqueue as $occ) {
-            if ($this->recordRun($schedule, $occ, 'enqueued', $now, $evaluatorWorkerId)) {
+            if ($this->recordRun($schedule, $occ, 'enqueued', $evaluatorWorkerId)) {
                 $job = $this->createJob($schedule, $occ, $now);
                 $this->linkJob($schedule, $occ, (string) $job->id);
                 $enqueued++;
             }
         }
         foreach ($coalesced as $occ) {
-            $this->recordRun($schedule, $occ, 'coalesced', $now, $evaluatorWorkerId);
+            $this->recordRun($schedule, $occ, 'coalesced', $evaluatorWorkerId);
         }
         foreach ($skipped as $occ) {
-            $this->recordRun($schedule, $occ, 'skipped', $now, $evaluatorWorkerId);
+            $this->recordRun($schedule, $occ, 'skipped', $evaluatorWorkerId);
         }
         foreach ($outsideWindow as $occ) {
-            $this->recordRun($schedule, $occ, 'outside_window', $now, $evaluatorWorkerId);
+            $this->recordRun($schedule, $occ, 'outside_window', $evaluatorWorkerId);
         }
 
         return $enqueued;
@@ -128,17 +164,19 @@ final class ScheduleEvaluator
         };
     }
 
-    private function recordRun(Schedule $schedule, Carbon $occ, string $action, Carbon $now, ?string $evaluatorWorkerId): bool
+    private function recordRun(Schedule $schedule, Carbon $occ, string $action, ?string $evaluatorWorkerId): bool
     {
+        $conn = $this->connection();
+
         // INSERT … ON CONFLICT DO NOTHING — the lynchpin of multi-scheduler safety.
-        $affected = $this->connection()->table($this->tbl('schedule_runs'))->insertOrIgnore([
+        $affected = $conn->table($this->tbl('schedule_runs'))->insertOrIgnore([
             'id' => (string) Uuid::v7(),
             'schedule_id' => $schedule->id,
             'occurrence_time' => $occ,
-            'detected_at' => $now,
+            'detected_at' => $conn->raw(SqlTime::nowExpr($conn)),
             'action' => $action,
             'evaluator_worker_id' => $evaluatorWorkerId,
-            'created_at' => $now,
+            'created_at' => $conn->raw(SqlTime::nowExpr($conn)),
         ]);
 
         return $affected === 1; // true = materialized for the FIRST time
@@ -161,13 +199,23 @@ final class ScheduleEvaluator
             'idempotent' => (bool) $schedule->idempotent,
             'priority' => (int) $schedule->priority,
             'state' => JobState::Queued,
-            'available_at' => $occ->greaterThan($now) ? $occ : $now,
             // Idempotent runs need a budget > 1 to actually retry on host-loss;
             // non-idempotent runs are single-shot (they park, they don't retry).
             'max_attempts' => (int) ($schedule->max_attempts ?? ($schedule->idempotent ? 3 : 1)),
             'attempt_count' => 0,
-            'queued_at' => $now,
         ]);
+
+        // available_at / queued_at on the DB clock, exactly as JobWarden::dispatch()
+        // stamps them: the claim gates on `available_at <= CURRENT_TIMESTAMP`, so a
+        // bound Carbon here would make the run early or late by the app↔DB offset.
+        // Both writes land in the surrounding evaluation transaction.
+        $conn = $this->connection();
+        $conn->table($job->getTable())
+            ->where($job->getKeyName(), $job->getKey())
+            ->update([
+                'available_at' => $conn->raw($occ->greaterThan($now) ? $this->atExpr($conn, $now, $occ) : SqlTime::nowExpr($conn)),
+                'queued_at' => $conn->raw(SqlTime::nowExpr($conn)),
+            ]);
 
         // Schedule tags carry to every run it spawns (plus param promotion).
         // Runtime path: silently keep only valid string=>string entries — a
@@ -196,6 +244,23 @@ final class ScheduleEvaluator
         $terminal = [JobState::Succeeded->value, JobState::Failed->value, JobState::Canceled->value, JobState::Stopped->value];
 
         return Job::query()->where('schedule_id', $schedule->id)->whereNotIn('state', $terminal)->exists();
+    }
+
+    /**
+     * A SQL expression placing an absolute instant in the DB's frame, as an offset from
+     * the DB clock — the same conversion JobWarden::dispatch() applies to a caller-supplied
+     * available_at. Second granularity: these are eligibility gates and display hints,
+     * never the dedup key.
+     */
+    private function atExpr(Connection $conn, Carbon $now, Carbon $target): string
+    {
+        return SqlTime::nowPlus($conn, (int) ceil($now->diffInSeconds($target, false)));
+    }
+
+    /** A tz-safely-read epoch-ms column back as an absolute instant. */
+    private function instant(int|float|string|null $epochMs): ?Carbon
+    {
+        return $epochMs === null ? null : Carbon::createFromTimestampMs((int) round((float) $epochMs));
     }
 
     private function connection(): Connection

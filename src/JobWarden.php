@@ -132,20 +132,36 @@ class JobWarden
     /** Register a one-time schedule that fires once at $runAt. */
     public function scheduleOnce(string $name, Carbon $runAt, string $jobClass, array $params = [], array $options = []): Schedule
     {
-        return Schedule::create([
-            'name' => $name,
-            'job_class' => $jobClass,
-            'params' => $params,
-            'kind' => 'one_time',
-            'run_at' => $runAt,
-            'timezone' => $options['timezone'] ?? 'UTC',
-            'enabled' => $options['enabled'] ?? true,
-            'idempotent' => (bool) ($options['idempotent'] ?? false),
-            'max_attempts' => $options['max_attempts'] ?? null,
-            'missed_policy' => 'run_latest',
-            'overlap_policy' => $options['overlap_policy'] ?? 'allow',
-            'priority' => (int) ($options['priority'] ?? 0),
-        ]);
+        $conn = DB::connection(config('jobwarden.connection'));
+
+        // run_at gates the one-time fire (`run_at <= now`) and the evaluator reads it back
+        // off the DB clock, so it must land in the DB's frame — a bound Carbon loses its
+        // offset and stores app-local wall-clock. Same offset-from-now conversion dispatch()
+        // uses for a caller-supplied available_at, and stamped in the same transaction so a
+        // concurrent scheduler tick never sees a one_time schedule with a null run_at.
+        $delaySeconds = (int) ceil(SqlTime::now($conn)->diffInSeconds($runAt, false));
+
+        return $conn->transaction(function () use ($conn, $name, $jobClass, $params, $options, $delaySeconds): Schedule {
+            $schedule = Schedule::create([
+                'name' => $name,
+                'job_class' => $jobClass,
+                'params' => $params,
+                'kind' => 'one_time',
+                'timezone' => $options['timezone'] ?? 'UTC',
+                'enabled' => $options['enabled'] ?? true,
+                'idempotent' => (bool) ($options['idempotent'] ?? false),
+                'max_attempts' => $options['max_attempts'] ?? null,
+                'missed_policy' => 'run_latest',
+                'overlap_policy' => $options['overlap_policy'] ?? 'allow',
+                'priority' => (int) ($options['priority'] ?? 0),
+            ]);
+
+            $conn->table($schedule->getTable())
+                ->where($schedule->getKeyName(), $schedule->getKey())
+                ->update(['run_at' => $conn->raw(SqlTime::nowPlus($conn, $delaySeconds))]);
+
+            return $schedule->refresh();
+        });
     }
 
     /**

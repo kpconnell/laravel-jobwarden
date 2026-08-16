@@ -5,8 +5,8 @@ declare(strict_types=1);
 namespace JobWarden\Console;
 
 use JobWarden\Models\Worker;
+use JobWarden\Support\SqlTime;
 use Illuminate\Console\Command;
-use Illuminate\Support\Carbon;
 
 /**
  * The "who is alive" view (spec §9.1): supervisors, schedulers, and reapers, with
@@ -20,7 +20,13 @@ final class WorkersCommand extends Command
 
     public function handle(): int
     {
-        $query = Worker::query()->orderBy('role')->orderByDesc('heartbeat_at');
+        // heartbeat_at is written on the DB clock (WorkerRegistry::stampDbClock), so its age
+        // has to be measured against that same clock. Reading the column through Eloquent's
+        // datetime cast and subtracting Carbon::now() mixes the two frames: MariaDB hands
+        // the value back as a bare string the cast parses in app.timezone, so under any
+        // app↔DB offset a fresh heartbeat printed as hours stale. withDisplayEpochs() is the
+        // existing tz-safe read — it appends heartbeat_at_ms from SqlTime::epochMsExpr().
+        $query = Worker::query()->withDisplayEpochs()->orderBy('role')->orderByDesc('heartbeat_at');
 
         if (! $this->option('all')) {
             $query->whereIn('state', ['starting', 'active', 'draining']);
@@ -29,7 +35,7 @@ final class WorkersCommand extends Command
             $query->where('role', $role);
         }
 
-        $now = Carbon::now();
+        $nowMs = SqlTime::now((new Worker)->getConnection())->getTimestamp() * 1000;
         $rows = $query->get()->map(fn (Worker $w): array => [
             substr((string) $w->id, 0, 8),
             $w->role,
@@ -37,7 +43,7 @@ final class WorkersCommand extends Command
             $w->host_id ? substr($w->host_id, 0, 8) : '-',
             $w->pid ?? '-',
             $w->current_load.'/'.($w->capacity ?? '∞'),
-            $w->heartbeat_at ? ((int) round(abs($now->diffInSeconds($w->heartbeat_at)))).'s ago' : '-',
+            $w->heartbeat_at_ms === null ? '-' : ((int) round(abs($nowMs - (float) $w->heartbeat_at_ms) / 1000)).'s ago',
             $w->last_signal ?? '-',
         ])->all();
 

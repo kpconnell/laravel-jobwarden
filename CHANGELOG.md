@@ -4,6 +4,121 @@ All notable changes to `laravel-jobwarden` are documented here. The format follo
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.16.0] - 2026-08-16
+
+Laravel 13 and PHP 8.5 support, plus a cluster of clock fixes: every remaining place
+JobWarden read or wrote a coordination timestamp on the *app* clock instead of the DB
+clock. No migrations, no new configuration.
+
+### Fixed
+- **The scheduler wrote and read its timestamps in `app.timezone`.** `ScheduleEvaluator`
+  was the last production write path still deriving "now" from `Carbon::now()`, and
+  Laravel drops a Carbon's offset when binding it (`Y-m-d H:i:s`), so the database stored
+  local wall-clock as if it were its own frame. Under `app.timezone=America/New_York` one
+  evaluation put `schedules.last_evaluated_at`, `schedule_runs.created_at`/`detected_at`
+  and the emitted job's `available_at`/`queued_at` all four hours off the DB clock. Three
+  consequences, none cosmetic: **scheduled jobs could sit unclaimable** — both claim
+  drivers gate on `available_at <= CURRENT_TIMESTAMP`, so an `app.timezone` *ahead* of the
+  database wrote `available_at` that far into the future and the run stayed `queued` and
+  untouched for the length of the offset; **on Postgres a schedule could stop firing
+  entirely** — writing local wall-clock into a `timestamptz` stores a different instant,
+  so under `Asia/Tokyo` `last_evaluated_at` landed +9h, the occurrence window came back
+  empty on every tick, and each tick pushed it further out; and **`jobwarden:prune` cut the
+  `schedule_runs` retention window against a mismatched frame**, so the 90-day boundary
+  moved by the offset. Writes now go through the DB clock exactly as `dispatch()` already
+  stamped `available_at`/`queued_at`.
+
+  The read half is equally load-bearing and is fixed with it: `last_evaluated_at` and
+  `run_at` are read back as epochs in the locked `SELECT` that already runs, because
+  MariaDB returns a tz-aware column as a bare string that the datetime cast parses in
+  `app.timezone` — a DB-frame value read that way lands hours off, and behind the database
+  it lands in the *future*. Fixing only the write side would have introduced exactly the
+  empty-window failure above on MySQL.
+
+  `schedule_runs.occurrence_time` is deliberately unchanged: it is the `UNIQUE` dedup key,
+  so its stored value must stay byte-stable across evaluations, and it was already written
+  in the UTC frame the rest of the row now shares.
+- **`jobwarden:workers` reported a live worker as stale.** `heartbeat_at` is stamped from
+  the DB clock and the reapers compare it DB-side, so the lease itself was always correct
+  — but the command read the column back through Eloquent's datetime cast and subtracted
+  `Carbon::now()`, mixing the two frames. Under `app.timezone=America/New_York` a heartbeat
+  written one second earlier printed as `14399s ago`: four hours of apparent staleness on a
+  healthy worker, which is precisely the signal that table exists to give an operator.
+- **`KillMode=process` on the shipped worker units.** systemd's default
+  `KillMode=control-group` tears down the whole cgroup when the main process dies, which on
+  a *crash* kills the two things designed to survive it — the co-resident Tier-2 reaper
+  (a separate child precisely so it outlives the supervisor) and the reparented job
+  children. State stayed correct because Tier 3 backs everything up, but Tier 3 orphans
+  *jobs* and never kills processes, so it could re-dispatch an idempotent job while the
+  original child still ran on that box; closing that window is the whole reason the reaper
+  is a separate process. systemd also will not restart until the cgroup empties, so a
+  generous `TimeoutStopSec` (which you want, so a drain can outlast a long job) became lane
+  downtime on every crash — and with `TimeoutStopSec=infinity`, an indefinite wedge in
+  `deactivating`.
+
+### Added
+- **Laravel 13 and PHP 8.5 support.** `illuminate/*` widened to `^13.0`,
+  `symfony/{process,uid}` to `^8.0`, Testbench to `^11.0`, PHPUnit to `^13.0`. Livewire
+  stays at `^3.5` — 3.7.11+ already declares `illuminate/support ^13.0`. CI gains a
+  `13.*`/`testbench-11.*` lane and PHP 8.5, minus Laravel 11 × PHP 8.5, a pair upstream
+  never tested and which `12.*`/`13.*` already cover.
+- **Lane coverage on the Workers page.** A lane whose supervisor died and was never
+  restarted is the one fleet failure nothing reported: every job is fine, every invariant
+  holds, the database is consistent — the work just queues. Workers now shows a chip per
+  lane (supervisors, capacity, queued depth), calls out any lane with queued work and
+  nobody serving it, and names each supervisor's lane on its row.
+
+### Changed
+- **Attempt error records are written in one DB-frame statement, encode-safe.** Both
+  failure-path writes to `job_attempts.error` went through `->save()`, which auto-stamps
+  `updated_at` on the app clock, and encodes via the model's `array` cast — a cast that
+  *throws* on a payload it cannot encode, at the first statement of the failure path. An
+  exception message is built by userland and routinely quotes bytes off a socket, a file,
+  or a driver error, so invalid UTF-8 lands there. When it did, nothing was recorded and
+  the child died with an uncaught exception, leaving the supervisor to synthesize a
+  `ProcessDied` describing the corpse rather than the exception. Both writes are now a
+  single query-builder `UPDATE` carrying the error and a `CURRENT_TIMESTAMP` `updated_at`,
+  with the payload encoded using `JSON_INVALID_UTF8_SUBSTITUTE |
+  JSON_PARTIAL_OUTPUT_ON_ERROR` — lossy, but a substituted byte beats losing the diagnosis,
+  and the output stays valid JSON so nothing changes on the read side. `jobs.last_error`
+  and `jobs.result` still go through the cast, so this narrows that window rather than
+  closing it.
+- **`Scheduling\OccurrenceCalculator` takes `run_at` as an argument.** `occurrences()` and
+  `nextDueAfter()` gained a required `?Carbon $runAt` parameter instead of reading it off
+  the model — assigning a Carbon to a datetime-cast attribute re-serializes it through a
+  bare `app.timezone` string on the way *in*, so a correctly-resolved instant was corrupted
+  again the moment it was handed back. The class is an internal collaborator of
+  `ScheduleEvaluator` and is not part of the documented API, but the signature change is
+  breaking for anything calling it directly.
+
+### Documentation
+- **"Running the roles: the launcher contract"** in `docs/HOSTING.md`. The global reaper
+  recovers *jobs*; the local reaper only ever *kills processes*; nothing in the package
+  starts either. A supervisor that dies and never comes back is therefore the quietest
+  failure in the system — recovery works, the database stays consistent, no invariant
+  breaks, and that lane's capacity is silently gone. Five tool-agnostic properties a
+  launcher must have, the per-launcher defaults that get a clean `exit 0` wrong (systemd
+  `Restart=no`, Docker's missing policy, supervisord's `autorestart=unexpected`), why
+  `always` does not fight a drain, and the corollary: drain through the launcher, never
+  `kill -TERM` on the PID.
+- **"Multiple lanes on one host"** — what is per-lane versus per-host, the full sequence
+  when a supervisor dies outside a drain, keeping Tier-2 takeover ahead of the Tier-3
+  budget, the `host_id`/PID-namespace trap for one-lane-per-container on a shared kernel,
+  and the per-lane alerts that have to exist because process death is invisible to the
+  engine. Also corrects two claims: heartbeats are written once per loop iteration (a
+  saturated supervisor beats at `poll_min_ms`), and `heartbeat_interval` sets the Tier-3
+  death threshold, not the write rate.
+
+### Upgrading
+No migrations. One thing to know if `app.timezone` is not UTC: rows written before this
+release keep their skewed values, and the scheduler now reads them in the DB frame. Where
+`app.timezone` was *behind* the database, the stored `last_evaluated_at` sits in the past
+by the offset, so the first tick after upgrade sees a window that wide. Schedules on the
+default `missed_policy=run_latest` (and `coalesce`) fire once regardless; a `run_all`
+schedule will backfill that window unless `catch_up_window_sec` or `max_catch_up` bounds
+it. Where `app.timezone` was *ahead*, the first tick sees an empty window, writes a correct
+`last_evaluated_at`, and is normal from the second tick on.
+
 ## [1.15.0] - 2026-07-26
 
 One supervisor fix — prefork recycling no longer stalls a busy worker — plus three changes

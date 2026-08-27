@@ -40,6 +40,12 @@ final class ChaosMonkeyE2ETest extends TestCase
         if ($this->engine() !== 'pgsql') {
             $this->markTestSkipped('Chaos E2E uses real child processes through the Docker/Postgres stack.');
         }
+        if (PHP_OS_FAMILY !== 'Linux') {
+            // Off-Linux the process probe is FakeProbe (see TestCase), which sends no real
+            // signal — the chaos mix's stubborn children are never killed, so the run can
+            // never reach terminal states. The real /proc probe is exercised in CI only.
+            $this->markTestSkipped('Chaos E2E needs the real /proc process probe (Linux only).');
+        }
 
         $this->root = dirname(__DIR__, 2);
 

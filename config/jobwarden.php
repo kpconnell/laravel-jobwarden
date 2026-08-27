@@ -125,6 +125,33 @@ return [
         // incident: one slow job held a lane's claiming at zero for 3+ hours). Set a
         // grace only on a lane whose longest job is reliably shorter than it.
         'prefork_recycle_grace' => (int) env('JOBWARDEN_PREFORK_RECYCLE_GRACE', 0),
+        // PREFORK only: container services a fork must NOT inherit. Immediately after the
+        // fork the child drops these bindings — container instance AND the facade's
+        // static cache, on the alias-normalized key, and only for shared bindings the
+        // master actually resolved (never booting a service just to forget it) — so the
+        // first use inside the job handler rebuilds a fresh instance with its own
+        // sockets instead of sharing the master's. Class-name keys and container
+        // aliases are fine; they normalize to the base binding. The defaults cover
+        // Laravel's connection-holding framework services plus the framework singletons
+        // known to capture them at construction (the PSR-6 wrapper, the rate limiter,
+        // the queue manager). Add your own keys for app singletons that hold sockets,
+        // or listen for JobWarden\Events\PreforkChildStarting to reset clients the
+        // container can't name (SDK clients, gRPC channels — see docs/HOSTING.md
+        // "Fork safety"). Forgetting a key does NOT fix references captured before the
+        // fork (a manager constructor-injected into an app singleton stays the
+        // master's) — those are hook territory too. Never list 'events': rebuilding
+        // the dispatcher would drop your listeners, including the hook itself.
+        // No env var: a list belongs in config, override by publishing.
+        'prefork_forget' => [
+            'redis',
+            'cache',
+            'cache.store',
+            'cache.psr6',
+            \Illuminate\Cache\RateLimiter::class,
+            'queue',
+            'mail.manager',
+            'log',
+        ],
 
         // On SIGTERM the supervisor stops claiming and waits for in-flight
         // children to finish, up to this many seconds. 0 = wait indefinitely

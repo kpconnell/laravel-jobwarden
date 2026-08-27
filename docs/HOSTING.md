@@ -541,6 +541,38 @@ recycle drain also ignores `JOBWARDEN_DRAIN_TIMEOUT` — timing out abandons chi
 `SIGKILL`ed by the local reaper, which is the right trade when the platform is stopping
 the container and the wrong one for housekeeping we chose to do.
 
+### Fork safety: what JobWarden resets, and what your app must
+
+`prefork` forks from an **already-booted** framework, so every child inherits whatever
+the master's boot opened — and a forked file descriptor is *shared*, not copied. The
+contract is the same one every mature preforking host converged on (Gunicorn's
+`post_fork`, Unicorn's `after_fork`, Octane's flush list): **JobWarden resets everything
+it owns and can name; one explicit hook covers everything it can't.** Three tiers:
+
+| Tier | What | Who resets it |
+|---|---|---|
+| 1 | JobWarden's own machinery: its DB connection, stdio, signal handlers, RNG state, boot timing | **JobWarden, unconditionally.** The child severs stdio, reseeds the RNG, drops inherited signal handlers, and reconnects its own DB session — the inherited PDO is held so no destructor can `COM_QUIT` the master's shared socket, and the child exits via `pcntl_exec` so no destructor *ever* runs. |
+| 2 | Framework services with well-known container keys that hold connections — or that captured one at construction | **JobWarden, by default** — `jobwarden.supervisor.prefork_forget` (defaults: `redis`, `cache`, `cache.store`, `cache.psr6`, the rate limiter, `queue`, `mail.manager`, `log`) is dropped in the child — the container instance **and the facade's static cache**, on the alias-normalized key — so the first use, whether `Cache::get()` or `app('cache')`, rebuilds a fresh instance with its own sockets. Only shared bindings the master actually resolved are touched; class-name keys and aliases normalize to the base binding. Publish the config to add your own keys or trim the list. |
+| 3 | Anything the container can't name: SDK clients with keep-alive sockets, gRPC channels, custom streams your providers opened — **and any reference to a Tier-2 service captured before the fork** (a manager constructor-injected into your own singleton is not swapped by forgetting its key) | **Your app**, via the `JobWarden\Events\PreforkChildStarting` event — dispatched inside the child after Tiers 1–2, immediately before your handler runs. Register a listener once in a service provider (listeners are inherited copy-on-write) and reset your clients there. |
+
+The rule of thumb for Tier 3 is one sentence: **if your app opened a connection before
+the fork, recreate it in the hook — never reuse it and never close it gracefully.** The
+danger isn't TCP per se, it's *in-band protocol state*: a raw close of a duplicated fd
+is harmless (the kernel refcounts it; the master's end stays open), but a client that
+says goodbye on the wire (`COM_QUIT`, SMTP `QUIT`, a TLS `close_notify`) or that keeps
+*using* the shared stream interleaves bytes into the master's live session. TLS-wrapped
+anything (HTTPS SDK clients, Redis over TLS) is the sneakiest case — reset it in the
+hook. Do **not** put `events` on the forget list: rebuilding the dispatcher would drop
+your registered listeners, including the Tier-3 hook itself.
+
+Every guarantee above is pinned by CI tests in real forks against MySQL and Postgres,
+at the level that matters: the child runs on its own DB *session* (server-side id, not
+object identity); a forget-listed, facade-accessed, alias-keyed service comes back on a
+different *kernel socket* (local port comparison) while the master's stays open and
+unchanged; the shipped `log` default rebuilds fresh through the facade; no destructor
+or shutdown function ever runs in a child; sibling forks are reseeded (`mt_rand`); and
+the hook fires inside the child, after the resets, with the child's pid.
+
 **The next ceiling is the database.** Once the boot is gone, per-job cost is dominated by
 the handful of small writes each job makes (claim, state transitions, the audit event,
 logs). Throughput then tracks your DB's commit rate, not the workers — size the DB (and,

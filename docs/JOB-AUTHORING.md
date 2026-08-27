@@ -265,6 +265,25 @@ This works identically in both execution modes: under `exec` it's the real
 stderr pipe, under `prefork` it lands in the attempt log and is drained into
 `job_logs` on reap.
 
+### Connections in a prefork handler
+
+Under `prefork` your handler runs in a fork of the already-booted master, and
+what it may safely touch follows one rule: **never reuse a connection that was
+opened before the fork.** JobWarden already gives you fresh copies of everything
+it can name — its own DB connection, plus the framework's connection-holding
+services on the `prefork_forget` config list (the redis, cache, queue, mail and
+log managers — exact keys in [CONFIGURATION.md](CONFIGURATION.md)) are reset in
+the child, facade access included, so `Cache::get()` or `app('redis')` in a
+handler builds fresh connections. Two things that reset can't reach are yours:
+an app singleton holding its own socket (an SDK client with keep-alive, a gRPC
+channel, a stream a service provider opened), and any object of yours that
+*captured* one of those framework managers before the fork — constructor
+injection keeps pointing at the master's instance no matter what the container
+forgets. Recreate both kinds in a `JobWarden\Events\PreforkChildStarting`
+listener (registered once in a service provider; it fires inside every child
+before your handler). See
+[HOSTING → Fork safety](HOSTING.md#fork-safety-what-jobwarden-resets-and-what-your-app-must).
+
 ## Long-running jobs and graceful stop
 
 On deploy/scale-down the supervisor sends SIGTERM and escalates to SIGKILL after

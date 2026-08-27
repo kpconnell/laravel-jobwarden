@@ -166,6 +166,94 @@ final class ForkExecutorTest extends TestCase
     }
 
     /**
+     * Tier 2 of the fork-safety contract, in-process (no fork needed — it's pure
+     * container arithmetic): every RESOLVED binding on the prefork_forget list is
+     * dropped so the next make() rebuilds fresh, the inherited instance is held so no
+     * destructor can say goodbye in-band on a shared socket, and a binding the master
+     * never resolved is NOT booted just to be forgotten. Unknown keys are ignored.
+     */
+    public function test_the_forget_list_rebuilds_resolved_services_and_never_boots_unresolved_ones(): void
+    {
+        $constructions = ['resolved' => 0, 'untouched' => 0];
+        $this->app->singleton('wb.resolved', function () use (&$constructions) {
+            $constructions['resolved']++;
+
+            return new \stdClass;
+        });
+        $this->app->singleton('wb.untouched', function () use (&$constructions) {
+            $constructions['untouched']++;
+
+            return new \stdClass;
+        });
+        $inherited = $this->app->make('wb.resolved');
+
+        config(['jobwarden.supervisor.prefork_forget' => ['wb.resolved', 'wb.untouched', 'wb.not-even-bound']]);
+
+        $executor = $this->executor();
+        (new ReflectionMethod(ForkExecutor::class, 'forgetFrameworkServices'))->invoke($executor);
+
+        $this->assertSame(0, $constructions['untouched'],
+            'a service the master never resolved was booted inside the child just to be forgotten');
+
+        $rebuilt = $this->app->make('wb.resolved');
+        $this->assertNotSame($inherited, $rebuilt, 'the listed binding still serves the inherited instance');
+        $this->assertSame(2, $constructions['resolved'], 'the rebuild did not go through the singleton binding');
+
+        $held = (new \ReflectionProperty(ForkExecutor::class, 'heldServices'))->getValue($executor);
+        $this->assertContains($inherited, $held,
+            'the inherited instance is not held — forgetting it can drop it to refcount 0 and fire a destructor mid-child');
+    }
+
+    /**
+     * REGRESSION (adversarial review): resolved() alias-resolves its argument but
+     * forgetInstance() does not — so a forget-list entry written as an alias (the
+     * idiomatic class-name key, e.g. CacheManager::class for 'cache') passed the
+     * guard, was dutifully "held", and then forgot NOTHING: the master's instance
+     * stayed live under the base key and the child kept sharing its sockets, silently.
+     * Keys must be alias-normalized before both the guard and the forget.
+     */
+    public function test_an_aliased_forget_key_still_drops_the_base_binding(): void
+    {
+        $this->app->singleton('wb.base', fn () => new \stdClass);
+        $this->app->alias('wb.base', 'wb.alias');
+        $inherited = $this->app->make('wb.base');
+
+        config(['jobwarden.supervisor.prefork_forget' => ['wb.alias']]);
+        (new ReflectionMethod(ForkExecutor::class, 'forgetFrameworkServices'))->invoke($this->executor());
+
+        $this->assertNotSame($inherited, $this->app->make('wb.base'),
+            'the alias passed the resolved() guard but forgot nothing — the base binding still serves the inherited instance');
+    }
+
+    /**
+     * REGRESSION (adversarial review): the guard was resolved() alone, which is also
+     * true for a plain bind() — for which make() CONSTRUCTS a brand-new instance (a
+     * service booted inside every fork, exactly what the contract forbids), holds the
+     * pointless fresh object, and forgets nothing. Non-shared bindings must be skipped
+     * without ever being instantiated.
+     */
+    public function test_a_resolved_non_shared_binding_is_skipped_without_being_constructed(): void
+    {
+        $constructions = 0;
+        $this->app->bind('wb.transient', function () use (&$constructions) {
+            $constructions++;
+
+            return new \stdClass;
+        });
+        $this->app->make('wb.transient');
+        $this->assertSame(1, $constructions);
+
+        config(['jobwarden.supervisor.prefork_forget' => ['wb.transient']]);
+        $executor = $this->executor();
+        (new ReflectionMethod(ForkExecutor::class, 'forgetFrameworkServices'))->invoke($executor);
+
+        $this->assertSame(1, $constructions,
+            'a non-shared binding was constructed inside the child just to be forgotten');
+        $this->assertSame([], (new \ReflectionProperty(ForkExecutor::class, 'heldServices'))->getValue($executor),
+            'a freshly built throwaway was held as if it were an inherited instance');
+    }
+
+    /**
      * REGRESSION: hardExit terminates via pcntl_exec, so the exec'd image's status IS
      * the child's status. Exec'ing /bin/true for every outcome reported a clean 0 for
      * a child that died mid-flight, which the supervisor renders to an operator as

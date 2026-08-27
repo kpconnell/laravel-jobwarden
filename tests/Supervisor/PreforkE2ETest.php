@@ -21,9 +21,16 @@ use JobWarden\Supervisor\Supervisor;
 use JobWarden\Tests\Concerns\RefreshesJobWardenSchema;
 use JobWarden\Tests\TestCase;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Event;
 use Workbench\App\Jobs\CrashJob;
+use Workbench\App\Jobs\DestructorProbeJob;
 use Workbench\App\Jobs\FailingJob;
+use Workbench\App\Jobs\ForkReportJob;
 use Workbench\App\Jobs\MarkerJob;
+use Illuminate\Support\Facades\Log;
+use Workbench\App\Support\ForkProbe;
+use Workbench\App\Support\SocketProbe;
+use Workbench\App\Support\SocketProbeFacade;
 
 /**
  * End-to-end PREFORK execution (config execution_mode=prefork): the supervisor
@@ -334,6 +341,300 @@ final class PreforkE2ETest extends TestCase
             'the grace window expired but the master kept claiming');
 
         @unlink($slowMarker);
+    }
+
+    // ------------------------------------------------------------------
+    // Fork safety (docs/HOSTING.md "Fork safety"): the three-tier contract,
+    // each tier pinned by a direct behavioural assertion in a REAL fork.
+    // ------------------------------------------------------------------
+
+    /**
+     * Tier 1, directly: the storm test proves the master's connection SURVIVES; this
+     * proves the child actually ran on a DIFFERENT DB session. Silent interleaving on
+     * the inherited socket "works" at low concurrency and corrupts in prod — exactly
+     * the failure mode a survival-only assertion can't see.
+     */
+    public function test_a_forked_child_talks_on_its_own_db_session_not_the_masters(): void
+    {
+        $report = $this->storage.'/fork-report-'.bin2hex(random_bytes(4)).'.json';
+        @unlink($report);
+
+        $masterBackendId = $this->backendId();
+        $job = $this->app->make(JobWarden::class)->dispatch(ForkReportJob::class, ['report' => $report]);
+
+        $supervisor = $this->supervisor();
+        $supervisor->boot();
+        $final = $this->driveUntil($supervisor, [$job->id]);
+        $this->assertSame(JobState::Succeeded, $final[$job->id]->state);
+
+        $facts = json_decode((string) file_get_contents($report), true);
+        $this->assertNotSame(getmypid(), $facts['child_pid'], 'the report was written by the master, not a fork');
+        $this->assertNotSame($masterBackendId, $facts['db_backend_id'],
+            'the child queried on the MASTER\'S DB session — the inherited socket was reused instead of reconnected');
+
+        // ...and the master is still on the same session it started on: nothing the
+        // child did reconnected or replaced the master's own handle.
+        $this->assertSame($masterBackendId, $this->backendId(), 'the master\'s session changed underneath it');
+
+        @unlink($report);
+    }
+
+    /**
+     * Tier 1: the child must terminate via pcntl_exec — no PHP shutdown functions, no
+     * destructors — because a destructor is precisely the code path that would send a
+     * graceful goodbye (COM_QUIT, TLS close_notify) down a socket shared with the
+     * master. The job plants both tripwires; neither may fire.
+     */
+    public function test_a_forked_child_never_runs_shutdown_functions_or_destructors(): void
+    {
+        $shutdown = $this->storage.'/tripwire-shutdown.txt';
+        $destructor = $this->storage.'/tripwire-destructor.txt';
+        @unlink($shutdown);
+        @unlink($destructor);
+
+        $job = $this->app->make(JobWarden::class)->dispatch(DestructorProbeJob::class, [
+            'shutdownMarker' => $shutdown,
+            'destructorMarker' => $destructor,
+        ]);
+
+        $supervisor = $this->supervisor();
+        $supervisor->boot();
+        $final = $this->driveUntil($supervisor, [$job->id]);
+        $this->assertSame(JobState::Succeeded, $final[$job->id]->state, 'the tripwires were never even planted');
+
+        $this->assertFileDoesNotExist($shutdown,
+            'a register_shutdown_function ran in the child — it no longer exits via pcntl_exec, so PDO destructors can now COM_QUIT the master\'s socket');
+        $this->assertFileDoesNotExist($destructor,
+            'an object destructor ran in the child — it no longer exits via pcntl_exec, so PDO destructors can now COM_QUIT the master\'s socket');
+    }
+
+    /**
+     * Tier 1: siblings forked from the same master image must not mint identical
+     * mt_rand values (fork copies the userland MT state; resetAfterFork reseeds) and
+     * each must hold its own DB session. Honest scope, per adversarial review: mt_rand
+     * is the ONLY entropy axis that can catch a deleted reseed, and even it passes
+     * accidentally if the master advances MT state between forks. random_bytes/uuid
+     * draw from the kernel CSPRNG per call and physically cannot collide across forks
+     * — they are asserted as sanity, not as coverage of any reset. child_pid
+     * uniqueness is likewise trivial while forks coexist.
+     */
+    public function test_sibling_forks_share_no_entropy_and_no_db_session(): void
+    {
+        $n = 8;
+        $ids = [];
+        $reports = [];
+        for ($i = 0; $i < $n; $i++) {
+            $reports[$i] = $this->storage.'/entropy-'.$i.'.json';
+            @unlink($reports[$i]);
+            $ids[] = $this->app->make(JobWarden::class)
+                ->dispatch(ForkReportJob::class, ['report' => $reports[$i]])->id;
+        }
+
+        $supervisor = $this->supervisor(capacity: 4);
+        $supervisor->boot();
+        $this->driveUntil($supervisor, $ids, timeout: 40.0);
+
+        $facts = array_map(fn (string $r) => json_decode((string) file_get_contents($r), true), $reports);
+        foreach (['child_pid', 'db_backend_id', 'mt_rand', 'random_bytes', 'uuid'] as $key) {
+            $values = array_column($facts, $key);
+            $this->assertCount($n, array_unique($values), "siblings shared a {$key} — forks are not independent on this axis");
+        }
+
+        foreach ($reports as $r) {
+            @unlink($r);
+        }
+    }
+
+    /**
+     * Tier 2: a container service on the prefork_forget list, resolved by the master
+     * before the fork, must be REBUILT inside the child on first use (fresh instance,
+     * fresh sockets) — while the master keeps its own instance untouched.
+     */
+    public function test_the_prefork_forget_list_rebuilds_a_listed_service_inside_the_fork(): void
+    {
+        $this->app->singleton('workbench.fork-probe', ForkProbe::class);
+        $masterProbe = $this->app->make('workbench.fork-probe');
+        $this->assertSame(getmypid(), $masterProbe->constructedInPid);
+
+        config(['jobwarden.supervisor.prefork_forget' => array_merge(
+            config('jobwarden.supervisor.prefork_forget'),
+            ['workbench.fork-probe'],
+        )]);
+
+        $report = $this->storage.'/forget-report.json';
+        @unlink($report);
+        $job = $this->app->make(JobWarden::class)->dispatch(ForkReportJob::class, ['report' => $report]);
+
+        $supervisor = $this->supervisor();
+        $supervisor->boot();
+        $final = $this->driveUntil($supervisor, [$job->id]);
+        $this->assertSame(JobState::Succeeded, $final[$job->id]->state);
+
+        $facts = json_decode((string) file_get_contents($report), true);
+        $this->assertNotNull($facts['probe_constructed_pid'], 'the child never saw the probe binding');
+        $this->assertSame($facts['child_pid'], $facts['probe_constructed_pid'],
+            'the child resolved the MASTER\'S inherited instance — prefork_forget did not drop the binding, so a real service here would be sharing the master\'s sockets');
+
+        $this->assertSame($masterProbe, $this->app->make('workbench.fork-probe'),
+            'the master\'s own instance was replaced — the forget must happen only inside the child');
+
+        @unlink($report);
+    }
+
+    /**
+     * Tier 2 at the KERNEL level, through the access path real apps use. Object
+     * identity is only a proxy — the property that matters is "different socket". A
+     * TCP connection's local ephemeral ip:port is its kernel identity (a fresh
+     * connection cannot reuse it while the original is open), so this binds a
+     * singleton that opens a real TCP connection, resolves it in the master THROUGH A
+     * FACADE (populating the static Facade cache the fork inherits copy-on-write),
+     * lists it on prefork_forget BY A CONTAINER ALIAS, and asserts the child — also
+     * going through the facade — reports a different local port than the master.
+     *
+     * This one test regresses both silent-defeat bugs the adversarial review
+     * confirmed: an alias key that forgetInstance() would miss without normalization,
+     * and the facade static cache that would bypass the container entirely.
+     */
+    public function test_the_forget_list_severs_a_facade_accessed_aliased_socket_service_at_the_kernel_level(): void
+    {
+        // Closure concrete, NOT the class name: with the alias below, a class-name
+        // concrete would alias-resolve back to the abstract and recurse forever.
+        $this->app->singleton('workbench.socket-probe', fn () => new SocketProbe);
+        $this->app->alias('workbench.socket-probe', SocketProbe::class);
+        config(['jobwarden.supervisor.prefork_forget' => array_merge(
+            config('jobwarden.supervisor.prefork_forget'),
+            [SocketProbe::class],   // the ALIAS, not the base key — must still work
+        )]);
+
+        // Resolve through the facade so Facade::$resolvedInstance is populated in the
+        // master before the fork — the exact state that used to defeat the forget.
+        $masterSocket = SocketProbeFacade::localName();
+        $this->assertSame(getmypid(), SocketProbeFacade::getFacadeRoot()->constructedInPid);
+
+        $report = $this->storage.'/socket-report.json';
+        @unlink($report);
+        $job = $this->app->make(JobWarden::class)->dispatch(ForkReportJob::class, ['report' => $report]);
+
+        $supervisor = $this->supervisor();
+        $supervisor->boot();
+        $final = $this->driveUntil($supervisor, [$job->id]);
+        $this->assertSame(JobState::Succeeded, $final[$job->id]->state);
+
+        $facts = json_decode((string) file_get_contents($report), true);
+        $this->assertNotNull($facts['socket_local'], 'the child never saw the probe binding');
+        $this->assertSame($facts['child_pid'], $facts['socket_constructed_pid'],
+            'the facade handed the child the MASTER\'S inherited instance — the static facade cache or the alias defeated prefork_forget');
+        $this->assertNotSame($masterSocket, $facts['socket_local'],
+            'same local ip:port = the child is on the MASTER\'S kernel socket, not a fresh connection');
+
+        // The master's side is untouched: same instance, same socket, still open.
+        $this->assertSame($masterSocket, SocketProbeFacade::localName(),
+            'the master\'s probe connection changed — the forget leaked out of the child');
+
+        @unlink($report);
+    }
+
+    /**
+     * Tier 2 for a SHIPPED default ('log'), through the facade. Shared context lives
+     * on the LogManager instance: the master stamps it via Log::, and a child whose
+     * Log:: still serves the inherited manager would see the stamp. A rebuilt manager
+     * comes back empty. Without this, no test exercises any of the default
+     * prefork_forget keys — a typo'd or renamed default would no-op with zero signal.
+     */
+    public function test_the_shipped_log_default_rebuilds_fresh_through_the_facade_inside_the_fork(): void
+    {
+        Log::shareContext(['jobwarden_master_boot_pid' => getmypid()]);
+        $this->assertArrayHasKey('jobwarden_master_boot_pid', Log::sharedContext());
+
+        $report = $this->storage.'/log-default-report.json';
+        @unlink($report);
+        $job = $this->app->make(JobWarden::class)->dispatch(ForkReportJob::class, ['report' => $report]);
+
+        $supervisor = $this->supervisor();
+        $supervisor->boot();
+        $final = $this->driveUntil($supervisor, [$job->id]);
+        $this->assertSame(JobState::Succeeded, $final[$job->id]->state);
+
+        $facts = json_decode((string) file_get_contents($report), true);
+        $this->assertArrayNotHasKey('jobwarden_master_boot_pid', (array) $facts['log_shared_context'],
+            'Log:: in the child served the MASTER\'S inherited LogManager — the shipped \'log\' default (or its facade clearing) no longer works');
+
+        // The master's manager keeps its stamp — the reset happened only in the child.
+        $this->assertArrayHasKey('jobwarden_master_boot_pid', Log::sharedContext());
+        Log::flushSharedContext();
+
+        @unlink($report);
+    }
+
+    /**
+     * Tier 3: the app's after-fork hook. A listener registered once in the master
+     * (inherited copy-on-write) must fire INSIDE the child, with the right attempt
+     * and the child's pid — and the documented ORDERING must hold at fire time: the
+     * whole point of the hook is that a listener may safely open connections because
+     * Tiers 1–2 already ran. So the listener itself records the evidence: the DB
+     * session it sees (must already be the child's own, not the master's) and the
+     * construction pid of a forget-listed service (must already be rebuilt). Moving
+     * the event() above the resets in runChild fails this test.
+     */
+    public function test_the_prefork_child_starting_event_fires_inside_the_child(): void
+    {
+        $this->app->singleton('workbench.fork-probe', ForkProbe::class);
+        $this->app->make('workbench.fork-probe');
+        config(['jobwarden.supervisor.prefork_forget' => array_merge(
+            config('jobwarden.supervisor.prefork_forget'),
+            ['workbench.fork-probe'],
+        )]);
+        $masterBackendId = $this->backendId();
+
+        $hookMarker = $this->storage.'/hook-'.bin2hex(random_bytes(4)).'.json';
+        @unlink($hookMarker);
+
+        $backendId = fn (): int => $this->backendId();
+        Event::listen(\JobWarden\Events\PreforkChildStarting::class,
+            static function (\JobWarden\Events\PreforkChildStarting $e) use ($hookMarker, $backendId): void {
+                file_put_contents($hookMarker, json_encode([
+                    'attempt_id' => $e->attemptId,
+                    'event_pid' => $e->childPid,
+                    'running_pid' => getmypid(),
+                    'db_backend_id_at_fire' => $backendId(),
+                    'probe_pid_at_fire' => app('workbench.fork-probe')->constructedInPid,
+                ]));
+            });
+
+        $job = $this->app->make(JobWarden::class)->dispatch(MarkerJob::class, []);
+
+        $supervisor = $this->supervisor();
+        $supervisor->boot();
+        $final = $this->driveUntil($supervisor, [$job->id]);
+        $this->assertSame(JobState::Succeeded, $final[$job->id]->state);
+
+        $this->assertFileExists($hookMarker, 'PreforkChildStarting never fired — apps have no after-fork hook');
+        $hook = json_decode((string) file_get_contents($hookMarker), true);
+
+        $attempt = JobAttempt::where('job_id', $job->id)->first();
+        $this->assertSame($attempt->id, $hook['attempt_id']);
+        $this->assertSame((int) $attempt->child_pid, $hook['event_pid'], 'the event does not carry the fork\'s own pid');
+        $this->assertSame($hook['event_pid'], $hook['running_pid'], 'the listener ran in the wrong process — the hook must fire INSIDE the child');
+        $this->assertNotSame(getmypid(), $hook['running_pid'], 'the hook fired in the master, not the fork');
+
+        // The ordering half of the contract, observed AT FIRE TIME by the listener:
+        $this->assertNotSame($masterBackendId, $hook['db_backend_id_at_fire'],
+            'at fire time the listener was on the MASTER\'S DB session — the event moved above the DB reconnect');
+        $this->assertSame($hook['running_pid'], $hook['probe_pid_at_fire'],
+            'at fire time a forget-listed service was still the master\'s instance — the event moved above the forget');
+
+        @unlink($hookMarker);
+    }
+
+    /** The current backend/session id of the master's own jobwarden connection. */
+    private function backendId(): int
+    {
+        $conn = DB::connection('jobwarden');
+
+        return match ($conn->getDriverName()) {
+            'pgsql' => (int) $conn->select('SELECT pg_backend_pid() AS id')[0]->id,
+            default => (int) $conn->select('SELECT CONNECTION_ID() AS id')[0]->id,
+        };
     }
 
     /**

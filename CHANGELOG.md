@@ -12,21 +12,33 @@ Octane's flush list): JobWarden resets everything it owns and can name; one docu
 hook covers everything it can't. No migrations.
 
 ### Added
-- **`jobwarden.supervisor.prefork_forget`** (config-only; defaults `redis`, `cache`,
-  `cache.store`, `cache.psr6`, `Illuminate\Cache\RateLimiter::class`, `queue`,
-  `mail.manager`, `log` — the connection-holding framework managers plus the framework
+- **`jobwarden.supervisor.prefork_forget`** (config-only; the shipped list is
+  `ForkExecutor::DEFAULT_FORGET` — `redis`, `cache`, `cache.store`, `cache.psr6`,
+  `Illuminate\Cache\RateLimiter::class`, `queue`, `queue.connection`, `filesystem`,
+  `mail.manager`, `log`: the connection-holding framework managers plus the framework
   singletons known to capture them at construction) — container services a prefork
   child drops right after the fork so first use rebuilds a fresh instance with its own
   sockets instead of sharing the master's. The drop covers both access paths: the
-  container instance **and the facade's static resolved-instance cache** (inherited
-  copy-on-write, and consulted before the container — without clearing it, `Cache::` /
-  `Redis::` / `Log::` in a handler would keep serving the master's manager), on the
-  alias-normalized key, so class-name and alias entries work. Only shared bindings the
-  master actually resolved are touched — nothing is booted just to be forgotten — and
-  each inherited instance is held so no client destructor can say goodbye in-band
-  (`QUIT`, TLS `close_notify`) down a socket shared with the master. The facade,
-  alias, and non-shared-binding hazards were surfaced by an adversarial multi-agent
-  review of this change set; each fix is mutation-tested (removing it fails a test).
+  container instance, on the alias-normalized key (class-name and alias entries work),
+  **and every facade's static resolved-instance cache** (inherited copy-on-write,
+  consulted before the container, and keyed by accessor — which may be an alias or a
+  contract, so all are cleared, as Octane does; without this `Cache::` / `Redis::` /
+  `Log::` in a handler would keep serving the master's manager). Only shared bindings
+  with a concrete that the master actually resolved are touched — nothing is booted
+  just to be forgotten, and `$app->instance()` registrations are skipped because there
+  is nothing to rebuild them from — and each inherited instance is held so no client
+  destructor can say goodbye in-band (`QUIT`, TLS `close_notify`) down a socket shared
+  with the master. A published config that predates the key falls back to the shipped
+  list rather than silently forgetting nothing. These hazards (facade cache, alias
+  asymmetry, non-shared and instance() bindings, the empty-fallback, captured
+  references) were surfaced by two rounds of adversarial multi-agent review of this
+  change set; each code fix is mutation-tested (removing it fails a test).
+- **Persistent connections are refused under prefork.** PHP keeps persistent handles
+  in a process-wide list the fork inherits, so a "fresh" client in the child gets the
+  master's socket back — no forgetting fixes that. A supervisor whose `jobwarden`
+  connection carries `PDO::ATTR_PERSISTENT` now refuses to fork, logs a warning, and
+  runs in `child` mode; the docs state the rule for the app's own connections
+  (phpredis `persistent`, memcached `persistent_id`).
 - **`JobWarden\Events\PreforkChildStarting`** — the app's after-fork hook, dispatched
   inside the child after JobWarden's own resets and immediately before the handler.
   Register a listener once in a service provider (inherited copy-on-write) to recreate
@@ -44,6 +56,10 @@ hook covers everything it can't. No migrations.
   (the `pcntl_exec` exit contract, previously guarded only indirectly); and the hook
   fires inside the child, demonstrably *after* the DB reconnect and the forget list
   (the listener itself records the DB session and a rebuilt service at fire time).
+  And because the child now rebuilds `log`, a handler's own `Log::` lines and its raw
+  `php://stdout` are both asserted to reach `job_logs` from a real fork. The hook runs
+  with the host log channel already silenced (a listener's `Log::` lines are dropped,
+  not captured — job-log capture is installed later by the runner).
 - **Docs: [HOSTING → Fork safety](docs/HOSTING.md#fork-safety-what-jobwarden-resets-and-what-your-app-must)**
   — the three tiers, the one-sentence rule for handlers (*never reuse or gracefully
   close a connection opened before the fork — recreate it*), and why the hazard is

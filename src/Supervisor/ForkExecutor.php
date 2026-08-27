@@ -46,6 +46,27 @@ use Illuminate\Support\Facades\DB;
 final class ForkExecutor
 {
     /**
+     * The shipped prefork_forget list (config/jobwarden.php references this) — the
+     * connection-holding framework managers plus the framework singletons known to
+     * capture one of them at construction. Also the in-code fallback when a published
+     * config predates the key.
+     *
+     * @var list<string>
+     */
+    public const DEFAULT_FORGET = [
+        'redis',
+        'cache',
+        'cache.store',
+        'cache.psr6',
+        \Illuminate\Cache\RateLimiter::class,
+        'queue',
+        'queue.connection',
+        'filesystem',
+        'mail.manager',
+        'log',
+    ];
+
+    /**
      * Inherited PDOs held for the life of the child ON PURPOSE: keeping them referenced
      * stops disconnect() from destructing them (which would COM_QUIT the shared socket).
      *
@@ -141,6 +162,13 @@ final class ForkExecutor
 
         // Tier 3 of the fork-safety contract: the app's after-fork hook, fired after
         // everything JobWarden owns is severed and immediately before the handler.
+        // The host log channel is silenced FIRST (the same step ChildRunner takes):
+        // 'log' was just forgotten, so a listener's first Log:: call builds a fresh
+        // manager — which must not land on the host's default channel (a file, a
+        // remote sink, php://stderr → this attempt's log) or throw from it. Job-log
+        // capture into job_logs is installed later by ChildRunner; listener log lines
+        // are silenced, not captured (documented in HOSTING "Fork safety").
+        ChildRunner::silenceHostLogChannel();
         event(new \JobWarden\Events\PreforkChildStarting($attemptId, (int) $pid));
 
         return app(ChildRunner::class)->run($attemptId, $token, $nonce);
@@ -224,22 +252,31 @@ final class ForkExecutor
     private function forgetFrameworkServices(): void
     {
         $app = app();
-        foreach ((array) config('jobwarden.supervisor.prefork_forget', []) as $abstract) {
+        $bindings = $app->getBindings();
+        // `??` not a config default: a config published before 1.17 replaces the whole
+        // 'supervisor' block (mergeConfigFrom is a shallow merge), and a missing key
+        // must fall back to the shipped list, never to "forget nothing" silently.
+        $keys = config('jobwarden.supervisor.prefork_forget') ?? self::DEFAULT_FORGET;
+
+        foreach ((array) $keys as $abstract) {
             if (! is_string($abstract) || $abstract === '') {
                 continue;
             }
             // Normalize container aliases FIRST: resolved() alias-resolves its argument
             // but forgetInstance() is a bare unset on the base key, so an aliased entry
             // (e.g. CacheManager::class for 'cache') would pass the guard and then
-            // silently forget nothing. Facade accessors are also the base keys, so the
-            // normalized key is the one the facade cache must be cleared under.
+            // silently forget nothing.
             $abstract = $app->getAlias($abstract);
 
             // Only a SHARED binding the master actually resolved holds a cached instance
-            // to drop. resolved() alone is not enough: a plain bind() marks resolved but
-            // caches nothing, so make() here would CONSTRUCT a fresh instance inside
-            // every fork just to discard it.
-            if (! $app->resolved($abstract) || ! $app->isShared($abstract)) {
+            // to drop, and only a binding with a concrete (singleton()/bind(), not a
+            // bare instance()) can be REBUILT in the child — an instance() registration
+            // has nothing to rebuild from, so forgetting it would make the child's first
+            // use autowire a different object or throw; those are hook territory and are
+            // skipped here. resolved() alone is not enough either: a plain bind() marks
+            // resolved but caches nothing, so make() would CONSTRUCT a fresh instance
+            // inside every fork just to discard it.
+            if (! $app->resolved($abstract) || ! $app->isShared($abstract) || ! isset($bindings[$abstract])) {
                 continue;
             }
 
@@ -248,13 +285,16 @@ final class ForkExecutor
                 $this->heldServices[] = $instance;
             }
             $app->forgetInstance($abstract);
-
-            // The container is not the only cache: facades keep the resolved root in a
-            // static (inherited copy-on-write), keyed by accessor = this base key. Left
-            // uncleared, Cache::/Redis::/Log:: in the handler would bypass the container
-            // and keep using the MASTER'S inherited manager — and its sockets.
-            \Illuminate\Support\Facades\Facade::clearResolvedInstance($abstract);
         }
+
+        // The container is not the only cache: facades keep the resolved root in a
+        // static (inherited copy-on-write) keyed by the facade's ACCESSOR string, which
+        // may be the base key, an alias, or a contract name — it cannot be derived from
+        // the forget list. So clear every facade's cached root, as Octane does: a facade
+        // over an untouched service simply re-resolves the same container instance on
+        // its next call, while Cache::/Redis::/Log:: over a forgotten one stop serving
+        // the MASTER'S inherited manager — and its sockets.
+        \Illuminate\Support\Facades\Facade::clearResolvedInstances();
     }
 
     /**

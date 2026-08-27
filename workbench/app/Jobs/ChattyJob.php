@@ -17,11 +17,17 @@ final class ChattyJob implements JobWardenJob
     public function __construct(
         private readonly int $steps = 3,
         private readonly int $delay = 0,
+        private readonly string $stdout = '',
     ) {
     }
 
     public function handle(JobContext $context): void
     {
+        if ($this->stdout !== '') {
+            // Raw fd 1, bypassing the Log facade entirely — under prefork this is the
+            // attempt log the supervisor ingests into job_logs on reap.
+            file_put_contents('php://stdout', $this->stdout."\n");
+        }
         for ($i = 1; $i <= $this->steps; $i++) {
             Log::info("working step {$i}/{$this->steps}", ['step' => 'progress', 'i' => $i]);
             if ($this->delay > 0) {

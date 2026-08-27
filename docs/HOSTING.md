@@ -552,8 +552,8 @@ it owns and can name; one explicit hook covers everything it can't.** Three tier
 | Tier | What | Who resets it |
 |---|---|---|
 | 1 | JobWarden's own machinery: its DB connection, stdio, signal handlers, RNG state, boot timing | **JobWarden, unconditionally.** The child severs stdio, reseeds the RNG, drops inherited signal handlers, and reconnects its own DB session — the inherited PDO is held so no destructor can `COM_QUIT` the master's shared socket, and the child exits via `pcntl_exec` so no destructor *ever* runs. |
-| 2 | Framework services with well-known container keys that hold connections — or that captured one at construction | **JobWarden, by default** — `jobwarden.supervisor.prefork_forget` (defaults: `redis`, `cache`, `cache.store`, `cache.psr6`, the rate limiter, `queue`, `mail.manager`, `log`) is dropped in the child — the container instance **and the facade's static cache**, on the alias-normalized key — so the first use, whether `Cache::get()` or `app('cache')`, rebuilds a fresh instance with its own sockets. Only shared bindings the master actually resolved are touched; class-name keys and aliases normalize to the base binding. Publish the config to add your own keys or trim the list. |
-| 3 | Anything the container can't name: SDK clients with keep-alive sockets, gRPC channels, custom streams your providers opened — **and any reference to a Tier-2 service captured before the fork** (a manager constructor-injected into your own singleton is not swapped by forgetting its key) | **Your app**, via the `JobWarden\Events\PreforkChildStarting` event — dispatched inside the child after Tiers 1–2, immediately before your handler runs. Register a listener once in a service provider (listeners are inherited copy-on-write) and reset your clients there. |
+| 2 | Framework services with well-known container keys that hold connections — or that captured one at construction | **JobWarden, by default** — `jobwarden.supervisor.prefork_forget` (defaults: `redis`, `cache`, `cache.store`, `cache.psr6`, the rate limiter, `queue`, `queue.connection`, `filesystem`, `mail.manager`, `log`; the list is `ForkExecutor::DEFAULT_FORGET`, also the fallback when a published config predates the key) is dropped in the child, and **every facade's static cache is cleared** (facades cache by accessor, which may be an alias or a contract — so all are cleared, as Octane does), so the first use, whether `Cache::get()` or `app('cache')`, rebuilds a fresh instance with its own sockets. Only shared bindings with a concrete the master actually resolved are touched; class-name keys and aliases normalize to the base binding. Publish the config to add your own keys or trim the list. |
+| 3 | Anything the container can't name: SDK clients with keep-alive sockets, gRPC channels, custom streams your providers opened — **plus two things the forget list cannot reach**: a reference to a Tier-2 service captured before the fork (a manager constructor-injected into your own singleton is not swapped by forgetting its key), and a service registered with `$app->instance()` (nothing to rebuild it from, so it is skipped even if listed) | **Your app**, via the `JobWarden\Events\PreforkChildStarting` event — dispatched inside the child after Tiers 1–2, immediately before your handler runs. Register a listener once in a service provider (listeners are inherited copy-on-write) and reset your clients there. The hook runs with the host log channel already silenced but *before* job-log capture: a listener's `Log::` lines are dropped, not recorded in `job_logs`. |
 
 The rule of thumb for Tier 3 is one sentence: **if your app opened a connection before
 the fork, recreate it in the hook — never reuse it and never close it gracefully.** The
@@ -564,6 +564,15 @@ says goodbye on the wire (`COM_QUIT`, SMTP `QUIT`, a TLS `close_notify`) or that
 anything (HTTPS SDK clients, Redis over TLS) is the sneakiest case — reset it in the
 hook. Do **not** put `events` on the forget list: rebuilding the dispatcher would drop
 your registered listeners, including the Tier-3 hook itself.
+
+**Persistent connections are incompatible with `prefork`.** `PDO::ATTR_PERSISTENT`,
+phpredis `persistent`, memcached `persistent_id`: PHP keeps those handles in a
+*process-wide* persistent list, which the fork inherits — so a "fresh" client built in
+the child looks its socket up by hash and gets the **master's** descriptor back. No
+amount of forgetting fixes that. JobWarden guards its own half: a supervisor whose
+`jobwarden` connection is PDO-persistent refuses to fork, logs a warning, and runs in
+`child` mode instead. Your half is the rule: no persistent options on any connection a
+prefork handler touches.
 
 Every guarantee above is pinned by CI tests in real forks against MySQL and Postgres,
 at the level that matters: the child runs on its own DB *session* (server-side id, not

@@ -12,6 +12,15 @@ use JobWarden\Tests\TestCase;
 use PHPUnit\Framework\Attributes\DataProvider;
 use ReflectionMethod;
 
+/** A facade whose accessor is a container ALIAS of the real binding ('wb.base'). */
+final class AliasAccessorFacade extends \Illuminate\Support\Facades\Facade
+{
+    protected static function getFacadeAccessor(): string
+    {
+        return 'wb.alias-name';
+    }
+}
+
 /**
  * The prefork child's process-level contract, exercised in REAL forks (the only
  * place it's observable — both behaviours mutate the calling process's own file
@@ -251,6 +260,67 @@ final class ForkExecutorTest extends TestCase
             'a non-shared binding was constructed inside the child just to be forgotten');
         $this->assertSame([], (new \ReflectionProperty(ForkExecutor::class, 'heldServices'))->getValue($executor),
             'a freshly built throwaway was held as if it were an inherited instance');
+    }
+
+    /**
+     * REGRESSION (adversarial review, round 2): facades cache their root under the
+     * ACCESSOR string — which may be an alias or a contract name, not the base key —
+     * so clearing the facade cache under the normalized key alone left a facade whose
+     * accessor is the alias serving the master's instance. Every facade root must be
+     * cleared. Also the sqlite-lane guard for the facade half of Tier 2: without a
+     * facade in a unit test, deleting the clearing only failed the engine-gated E2E.
+     */
+    public function test_a_facade_whose_accessor_is_an_alias_stops_serving_the_inherited_root(): void
+    {
+        $this->app->singleton('wb.base', fn () => new \stdClass);
+        $this->app->alias('wb.base', 'wb.alias-name');
+        $inherited = AliasAccessorFacade::getFacadeRoot();   // populates the static cache under the ALIAS
+        $this->assertSame($inherited, $this->app->make('wb.base'));
+
+        config(['jobwarden.supervisor.prefork_forget' => ['wb.base']]);
+        (new ReflectionMethod(ForkExecutor::class, 'forgetFrameworkServices'))->invoke($this->executor());
+
+        $this->assertNotSame($inherited, AliasAccessorFacade::getFacadeRoot(),
+            'the facade (accessor = alias) still serves the master\'s inherited root — the facade cache was cleared under the base key only');
+        $this->assertSame(AliasAccessorFacade::getFacadeRoot(), $this->app->make('wb.base'),
+            'facade and container disagree about the current instance');
+    }
+
+    /**
+     * REGRESSION (adversarial review, round 2): $app->instance() — the common way to
+     * register a pre-built SDK client — passes resolved()+isShared() but has no binding
+     * to rebuild from, so forgetting it made the child's first use autowire a different
+     * object or throw. Such keys must be left alone (they are hook territory).
+     */
+    public function test_an_instance_registered_key_is_left_alone_because_it_cannot_be_rebuilt(): void
+    {
+        $prebuilt = new \stdClass;
+        $this->app->instance('wb.prebuilt', $prebuilt);
+
+        config(['jobwarden.supervisor.prefork_forget' => ['wb.prebuilt']]);
+        $executor = $this->executor();
+        (new ReflectionMethod(ForkExecutor::class, 'forgetFrameworkServices'))->invoke($executor);
+
+        $this->assertSame($prebuilt, $this->app->make('wb.prebuilt'),
+            'an instance()-registered service was forgotten with nothing to rebuild it from');
+        $this->assertSame([], (new \ReflectionProperty(ForkExecutor::class, 'heldServices'))->getValue($executor));
+    }
+
+    /**
+     * REGRESSION (adversarial review, round 2): a config published before 1.17 replaces
+     * the whole 'supervisor' block (shallow merge), so the key is simply absent — and
+     * an in-code fallback of [] silently disabled Tier 2 for exactly those apps. The
+     * fallback must be the shipped list.
+     */
+    public function test_a_missing_forget_key_falls_back_to_the_shipped_defaults(): void
+    {
+        config(['jobwarden.supervisor.prefork_forget' => null]);
+        $inheritedLog = $this->app->make('log');
+
+        (new ReflectionMethod(ForkExecutor::class, 'forgetFrameworkServices'))->invoke($this->executor());
+
+        $this->assertNotSame($inheritedLog, $this->app->make('log'),
+            'with the key absent nothing was forgotten — the fallback is not the shipped default list');
     }
 
     /**

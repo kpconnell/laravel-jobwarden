@@ -137,21 +137,19 @@ return [
         // the queue manager). Add your own keys for app singletons that hold sockets,
         // or listen for JobWarden\Events\PreforkChildStarting to reset clients the
         // container can't name (SDK clients, gRPC channels — see docs/HOSTING.md
-        // "Fork safety"). Forgetting a key does NOT fix references captured before the
-        // fork (a manager constructor-injected into an app singleton stays the
-        // master's) — those are hook territory too. Never list 'events': rebuilding
-        // the dispatcher would drop your listeners, including the hook itself.
-        // No env var: a list belongs in config, override by publishing.
-        'prefork_forget' => [
-            'redis',
-            'cache',
-            'cache.store',
-            'cache.psr6',
-            \Illuminate\Cache\RateLimiter::class,
-            'queue',
-            'mail.manager',
-            'log',
-        ],
+        // "Fork safety"). Two things the list cannot reach are hook territory too:
+        // references captured before the fork (a manager constructor-injected into an
+        // app singleton stays the master's), and services registered with
+        // $app->instance() — there is no binding to rebuild them from, so they are
+        // skipped. Never list 'events': rebuilding the dispatcher would drop your
+        // listeners, including the hook itself. Persistent connections (PDO
+        // ATTR_PERSISTENT, phpredis persistent, memcached persistent_id) are
+        // INCOMPATIBLE with prefork: a "fresh" client looks its socket up in the
+        // process-wide persistent list the fork inherited and gets the master's fd back.
+        // No env var: a list belongs in config, override by publishing. The shipped
+        // list is JobWarden\Supervisor\ForkExecutor::DEFAULT_FORGET (also the fallback
+        // when a published config predates this key).
+        'prefork_forget' => \JobWarden\Supervisor\ForkExecutor::DEFAULT_FORGET,
 
         // On SIGTERM the supervisor stops claiming and waits for in-flight
         // children to finish, up to this many seconds. 0 = wait indefinitely

@@ -22,6 +22,7 @@ use JobWarden\Tests\Concerns\RefreshesJobWardenSchema;
 use JobWarden\Tests\TestCase;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
+use Workbench\App\Jobs\ChattyJob;
 use Workbench\App\Jobs\CrashJob;
 use Workbench\App\Jobs\DestructorProbeJob;
 use Workbench\App\Jobs\FailingJob;
@@ -624,6 +625,41 @@ final class PreforkE2ETest extends TestCase
             'at fire time a forget-listed service was still the master\'s instance — the event moved above the forget');
 
         @unlink($hookMarker);
+    }
+
+    /**
+     * The forget list drops 'log' and every facade root in the child — so the
+     * handler's OWN logging must demonstrably still work end-to-end under prefork:
+     * standard Log:: calls from the handler are captured into job_logs (through the
+     * rebuilt LogManager + JobLogCapture), and a raw php://stdout write lands in the
+     * attempt log the supervisor ingests into job_logs on reap. Without this, the only
+     * prefork evidence was ChildRunner's own step lines.
+     */
+    public function test_a_handlers_log_facade_lines_and_raw_stdout_both_reach_job_logs_under_prefork(): void
+    {
+        $job = $this->app->make(JobWarden::class)->dispatch(ChattyJob::class, [
+            'steps' => 2,
+            'stdout' => 'RAW-STDOUT-FROM-THE-HANDLER',
+        ]);
+
+        $supervisor = $this->supervisor();
+        $supervisor->boot();
+        $final = $this->driveUntil($supervisor, [$job->id]);
+        $this->assertSame(JobState::Succeeded, $final[$job->id]->state);
+
+        $attempt = JobAttempt::where('job_id', $job->id)->first();
+        $sink = $this->app->make(\JobWarden\Logging\Contracts\LogBodySink::class);
+        $rows = DB::connection('jobwarden')->table('jobwarden_job_logs')
+            ->where('attempt_id', $attempt->id)->get(['body_ref', 'step'])
+            ->map(fn ($r) => ['step' => $r->step, 'message' => (string) $sink->resolve($r->body_ref)]);
+        $messages = $rows->pluck('message')->all();
+
+        $this->assertContains('working step 1/2', $messages, 'the handler\'s Log::info did not reach job_logs — the rebuilt LogManager is not captured');
+        $this->assertContains('all steps complete', $messages, 'the handler\'s Log::notice did not reach job_logs');
+
+        $stdout = $rows->firstWhere('step', 'process_output');
+        $this->assertNotNull($stdout, 'no process_output row — the child\'s raw stdout never reached the attempt log or was not ingested');
+        $this->assertStringContainsString('RAW-STDOUT-FROM-THE-HANDLER', $stdout['message']);
     }
 
     /** The current backend/session id of the master's own jobwarden connection. */

@@ -438,7 +438,32 @@ final class Supervisor
     private function isPrefork(): bool
     {
         return (string) config('jobwarden.supervisor.execution_mode') === 'prefork'
-            && function_exists('pcntl_fork');
+            && function_exists('pcntl_fork')
+            && ! $this->persistentDbBlocksPrefork();
+    }
+
+    private ?bool $persistentDbBlocksPrefork = null;
+
+    /**
+     * A PDO-persistent jobwarden connection cannot be forked safely: the child's
+     * "fresh" reconnect looks the handle up in PHP's process-wide persistent list —
+     * which the fork inherited — and gets the MASTER'S socket back, so the child would
+     * run on the master's DB session. Refuse prefork (fall back to child mode, which
+     * boots a new process and its own persistent list) and say so once, loudly.
+     */
+    private function persistentDbBlocksPrefork(): bool
+    {
+        if ($this->persistentDbBlocksPrefork === null) {
+            $options = (array) config('database.connections.'.config('jobwarden.connection').'.options', []);
+            $this->persistentDbBlocksPrefork = ! empty($options[\PDO::ATTR_PERSISTENT]);
+            if ($this->persistentDbBlocksPrefork) {
+                Log::warning('prefork: refusing to fork — the jobwarden DB connection is PDO-persistent, so a fork would inherit the master\'s socket and run on its session. Falling back to execution_mode=child; drop PDO::ATTR_PERSISTENT from the connection options to use prefork', [
+                    'connection' => config('jobwarden.connection'),
+                ]);
+            }
+        }
+
+        return $this->persistentDbBlocksPrefork;
     }
 
     private function forkExecutor(): ForkExecutor

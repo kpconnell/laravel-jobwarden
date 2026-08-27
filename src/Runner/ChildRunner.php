@@ -49,7 +49,7 @@ final class ChildRunner
 
     public function run(string $attemptId, int $token, string $nonce): int
     {
-        $this->silenceHostLogChannel();
+        self::silenceHostLogChannel();
 
         // --- instrumentation: separate framework-boot cost from starvation wait ---
         // boot_wall = time from PHP process start (REQUEST_TIME_FLOAT) to here;
@@ -172,7 +172,7 @@ final class ChildRunner
      * forked child has no business writing to and that can throw on the way, taking
      * the failure report down with them.
      */
-    private function silenceHostLogChannel(): void
+    public static function silenceHostLogChannel(): void
     {
         config([
             'logging.default' => 'jobwarden_child',

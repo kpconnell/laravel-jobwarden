@@ -4,6 +4,51 @@ All notable changes to `laravel-jobwarden` are documented here. The format follo
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.17.0] - 2026-08-27
+
+The prefork fork-safety contract, made explicit — the same three-tier division every
+mature preforking host converged on (Gunicorn `post_fork`, Unicorn `after_fork`,
+Octane's flush list): JobWarden resets everything it owns and can name; one documented
+hook covers everything it can't. No migrations.
+
+### Added
+- **`jobwarden.supervisor.prefork_forget`** (config-only; defaults `redis`, `cache`,
+  `cache.store`, `cache.psr6`, `Illuminate\Cache\RateLimiter::class`, `queue`,
+  `mail.manager`, `log` — the connection-holding framework managers plus the framework
+  singletons known to capture them at construction) — container services a prefork
+  child drops right after the fork so first use rebuilds a fresh instance with its own
+  sockets instead of sharing the master's. The drop covers both access paths: the
+  container instance **and the facade's static resolved-instance cache** (inherited
+  copy-on-write, and consulted before the container — without clearing it, `Cache::` /
+  `Redis::` / `Log::` in a handler would keep serving the master's manager), on the
+  alias-normalized key, so class-name and alias entries work. Only shared bindings the
+  master actually resolved are touched — nothing is booted just to be forgotten — and
+  each inherited instance is held so no client destructor can say goodbye in-band
+  (`QUIT`, TLS `close_notify`) down a socket shared with the master. The facade,
+  alias, and non-shared-binding hazards were surfaced by an adversarial multi-agent
+  review of this change set; each fix is mutation-tested (removing it fails a test).
+- **`JobWarden\Events\PreforkChildStarting`** — the app's after-fork hook, dispatched
+  inside the child after JobWarden's own resets and immediately before the handler.
+  Register a listener once in a service provider (inherited copy-on-write) to recreate
+  connection-holding singletons the container can't name: SDK clients with keep-alive
+  sockets, gRPC channels, custom streams.
+- **Fork-safety test coverage** pinning the whole contract in real forks against MySQL
+  and Postgres, at the resource level rather than object identity: the child runs on
+  its own DB session (server-side session id, not just "the master survived"); a
+  forget-listed service bound under an alias and accessed through a facade comes back
+  on a **different kernel socket** (local ephemeral-port comparison) while the
+  master's connection stays open and unchanged; the shipped `log` default rebuilds
+  fresh through the facade path; siblings are reseeded (`mt_rand` — the one entropy
+  axis that can regress; `random_bytes`/uuids draw from the kernel CSPRNG and are
+  asserted as sanity only); no shutdown function or destructor ever runs in a child
+  (the `pcntl_exec` exit contract, previously guarded only indirectly); and the hook
+  fires inside the child, demonstrably *after* the DB reconnect and the forget list
+  (the listener itself records the DB session and a rebuilt service at fire time).
+- **Docs: [HOSTING → Fork safety](docs/HOSTING.md#fork-safety-what-jobwarden-resets-and-what-your-app-must)**
+  — the three tiers, the one-sentence rule for handlers (*never reuse or gracefully
+  close a connection opened before the fork — recreate it*), and why the hazard is
+  in-band protocol state, not TCP per se.
+
 ## [1.16.0] - 2026-08-16
 
 Laravel 13 and PHP 8.5 support, plus a cluster of clock fixes: every remaining place

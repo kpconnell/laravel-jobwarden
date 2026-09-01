@@ -10,6 +10,7 @@ use JobWarden\Http\Livewire\JobShow;
 use JobWarden\Models\Job;
 use JobWarden\Models\JobAttempt;
 use JobWarden\Models\JobLog;
+use JobWarden\Models\Worker;
 use JobWarden\States\AttemptState;
 use JobWarden\States\JobState;
 use JobWarden\Support\SqlTime;
@@ -262,6 +263,66 @@ final class DashboardJobShowTest extends TestCase
             Livewire::test(JobLogTail::class, ['jobId' => $job->id])
                 ->assertSet('live', true)
                 ->assertSeeHtml('wire:poll.2s');
+        }
+    }
+
+    /**
+     * The four tabs can only report what already happened, so a waiting job used
+     * to render as four empty panes. The panel is the only thing on the page that
+     * answers "why hasn't it started?".
+     */
+    public function test_a_queued_job_explains_what_it_is_waiting_on(): void
+    {
+        Worker::create([
+            'role' => 'supervisor', 'host_id' => 'h1', 'state' => 'active',
+            'incarnation' => 1, 'capacity' => 4, 'meta' => ['lane' => 'default'],
+        ]);
+        $job = Job::create(['job_class' => 'Report', 'state' => JobState::Queued, 'lane' => 'reports']);
+
+        Livewire::test(JobShow::class, ['job' => $job->id])
+            ->assertOk()
+            ->assertSee('waiting on')
+            ->assertSee('No supervisor is running lane reports')
+            ->assertSee('nothing can claim it')
+            ->assertSeeHtml(route('jobwarden.workers'));
+    }
+
+    public function test_a_pending_job_links_the_upstream_that_blocks_it(): void
+    {
+        $upstream = Job::create(['job_class' => 'Extract', 'state' => JobState::Running]);
+        $job = Job::create(['job_class' => 'Rollup', 'state' => JobState::Pending]);
+        $this->jobwarden()->table($this->tbl('job_dependencies'))->insert([
+            'job_id' => $job->id, 'depends_on_job_id' => $upstream->id, 'edge_condition' => 'on_success',
+        ]);
+
+        Livewire::test(JobShow::class, ['job' => $job->id])
+            ->assertSee('Blocked on 1 upstream job')
+            ->assertSee('needs: succeeded')
+            ->assertSeeHtml(route('jobwarden.jobs.show', $upstream->id));
+    }
+
+    /** An orphaned upstream is the blocker operators misread; the panel names it. */
+    public function test_an_orphaned_upstream_gets_an_explanatory_note(): void
+    {
+        $upstream = Job::create(['job_class' => 'Extract', 'state' => JobState::Orphaned]);
+        $job = Job::create(['job_class' => 'Rollup', 'state' => JobState::Pending]);
+        $this->jobwarden()->table($this->tbl('job_dependencies'))->insert([
+            'job_id' => $job->id, 'depends_on_job_id' => $upstream->id, 'edge_condition' => 'on_completion',
+        ]);
+
+        Livewire::test(JobShow::class, ['job' => $job->id])
+            ->assertSee('is not terminal')
+            ->assertSee('Restart or');
+    }
+
+    public function test_a_job_that_is_not_waiting_renders_no_panel(): void
+    {
+        foreach ([JobState::Running, JobState::Succeeded, JobState::Failed] as $state) {
+            $job = Job::create(['job_class' => 'X', 'state' => $state]);
+
+            Livewire::test(JobShow::class, ['job' => $job->id])
+                ->assertViewHas('waiting', null)
+                ->assertDontSee('waiting on');
         }
     }
 }

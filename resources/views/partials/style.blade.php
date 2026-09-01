@@ -264,6 +264,34 @@ a{color:inherit;text-decoration:none}
 .errpanel .loc{font-family:var(--mono);font-size:11px;color:var(--fg-2);word-break:break-all}
 .errpanel .trace{margin-top:8px;padding-top:8px;border-top:1px solid var(--h-red-dot);font-family:var(--mono);font-size:10.5px;color:var(--fg-2);white-space:pre;overflow:auto;max-height:300px;line-height:1.7}
 
+/* ---------- waiting panel (the errpanel's mirror: why it hasn't STARTED) ----------
+   Only the head carries the hue — the body is a checklist, and tinting all of it
+   would shout as loudly as a failure for a job that is merely early. */
+.waitpanel{border:1px solid var(--border-2);border-radius:9px;background:var(--panel);margin-bottom:14px;overflow:hidden}
+.waitpanel .head{display:flex;align-items:baseline;gap:8px;flex-wrap:wrap;padding:9px 14px;border-bottom:1px solid var(--border);background:var(--panel-2)}
+.waitpanel .tag{font-family:var(--mono);font-size:11px;font-weight:600;color:var(--fg-3)}
+.waitpanel .why{font-size:13px;font-weight:500}
+.waitpanel .rows{padding:2px 14px}
+.waitpanel .wrow{display:grid;grid-template-columns:8px 118px minmax(0,1fr);gap:10px;align-items:baseline;padding:7px 0;border-bottom:1px solid var(--border)}
+.waitpanel .wrow:last-child{border-bottom:0}
+.waitpanel .wrow .sdot{align-self:center}
+.waitpanel .wrow .k{font-family:var(--mono);font-size:11.5px;color:var(--fg-3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.waitpanel .wrow .v{font-size:11.5px;line-height:1.9}
+.waitpanel .dep{display:inline-flex;align-items:center;gap:6px;margin-right:12px;white-space:nowrap;max-width:100%}
+.waitpanel .dep .cls{font-family:var(--mono);font-size:11.5px;overflow:hidden;text-overflow:ellipsis}
+.waitpanel .cond{font-family:var(--mono);font-size:10.5px;color:var(--fg-3);font-style:normal}
+{{-- Links look like text everywhere else on the page (whole rows are clickable); inside
+     the panel they are the only way out to the thing that is blocking, so they read as links. --}}
+.waitpanel a{color:var(--accent)}
+.waitpanel a:hover{text-decoration:underline}
+.waitpanel .wnote{padding:9px 14px;border-top:1px solid var(--border);background:var(--panel-2);font-size:11px;color:var(--fg-2);line-height:1.6}
+.waitpanel .wnote .mono{font-size:10.5px}
+@foreach (['red','amber','blue','gray'] as $hue)
+.waitpanel.h-{{ $hue }}{border-color:var(--h-{{ $hue }}-dot)}
+.waitpanel.h-{{ $hue }} .head{background:var(--h-{{ $hue }}-bg)}
+.waitpanel.h-{{ $hue }} .head .tag,.waitpanel.h-{{ $hue }} .head .why{color:var(--h-{{ $hue }}-fg)}
+@endforeach
+
 /* ---------- logs terminal ---------- */
 .logbar{display:flex;align-items:center;gap:10px;margin-bottom:10px}
 .logbar .note{font-family:var(--mono);font-size:10.5px;color:var(--fg-3)}

@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace JobWarden\Http\Livewire;
 
+use JobWarden\Health\WaitAnalysis;
 use JobWarden\Http\Livewire\Concerns\JobActionGuards;
 use JobWarden\Models\Job;
 use JobWarden\Operations\OperatorActions;
@@ -87,6 +88,9 @@ final class JobShow extends Component
         return view('jobwarden::livewire.job-show', [
             'job' => $job,
             'lastAttempt' => $job->attempts->last(),
+            // Null unless the job is pending/queued/retrying, so a finished job
+            // pays nothing for the gate queries.
+            'waiting' => WaitAnalysis::for($job),
         ]);
     }
 }

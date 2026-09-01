@@ -58,6 +58,11 @@
             <div class="meta-cell"><div class="k">Duration</div><div class="v">{{ $fmtMs($lastAttempt?->duration_ms) }}</div></div>
         </div>
 
+        {{-- why it hasn't started (pending|queued|retrying only) --}}
+        @if ($waiting !== null)
+            @include('jobwarden::partials.waiting', ['waiting' => $waiting])
+        @endif
+
         {{-- params + tags (first-class) --}}
         <div class="pt-grid">
             <div class="kv-panel">

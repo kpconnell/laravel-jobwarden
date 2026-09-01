@@ -4,6 +4,54 @@ All notable changes to `laravel-jobwarden` are documented here. The format follo
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.18.0] - 2026-09-01
+
+Why a waiting job hasn't started, on the job detail page. No migrations, no new
+configuration.
+
+### Added
+- **A "waiting on" panel on the job detail page** — the mirror of the `last_error`
+  panel, which answers why a job *stopped*. The four tabs can only report what already
+  happened, so a job that had not started rendered as four empty panes: Attempts said
+  "the job hasn't been claimed", Timeline showed a lone `· → pending`, Result was blank,
+  and nothing on the page answered the only question an operator has about it. Every
+  gate is knowable exactly, because admission is a closed set of predicates — so the
+  panel states a one-line verdict and shows the whole checklist under it: `available_at`,
+  unmet DAG edges, unmet cross-batch edges, the admit pass, lane coverage, and position
+  in the claim order. Each blocking upstream job or batch links straight to it.
+
+  It names the things a timeline cannot. An **orphaned upstream still gates its
+  dependents under either edge condition** — `orphaned` is not terminal, a parked orphan
+  awaits an operator verdict — which is the blocker most often misread as a stuck job,
+  and it gets an explanatory note. An **upstream batch that is terminal but not
+  quiescent** (a failed batch still draining its spared finalizer subtree) reports how
+  many members are still in flight. A **lane with no live supervisor** is called out on
+  the job itself, not only on the Workers page — and because the admit pass is *not*
+  lane-scoped, the panel keeps the fleet-wide question (is anything promoting `pending`
+  at all?) separate from the lane question (can anything claim this once it is
+  `queued`?). A pending job is admitted into a lane with no workers and then sits there;
+  the two rows now show that as two different facts.
+
+  Two things worth knowing about how it reads. **A supervisor still `active` past
+  `heartbeat_interval * missed_beats` is not counted as coverage**, and its capacity is
+  excluded from the lane's slot totals: the global reaper will flip it to `dead`, but
+  until it does, a row with a stale heartbeat is a process that has stopped claiming, and
+  counting it would hide exactly the outage the row exists to show. And **backlog depth
+  stops at 100** (rendered `100+`), counted through a `LIMIT`ed derived table rather than
+  `->limit()->count()` — the query builder applies a limit to the aggregate's single
+  result row, not to the scan, so the naive form would walk an entire lane backlog on
+  every dashboard poll.
+
+  Nothing is queried for a job that is not `pending`/`queued`/`retrying`, so the page is
+  unchanged for every other state. The gate reads live in `JobWarden\Health\WaitAnalysis`;
+  its two dependency predicates are the same carve-out from the strict rule as
+  `DepsSatisfiedGuard`'s, inverted to SELECT the offending edges rather than count them,
+  and all three sites (the guard, the `Admitter` window, and this) now carry the note that
+  they must stay identical — a panel that reports a different answer than the engine acts
+  on is worse than no panel. Every comparison is evaluated against the DB clock, including
+  the `created_at` pivot of the backlog count, which is read from the job's own row inside
+  SQL rather than bound from PHP.
+
 ## [1.17.0] - 2026-08-27
 
 The prefork fork-safety contract, made explicit — the same three-tier division every

@@ -4,6 +4,73 @@ All notable changes to `laravel-jobwarden` are documented here. The format follo
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.19.0] - 2026-09-17
+
+Skip: an operator's verdict that a DAG node's outcome does not matter. One
+migration (`skipped_count` on `batches`). No new configuration.
+
+### Added
+- **A `skipped` job state and a `skip` operator action** — on the job page, the
+  bulk bar of the Jobs screen, `POST /jobs/{id}/skip`, and `OperatorActions::skip()`.
+  The field request: deep in a large DAG one node fails, the operator judges it
+  non-critical for this run, and wants the graph to continue. `skipped` is terminal
+  and satisfies an `on_success` dependency edge exactly as `succeeded` does, so the
+  dependents proceed. It is not a fake success: the job keeps its `last_error` and
+  attempt history, and the verdict, actor, and reason sit on the timeline like every
+  other operator action. Never produced by the system.
+
+  Skip is offered on every state but `succeeded`. A settled job (`failed`,
+  `stopped`, `canceled`) moves at once; so do pre-run work and a parked orphan. A
+  **running job is kill-and-skip**: the same desired-state flag that stop uses, with a
+  third `cancel_mode`, `skip`. The supervisor signals the child as it always has and,
+  when it reaps it, lands the job `skipped` rather than `stopped`; recovery honoring
+  the flag on a lost attempt, and the reconcile sweep for a stranded stopped attempt,
+  land it the same way. If the child fails on its own before the signal arrives, the
+  verdict is still `skipped`, never a retry. The operator never lands a running job
+  directly — the transition table permits `running → skipped` to the supervisor,
+  reaper, and system only, mirroring `running → stopped`.
+
+  For the batch, skipping a doomed member is the same undo as retrying it: a
+  `partial` or `failed` batch reopens (a fail_fast batch whose only failure was
+  skipped no longer trips), and the dependents the cascade canceled as unreachable are
+  revived and admitted past the skipped node. Unlike a retry the node is settled, so
+  the completion check runs immediately and a fan-out with nothing to revive settles at
+  once. **Skipped members never spoil the verdict**: a batch whose only non-successes
+  are skipped ends `succeeded`, so a strict cross-batch edge on it proceeds too —
+  otherwise a skip would unblock one hop and doom the next, with no batch-level skip
+  to fix it. The count lives in a new `skipped_count` column (the sixth progress
+  bucket; the partition invariant now sums six) and in `summary.skipped`, and
+  `JobContext::batch()` lists a skipped member among the non-successes with the error
+  the verdict overrode. An operator's own cancel verdict still ends the batch
+  `partial`. As with retry, members a fail_fast sweep canceled carry the sweep's
+  reason, not the cascade sentinel, so they are not revived by a skip.
+
+  The reconcile sweep gained a settled arm for a lost `failed → skipped` event: a
+  completed batch with nothing in flight whose recorded verdict the counters no longer
+  support (`partial` with no failed or canceled member, `partial` still holding a
+  cascade-canceled member whose upstreams are viable again, or `failed` under a policy
+  that no longer trips) is reopened and settled in the same tick. That arm also closes
+  a latent gap for a lost re-entry event whose member finished before the sweep saw it
+  in flight. The three revive-side windows now share one no-doomed-upstream predicate.
+
+### Changed
+- **Cancel and stop are now scoped to the states they name, and each maps to one
+  verdict.** `cancel` withdraws work that has not started (`pending`, `queued`,
+  `retrying` → `canceled`); `stop` halts work that is active or parked (`running` →
+  flagged for the supervisor, `orphaned` → `stopped`). Previously both accepted any
+  non-terminal state and the job's state, not the verb, decided where it landed —
+  the two differed only in the mode recorded on the row. A verb applied outside its
+  states is now refused with the same `InvalidArgumentException` retry and restart
+  always raised (a 500 on the API — check `state` first). The dashboard offers one halt
+  verb per state accordingly. The claim race is unchanged: a cancel whose flag lands
+  after a claim is still honored by the supervisor, and that job lands `stopped`,
+  because it was running when halted.
+- Every SQL predicate over "has this job ended" — the dependency guard, the admit
+  window, the wait analysis panel, the schedule overlap check, retention, the batch
+  reader, and the coordinator's member sweeps — now reads `JobState::terminalValues()`
+  and `JobState::satisfyingValues()` instead of a hand-typed list, so a terminal state
+  cannot be missed by one of them.
+
 ## [1.18.0] - 2026-09-01
 
 Why a waiting job hasn't started, on the job detail page. No migrations, no new

@@ -16,27 +16,71 @@ use JobWarden\Support\SqlTime;
 use Illuminate\Support\Facades\DB;
 
 /**
- * Durable, audited operator actions (spec §10.1). Cancellation is desired-state
- * in the database (spec §6.3) so it works across hosts: set the flag, apply the
+ * Durable, audited operator actions (spec §10.1). Halting is desired-state in
+ * the database (spec §6.3) so it works across hosts: set the flag, apply the
  * immediate transition where there is no live owner, and let the owning
  * supervisor (or recovery) honor it otherwise.
+ *
+ * Each verb is scoped to the states it names, so a verb maps to one verdict:
+ *   cancel   withdraws work that has not started      → canceled
+ *   stop     halts work that is active or parked      → stopped
+ *   skip     rules the node's outcome irrelevant      → skipped (from anywhere but succeeded)
+ *   retry    re-runs a failed job                     → queued
+ *   restart  re-runs a stopped or parked job          → queued
+ * A verb applied outside its states is refused (InvalidArgumentException),
+ * exactly as retry/restart always were — never silently mapped to another verb.
  */
 final class OperatorActions
 {
+    private const PRE_RUN = [JobState::Pending, JobState::Queued, JobState::Retrying];
+
     public function __construct(private readonly StateMachine $stateMachine)
     {
     }
 
-    /** Withdraw a job. Pre-run → canceled immediately; running → flagged for the supervisor. */
+    /**
+     * Withdraw work that has not started → canceled. The flag is written first,
+     * so if a claim wins the race the owning supervisor still halts the child —
+     * that job lands `stopped`, because it WAS running when halted.
+     */
     public function cancel(Job $job, string $reason, ?string $actorId = null): void
     {
-        $this->halt($job, 'cancel', $reason, $actorId);
+        $this->assertState($job, self::PRE_RUN, 'cancel');
+        $this->halt($job, 'cancel', JobState::Canceled, $reason, $actorId);
     }
 
-    /** Halt active work. Running → flagged (supervisor stops it); else handled like cancel. */
+    /**
+     * Halt active work → stopped. A running job is flagged and signaled by its
+     * supervisor; a parked orphan (no live owner) is stopped immediately.
+     */
     public function stop(Job $job, string $reason, ?string $actorId = null): void
     {
-        $this->halt($job, 'stop', $reason, $actorId);
+        $this->assertState($job, [JobState::Running, JobState::Orphaned], 'stop');
+        $this->halt($job, 'stop', JobState::Stopped, $reason, $actorId);
+    }
+
+    /**
+     * Rule the node's outcome irrelevant → skipped: its dependents proceed as
+     * if it had succeeded (JobState::satisfiesSuccessEdge). A settled job
+     * (failed/stopped/canceled) moves directly. Anything still live takes the
+     * desired-state path with cancel_mode = 'skip' — a running job is killed by
+     * its supervisor and then lands `skipped` ("kill and skip"); pre-run work
+     * and a parked orphan move immediately, the flag covering the claim race.
+     */
+    public function skip(Job $job, string $reason, ?string $actorId = null): void
+    {
+        $this->assertState($job, [
+            JobState::Failed, JobState::Stopped, JobState::Canceled, JobState::Orphaned,
+            JobState::Running, ...self::PRE_RUN,
+        ], 'skip');
+
+        if ($job->state->isTerminal()) {
+            $this->stateMachine->applyJobTransition($job, JobState::Skipped, TransitionContext::for(ActorType::Operator, $actorId, $reason));
+
+            return;
+        }
+
+        $this->halt($job, 'skip', JobState::Skipped, $reason, $actorId);
     }
 
     /** Operator retry of a FAILED job → re-queue, minting a fresh attempt. */
@@ -53,24 +97,24 @@ final class OperatorActions
         $this->requeue($job, $reason, $actorId);
     }
 
-    private function halt(Job $job, string $mode, string $reason, ?string $actorId): void
+    /**
+     * Desired-state first: even if the immediate transition loses a race to a
+     * claim, the flag remains and the supervisor/recovery honor it. `$to` is
+     * the immediate landing state where there is no live owner; a running job
+     * is only flagged, and lands per the mode when its supervisor reaps it
+     * (JobState::haltedState).
+     */
+    private function halt(Job $job, string $mode, JobState $to, string $reason, ?string $actorId): void
     {
-        // Desired-state first: even if the immediate transition loses a race to a
-        // claim, the flag remains and the supervisor/recovery will honor it.
         $this->setCancelFlags($job, $mode, $reason);
         $job->refresh();
 
-        $context = TransitionContext::for(ActorType::Operator, $actorId, $reason);
+        if ($job->state === JobState::Running) {
+            return; // the owning supervisor observes the flag and stops the child.
+        }
 
         try {
-            match (true) {
-                in_array($job->state, [JobState::Pending, JobState::Queued, JobState::Retrying], true)
-                    => $this->stateMachine->applyJobTransition($job, JobState::Canceled, $context),
-                $job->state === JobState::Orphaned
-                    => $this->stateMachine->applyJobTransition($job, JobState::Stopped, $context),
-                // running/dispatched: the owning supervisor observes the flag and stops the child.
-                default => null,
-            };
+            $this->stateMachine->applyJobTransition($job, $to, TransitionContext::for(ActorType::Operator, $actorId, $reason));
         } catch (IllegalTransitionException|GuardFailedException|StaleFencingTokenException) {
             // Raced with a claim/transition — the desired-state flag remains in effect.
         }

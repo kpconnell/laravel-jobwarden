@@ -136,6 +136,11 @@ final class JobsController
         return $this->act($request, fn (Job $j) => $ops->restart($j, $this->reason($request, 'restarted via API'), $this->actor($request)), $job);
     }
 
+    public function skip(Request $request, OperatorActions $ops, string $job)
+    {
+        return $this->act($request, fn (Job $j) => $ops->skip($j, $this->reason($request, 'skipped via API'), $this->actor($request)), $job);
+    }
+
     private function act(Request $request, callable $action, string $job)
     {
         $model = Job::findOrFail($job);

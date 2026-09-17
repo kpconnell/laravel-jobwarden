@@ -442,6 +442,39 @@ Failure policies:
 - `fail_fast`
 - `threshold(N)`
 
+### Skipping a member
+
+Deep in a large DAG one node fails, and the operator judges it non-critical for
+this run. **Skip** is the operator's verdict that the node's outcome does not
+matter to the graph: its dependents proceed as if it had succeeded.
+
+```bash
+curl -s -XPOST localhost/jobwarden/api/jobs/<id>/skip -d 'reason=report step is optional tonight'
+```
+
+Skip is offered on every job that has not succeeded, from the job page, the bulk
+bar on the Jobs screen, the API, or `OperatorActions::skip()`:
+
+- **A settled job** (`failed`, `stopped`, `canceled`) moves straight to `skipped`.
+  It keeps its `last_error` and attempt history; the verdict and reason are on the
+  timeline like any other operator action.
+- **A running job** is *kill-and-skip*: the same desired-state flag stop uses, with
+  `cancel_mode = skip`. The supervisor signals the child and, when it reaps it, the
+  job lands `skipped` instead of `stopped`. If the child fails on its own first, or
+  the host dies and recovery finds the flag, the verdict is still `skipped`, never
+  a retry.
+- **A pending, queued, or retrying job** is skipped before it runs. If a claim wins
+  the race, the flag still halts it and it lands `skipped`.
+- **A parked orphan** is skipped immediately, its lost attempt left as it was.
+
+For the batch, skipping a failed member is the same undo as retrying it: a
+`partial` or `failed` batch reopens, and the dependents canceled as unreachable are
+revived and admitted past the skipped node. Unlike a retry, the node is settled, so
+a fan-out with nothing to revive completes at once. **Skipped members never spoil
+the verdict**: a batch whose only non-successes are skipped ends `succeeded`, with
+`skipped_count` on the row and `skipped` in the summary, so a strict downstream
+batch proceeds too. An operator's own cancel verdict still ends the batch `partial`.
+
 ### `finally` members
 
 `dependsOn` is strict: the dependent runs only if every upstream **succeeded**, and an
@@ -684,6 +717,13 @@ The Jobs screen filters by state, lane, and indexed tags, with bulk retry/restar
 Job detail shows the bound constructor params, tags, attempts, an event timeline, the completion result, and a live log tail:
 
 ![Job detail with params, tags, and a live log tail](docs/images/dashboard-job-detail.png)
+
+Operator verbs are scoped to the states they name, and each maps to one verdict:
+**cancel** withdraws work that has not started (`canceled`), **stop** halts work that
+is active or parked (`stopped`), **skip** rules a node's outcome irrelevant
+(`skipped`), **retry** re-runs a failed job, **restart** re-runs a stopped or parked
+one. A verb applied outside its states is refused rather than silently mapped to
+another.
 
 The API mounts under:
 

@@ -107,11 +107,16 @@ class RecoveryService
             return false;
         }
 
+        // The mode decides the verdict: `skip` is the one flag whose value picks
+        // the landing state (the operator's verdict on the graph), cancel/stop
+        // both record how the run ended — halted while active, so `stopped`.
+        $to = JobState::haltedState((string) $job->cancel_mode);
+
         try {
             $this->stateMachine->applyJobTransition(
                 $job,
-                JobState::Stopped,
-                TransitionContext::for($actor, null, 'cancellation honored on recovery: '.((string) $job->cancel_reason))
+                $to,
+                TransitionContext::for($actor, null, $to->value.' honored on recovery: '.((string) $job->cancel_reason))
             );
 
             return true;

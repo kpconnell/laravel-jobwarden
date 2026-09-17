@@ -3,7 +3,7 @@
 
     $stateHue = fn (string $s) => match ($s) {
         'succeeded' => 'green', 'failed' => 'red', 'running', 'queued', 'dispatched' => 'blue',
-        'retrying' => 'amber', 'orphaned' => 'purple', 'canceled', 'stopped' => 'gray', default => 'slate',
+        'retrying' => 'amber', 'orphaned' => 'purple', 'canceled', 'stopped', 'skipped' => 'gray', default => 'slate',
     };
 @endphp
 <div class="view" wire:poll.{{ config('jobwarden.dashboard.poll', '10s') }}>
@@ -27,7 +27,7 @@
         </div>
 
         <div class="count-chips">
-            @foreach (['pending' => $batch->pending_count, 'running' => $batch->running_count, 'succeeded' => $batch->succeeded_count, 'failed' => $batch->failed_count, 'canceled' => $batch->canceled_count] as $label => $n)
+            @foreach (['pending' => $batch->pending_count, 'running' => $batch->running_count, 'succeeded' => $batch->succeeded_count, 'failed' => $batch->failed_count, 'canceled' => $batch->canceled_count, 'skipped' => $batch->skipped_count] as $label => $n)
                 <div class="count-chip">
                     <span class="sdot h-{{ $stateHue($label) }}" style="width:6px;height:6px"></span>
                     <span>{{ $label }}</span><b>{{ number_format((int) $n) }}</b>
@@ -45,7 +45,7 @@
     <div class="tab-body">
         @if ($tab === 'graph' && $dag !== null)
             <div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin-bottom:12px">
-                @foreach (['succeeded', 'running', 'pending', 'failed', 'canceled'] as $lg)
+                @foreach (['succeeded', 'running', 'pending', 'failed', 'canceled', 'skipped'] as $lg)
                     <div style="display:flex;align-items:center;gap:6px">
                         <span class="dag-node fill-{{ $stateHue($lg) }}" style="width:16px;height:11px"></span>
                         <span style="font-size:11px;color:var(--fg-2)">{{ $lg }}</span>

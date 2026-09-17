@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace JobWarden\Console;
 
+use JobWarden\States\JobState;
 use JobWarden\Support\SqlTime;
 use Illuminate\Console\Command;
 use Illuminate\Database\Connection;
@@ -20,7 +21,6 @@ final class PruneCommand extends Command
 
     protected $description = 'Delete old terminal jobs/logs/events and dead workers per retention policy.';
 
-    private const TERMINAL = ['succeeded', 'failed', 'canceled', 'stopped'];
 
     public function handle(): int
     {
@@ -29,7 +29,7 @@ final class PruneCommand extends Command
         $retention = (array) config('jobwarden.retention');
 
         $jobs = $conn->table($this->tbl('jobs'))
-            ->whereIn('state', self::TERMINAL)
+            ->whereIn('state', JobState::terminalValues())
             ->whereNotNull('finished_at')
             ->where('finished_at', '<', $conn->raw(SqlTime::nowMinus($conn, ((int) ($retention['jobs_days'] ?? 30)) * 86400)));
 

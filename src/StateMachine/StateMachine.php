@@ -169,7 +169,7 @@ class StateMachine
             $set['started_at'] = $conn->raw('coalesce(started_at, CURRENT_TIMESTAMP)');
         }
 
-        if (in_array($to->value, ['succeeded', 'failed', 'canceled', 'stopped'], true)) {
+        if ($to->isTerminal()) { // JobState|AttemptState — both define it
             $set['finished_at'] = $now;
         }
 

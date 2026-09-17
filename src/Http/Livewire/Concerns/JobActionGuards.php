@@ -15,13 +15,23 @@ use JobWarden\States\JobState;
  */
 trait JobActionGuards
 {
-    /** @return list<string> of retry|restart|cancel|stop, in display order */
+    /**
+     * One halt verb per state (cancel withdraws pre-run work, stop halts active
+     * work), a re-run verb where one applies, and skip everywhere but succeeded
+     * — on a running job it is kill-and-skip, so the view words its confirm
+     * accordingly.
+     *
+     * @return list<string> of retry|restart|cancel|stop|skip, in display order
+     */
     public static function allowedActions(Job $job): array
     {
         return match ($job->state) {
-            JobState::Failed => ['retry'],
-            JobState::Orphaned, JobState::Stopped => ['restart'],
-            JobState::Pending, JobState::Queued, JobState::Running, JobState::Retrying => ['cancel', 'stop'],
+            JobState::Failed => ['retry', 'skip'],
+            JobState::Orphaned => ['restart', 'stop', 'skip'],
+            JobState::Stopped => ['restart', 'skip'],
+            JobState::Canceled => ['skip'],
+            JobState::Pending, JobState::Queued, JobState::Retrying => ['cancel', 'skip'],
+            JobState::Running => ['stop', 'skip'],
             default => [],
         };
     }

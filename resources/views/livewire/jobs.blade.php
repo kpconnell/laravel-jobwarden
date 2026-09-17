@@ -59,6 +59,7 @@
                 <button type="button" class="btn sm btn-purple" wire:click="bulk('restart')">Restart</button>
                 <button type="button" class="btn sm" wire:click="bulk('cancel')" wire:confirm="Cancel the selected jobs?">Cancel</button>
                 <button type="button" class="btn sm btn-red" wire:click="bulk('stop')" wire:confirm="Stop the selected jobs?">Stop</button>
+                <button type="button" class="btn sm btn-red" wire:click="bulk('skip')" wire:confirm="Skip the selected jobs? Running ones are stopped first. Their dependents will proceed as if they had succeeded.">Skip</button>
             </div>
             <button type="button" class="clear" wire:click="clearSelection">clear</button>
         </div>

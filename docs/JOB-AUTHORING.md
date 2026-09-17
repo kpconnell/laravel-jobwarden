@@ -183,9 +183,10 @@ carries no job data (that's the constructor's job):
   `jobwarden:logs --export`.
 - `$context->result([...])` — store the job's completion payload (see Results).
 - `$context->batchId`, `$context->batch()` — for a batch member, the batch id and
-  a live read of the batch around it: its state, failure policy, progress counts,
-  and the members that did not succeed (with each one's error message or cancel
-  reason). `null` for a standalone job. This is what a finalizer reacts to — see
+  a live read of the batch around it: its state, failure policy, progress counts
+  (including `skipped`), and the members that did not succeed (with each one's
+  error message or cancel reason; a member an operator skipped is listed as
+  `skipped` with the error the verdict overrode). `null` for a standalone job. This is what a finalizer reacts to — see
   Batches in the README. Always the job's **own** batch: batches the job is
   merely *gated on* (cross-batch dependencies) are not exposed here — pass their
   ids in params if the handler needs them (see Gating a job on other batches).

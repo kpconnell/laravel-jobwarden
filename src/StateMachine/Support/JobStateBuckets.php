@@ -8,8 +8,8 @@ use JobWarden\States\JobState;
 
 /**
  * Maps each Job state to the batch progress counter it falls under, partitioning
- * all states into five buckets so that
- *   pending_count + running_count + succeeded_count + failed_count + canceled_count
+ * all states into six buckets so that
+ *   pending_count + running_count + succeeded_count + failed_count + canceled_count + skipped_count
  * always equals total_jobs (a testable invariant). Refined further by the batch
  * coordinator in P12.
  */
@@ -23,6 +23,7 @@ final class JobStateBuckets
             JobState::Succeeded => 'succeeded_count',
             JobState::Failed => 'failed_count',
             JobState::Canceled, JobState::Stopped => 'canceled_count',
+            JobState::Skipped => 'skipped_count',
         };
     }
 }

@@ -57,6 +57,21 @@ final class WaitAnalysisTest extends TestCase
         $this->assertSame('Blocked on 1 upstream job', $w['headline']['text']);
     }
 
+    public function test_a_skipped_upstream_satisfies_a_strict_edge(): void
+    {
+        // The read side must agree with the engine: an operator's skip is
+        // "proceed as if succeeded", so it is never listed as a blocker.
+        $this->supervisor();
+        $skipped = Job::create(['job_class' => 'Skipped', 'state' => JobState::Skipped]);
+        $job = Job::create(['job_class' => 'Downstream', 'state' => JobState::Pending]);
+        $this->edge($job, $skipped);
+
+        $w = WaitAnalysis::for($job);
+
+        $this->assertSame([], $w['job_deps']['items']);
+        $this->assertSame('Eligible — awaiting the next admit pass', $w['headline']['text']);
+    }
+
     /**
      * The on_completion carve-out: a finally-style member runs after its
      * upstream ENDS, however it ended.

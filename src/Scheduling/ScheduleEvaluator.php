@@ -241,9 +241,7 @@ final class ScheduleEvaluator
 
     private function hasActiveJob(Schedule $schedule): bool
     {
-        $terminal = [JobState::Succeeded->value, JobState::Failed->value, JobState::Canceled->value, JobState::Stopped->value];
-
-        return Job::query()->where('schedule_id', $schedule->id)->whereNotIn('state', $terminal)->exists();
+        return Job::query()->where('schedule_id', $schedule->id)->whereNotIn('state', JobState::terminalValues())->exists();
     }
 
     /**

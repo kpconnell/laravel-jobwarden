@@ -63,6 +63,22 @@ final class JobTransitions implements TransitionTable
             // again when its doomed upstream is retried/restarted — back to
             // waiting on dependencies (BatchCoordinator only).
             new Transition(S::Canceled, S::Pending, [A::System]),
+
+            // skip: an operator's verdict that the node's outcome does not
+            // matter to the graph (spec §10.1). Direct where there is no live
+            // owner — a settled verdict, a parked orphan, or work that has not
+            // started. A RUNNING job is never landed by the operator: skip sets
+            // the desired-state flag with cancel_mode = 'skip', and the process
+            // owner (supervisor, or recovery for a lost attempt) carries it out,
+            // exactly as `running → stopped` works.
+            new Transition(S::Failed, S::Skipped, [A::Operator]),
+            new Transition(S::Stopped, S::Skipped, [A::Operator]),
+            new Transition(S::Canceled, S::Skipped, [A::Operator]),
+            new Transition(S::Orphaned, S::Skipped, [A::Operator, A::Reaper, A::System]),
+            new Transition(S::Pending, S::Skipped, [A::Operator], [new NotYetRunningGuard]),
+            new Transition(S::Queued, S::Skipped, [A::Operator], [new NotYetRunningGuard]),
+            new Transition(S::Retrying, S::Skipped, [A::Operator], [new NotYetRunningGuard]),
+            new Transition(S::Running, S::Skipped, [A::Supervisor, A::Reaper, A::System]),
         ];
 
         $map = [];

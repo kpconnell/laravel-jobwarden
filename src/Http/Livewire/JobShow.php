@@ -8,6 +8,7 @@ use JobWarden\Health\WaitAnalysis;
 use JobWarden\Http\Livewire\Concerns\JobActionGuards;
 use JobWarden\Models\Job;
 use JobWarden\Operations\OperatorActions;
+use JobWarden\States\JobState;
 use Livewire\Attributes\Layout;
 use Livewire\Attributes\Url;
 use Livewire\Component;
@@ -54,6 +55,12 @@ final class JobShow extends Component
     public function restart(OperatorActions $ops): void
     {
         $this->run(fn () => $ops->restart($this->job(), 'restart via dashboard', $this->actor()), 'restarted');
+    }
+
+    public function skip(OperatorActions $ops): void
+    {
+        $job = $this->job();
+        $this->run(fn () => $ops->skip($job, 'skip via dashboard', $this->actor()), $job->state === JobState::Running ? 'stop and skip requested' : 'skipped');
     }
 
     private function run(callable $action, string $ok): void

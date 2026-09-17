@@ -7,6 +7,7 @@ namespace JobWarden\Tests\Runner;
 use JobWarden\JobWarden;
 use JobWarden\Models\Batch;
 use JobWarden\Models\Job;
+use JobWarden\Operations\OperatorActions;
 use JobWarden\Runner\JobContext;
 use JobWarden\StateMachine\StateMachine;
 use JobWarden\StateMachine\TransitionContext;
@@ -62,6 +63,28 @@ final class JobContextBatchTest extends TestCase
         $this->assertSame('stripe timed out', $byClass['JobWork']['error'], 'the failure message, from last_error');
         $this->assertSame('canceled', $byClass['JobOther']['state']);
         $this->assertSame('batch member failed under fail_fast', $byClass['JobOther']['error'], 'the cancel verdict stands in for an error');
+    }
+
+    public function test_a_skipped_member_is_listed_with_the_error_the_operator_overrode(): void
+    {
+        $batch = $this->jobwarden()->batch('etl', 'continue')
+            ->add('work', 'JobWork')
+            ->add('cleanup', 'JobCleanup', dependsOnCompletion: ['work'])
+            ->dispatch();
+
+        $work = $this->member($batch, 'JobWork');
+        $this->complete($work, JobState::Failed);
+        $work->refresh()->forceFill(['last_error' => ['class' => 'RuntimeException', 'message' => 'stripe timed out']])->saveQuietly();
+        $this->app->make(OperatorActions::class)->skip($work->refresh(), 'not critical', 'op-1');
+
+        $cleanup = $this->member($batch, 'JobCleanup');
+        $view = (new JobContext($cleanup->id, 'attempt-1', 1, null, (string) $cleanup->batch_id))->batch();
+
+        $this->assertSame(0, $view['counts']['failed']);
+        $this->assertSame(1, $view['counts']['skipped']);
+        $this->assertCount(1, $view['failures']);
+        $this->assertSame('skipped', $view['failures'][0]['state']);
+        $this->assertSame('stripe timed out', $view['failures'][0]['error'], 'the verdict overrides the error, it does not erase it');
     }
 
     public function test_batch_is_null_for_a_standalone_job(): void

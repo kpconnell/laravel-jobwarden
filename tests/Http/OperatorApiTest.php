@@ -174,6 +174,28 @@ final class OperatorApiTest extends TestCase
         $this->assertSame(JobState::Canceled, $job->refresh()->state);
     }
 
+    public function test_skip_action_skips_a_failed_job(): void
+    {
+        $job = Job::create(['job_class' => 'X', 'state' => JobState::Failed]);
+
+        $this->postJson("jobwarden/api/jobs/{$job->id}/skip", ['reason' => 'not critical'])
+            ->assertOk()
+            ->assertJsonPath('state', JobState::Skipped->value);
+
+        $this->assertSame(JobState::Skipped, $job->refresh()->state);
+    }
+
+    public function test_skip_action_flags_a_running_job_for_kill_and_skip(): void
+    {
+        $job = Job::create(['job_class' => 'X', 'state' => JobState::Running]);
+
+        $this->postJson("jobwarden/api/jobs/{$job->id}/skip")
+            ->assertOk()
+            ->assertJsonPath('state', JobState::Running->value)
+            ->assertJsonPath('cancel_requested', true)
+            ->assertJsonPath('cancel_mode', 'skip');
+    }
+
     public function test_restart_action_requeues_a_stopped_job(): void
     {
         $job = Job::create(['job_class' => 'X', 'state' => JobState::Stopped]);

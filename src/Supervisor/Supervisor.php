@@ -693,6 +693,9 @@ final class Supervisor
 
         try {
             if ($handle->stopRequested) {
+                // The attempt was stopped, whatever the operator's intent; the
+                // JOB lands per the flag's mode — `skipped` for a kill-and-skip,
+                // `stopped` otherwise (JobState::haltedState).
                 $this->stateMachine->applyAttemptTransition($attempt, AttemptState::Stopped, (clone $context)->because('stopped by operator'));
                 $this->logStopLine($handle, sprintf(
                     'stopped by operator; child reaped (exit=%s signal=%s)',
@@ -700,7 +703,8 @@ final class Supervisor
                     $handle->termSignal ?? 'n/a'
                 ));
                 if ($job !== null) {
-                    $this->stateMachine->applyJobTransition($job, JobState::Stopped, TransitionContext::for(ActorType::Supervisor, null, 'stopped by operator'));
+                    $to = JobState::haltedState((string) $job->cancel_mode);
+                    $this->stateMachine->applyJobTransition($job, $to, TransitionContext::for(ActorType::Supervisor, null, $to->value.' by operator'));
                 }
 
                 return;
@@ -849,7 +853,7 @@ final class Supervisor
                 $reason = (string) ($cancel->cancel_reason ?? '');
                 $this->logStopLine($handle, sprintf(
                     '%s requested%s; SIGTERM sent (%ds grace, then SIGKILL)',
-                    $cancel->cancel_mode === 'stop' ? 'stop' : 'cancel',
+                    in_array($cancel->cancel_mode, ['stop', 'skip'], true) ? $cancel->cancel_mode : 'cancel',
                     $reason !== '' ? ': '.$reason : '',
                     $grace
                 ));

@@ -378,6 +378,126 @@ final class BatchTest extends TestCase
         }
     }
 
+    // -- skip: an operator rules a member's outcome irrelevant -----------------
+
+    public function test_skipping_a_failed_upstream_revives_its_dependents_and_the_batch_ends_succeeded(): void
+    {
+        // The field request: deep in a DAG one node fails, the operator judges it
+        // non-critical. Skip undoes the doom exactly as a retry does — dependents
+        // back to waiting, batch reopened — but the node is settled, so the
+        // chain proceeds past it and the batch ends succeeded, skip on record.
+        $batch = $this->jobwarden()->batch('chain', 'continue')
+            ->add('a', 'JobA')
+            ->add('b', 'JobB', dependsOn: ['a'])
+            ->add('c', 'JobC', dependsOn: ['b'])
+            ->dispatch();
+
+        $this->complete($this->member($batch, 'JobA'), JobState::Failed);
+        $this->assertSame(BatchState::Partial, $batch->refresh()->state);
+        $this->assertSame(JobState::Canceled, $this->member($batch, 'JobB')->state);
+
+        $this->app->make(OperatorActions::class)->skip($this->member($batch, 'JobA'), 'a is not mission critical', 'op-1');
+
+        $batch->refresh();
+        $this->assertSame(BatchState::Running, $batch->state, 'batch reopened');
+        $this->assertSame(JobState::Skipped, $this->member($batch, 'JobA')->state);
+        $this->assertSame(0, $batch->failed_count);
+        $this->assertSame(1, $batch->skipped_count);
+
+        $b = $this->member($batch, 'JobB');
+        $this->assertSame(JobState::Pending, $b->state, 'b waits on its predecessor again');
+        $this->assertNull($b->cancel_reason);
+        $this->assertSame(JobState::Pending, $this->member($batch, 'JobC')->state, 'revival cascades transitively');
+
+        // A skipped upstream satisfies the on_success edge: b is admitted at once.
+        $admitter = $this->app->make(Admitter::class);
+        $admitter->admit();
+        $this->assertSame(JobState::Queued, $this->member($batch, 'JobB')->state, 'admitted past the skipped node');
+        $this->complete($this->member($batch, 'JobB'), JobState::Succeeded);
+        $admitter->admit();
+        $this->complete($this->member($batch, 'JobC'), JobState::Succeeded);
+
+        $batch->refresh();
+        $this->assertSame(BatchState::Succeeded, $batch->state, 'skipped members do not spoil the verdict');
+        $this->assertSame(2, $batch->succeeded_count);
+        $this->assertSame(1, $batch->skipped_count);
+        $this->assertSame(1, $batch->summary['skipped']);
+        $this->assertSame('succeeded', $batch->summary['outcome']);
+    }
+
+    public function test_skipping_the_only_failure_of_a_fanout_completes_it_at_once(): void
+    {
+        // Nothing to revive: the skip itself is the last word, so the batch must
+        // settle now rather than wait for an event that will never come.
+        $batch = $this->jobwarden()->batch('fanout', 'continue')
+            ->add('a', 'JobA')->add('b', 'JobB')->dispatch();
+
+        $this->complete($this->member($batch, 'JobA'), JobState::Succeeded);
+        $this->complete($this->member($batch, 'JobB'), JobState::Failed);
+        $this->assertSame(BatchState::Partial, $batch->refresh()->state);
+
+        $this->app->make(OperatorActions::class)->skip($this->member($batch, 'JobB'), 'skip b', 'op-1');
+
+        $batch->refresh();
+        $this->assertSame(BatchState::Succeeded, $batch->state);
+        $this->assertSame('succeeded', $batch->summary['outcome']);
+        $this->assertSame(1, $batch->summary['skipped']);
+    }
+
+    public function test_a_skip_leaves_the_batch_partial_while_an_operator_cancel_remains(): void
+    {
+        $batch = $this->jobwarden()->batch('fanout', 'continue')
+            ->add('a', 'JobA')->add('b', 'JobB')->add('c', 'JobC')->dispatch();
+
+        $this->app->make(OperatorActions::class)->cancel($this->member($batch, 'JobC'), 'operator cancel', 'op-1');
+        $this->complete($this->member($batch, 'JobA'), JobState::Succeeded);
+        $this->complete($this->member($batch, 'JobB'), JobState::Failed);
+        $this->assertSame(BatchState::Partial, $batch->refresh()->state);
+
+        $this->app->make(OperatorActions::class)->skip($this->member($batch, 'JobB'), 'skip b', 'op-1');
+
+        $batch->refresh();
+        $this->assertSame(BatchState::Partial, $batch->state, 'the canceled member still spoils it');
+        $this->assertSame(JobState::Canceled, $this->member($batch, 'JobC')->state, 'an operator verdict is never revived');
+    }
+
+    public function test_skipping_the_only_failure_of_a_fail_fast_batch_reopens_it(): void
+    {
+        $batch = $this->jobwarden()->batch('ff', 'fail_fast')
+            ->add('a', 'JobA')->add('b', 'JobB')->dispatch();
+
+        $this->complete($this->member($batch, 'JobA'), JobState::Failed);
+        $this->assertSame(BatchState::Failed, $batch->refresh()->state);
+        $this->assertSame(JobState::Canceled, $this->member($batch, 'JobB')->state);
+
+        // failed_count drops to 0, the policy no longer trips, the batch reopens.
+        // b was canceled by the fail_fast sweep (not the unreachable-cascade),
+        // so — as with retry — it stays canceled and the batch settles partial.
+        $this->app->make(OperatorActions::class)->skip($this->member($batch, 'JobA'), 'skip a', 'op-1');
+
+        $batch->refresh();
+        $this->assertSame(BatchState::Partial, $batch->state);
+        $this->assertSame(JobState::Canceled, $this->member($batch, 'JobB')->state);
+    }
+
+    public function test_skipping_a_pending_member_lets_its_dependents_through(): void
+    {
+        $batch = $this->jobwarden()->batch('chain')
+            ->add('a', 'JobA')
+            ->add('b', 'JobB', dependsOn: ['a'])
+            ->dispatch();
+
+        $this->app->make(OperatorActions::class)->skip($this->member($batch, 'JobA'), 'step not needed', 'op-1');
+        $this->assertSame(JobState::Skipped, $this->member($batch, 'JobA')->state);
+        $this->assertSame(BatchState::Running, $batch->refresh()->state, 'b is still in flight');
+
+        $this->app->make(Admitter::class)->admit();
+        $this->assertSame(JobState::Queued, $this->member($batch, 'JobB')->state);
+
+        $this->complete($this->member($batch, 'JobB'), JobState::Succeeded);
+        $this->assertSame(BatchState::Succeeded, $batch->refresh()->state);
+    }
+
     public function test_a_dependency_cycle_is_rejected(): void
     {
         $this->expectException(RuntimeException::class);

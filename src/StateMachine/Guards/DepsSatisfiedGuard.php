@@ -13,9 +13,10 @@ use Illuminate\Support\Facades\DB;
 
 /**
  * Dependency satisfaction (spec §13.6 default): a job is admitted only when ALL
- * of its depends_on jobs are satisfied — succeeded for an `on_success` edge, or
- * merely ENDED (any terminal state) for an `on_completion` edge, which is what
- * lets a batch carry a finally-style member. The same pair of conditions gates
+ * of its depends_on jobs are satisfied — succeeded (or skipped by an operator,
+ * see JobState::satisfiesSuccessEdge) for an `on_success` edge, or merely
+ * ENDED (any terminal state) for an `on_completion` edge, which is what lets a
+ * batch carry a finally-style member. The same pair of conditions gates
  * cross-batch edges (spec §8.5): an `on_success` batch dependency requires the
  * upstream BATCH to reach `succeeded`, an `on_completion` one requires it
  * terminal AND quiescent. A job with no edges passes trivially.
@@ -33,12 +34,12 @@ final class DepsSatisfiedGuard implements Guard
         $conn = DB::connection(config('jobwarden.connection'));
         $prefix = (string) config('jobwarden.table_prefix');
 
-        $terminal = [JobState::Succeeded->value, JobState::Failed->value, JobState::Canceled->value, JobState::Stopped->value];
+        $terminal = JobState::terminalValues();
 
         $unmet = $conn->table($prefix.'job_dependencies as d')
             ->join($prefix.'jobs as dep', 'dep.id', '=', 'd.depends_on_job_id')
             ->where('d.job_id', $entity->getKey())
-            ->where('dep.state', '!=', JobState::Succeeded->value)
+            ->whereNotIn('dep.state', JobState::satisfyingValues())
             // Written as a carve-out from the strict rule rather than as two
             // arms, so an unrecognized edge_condition keeps the strict (safe)
             // behavior instead of admitting on anything. `orphaned` is NOT

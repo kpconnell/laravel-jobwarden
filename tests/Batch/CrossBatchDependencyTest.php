@@ -346,6 +346,33 @@ final class CrossBatchDependencyTest extends TestCase
         $this->assertSame(JobState::Queued, $this->member($b2, 'JobWork')->state, 'admitted after the upstream re-succeeds');
     }
 
+    public function test_skipping_the_upstream_failure_lets_a_strict_dependent_batch_proceed(): void
+    {
+        // The reason skipped members do not spoil the verdict: an operator's
+        // skip must carry across a strict cross-batch edge, or it would unblock
+        // one hop and doom the next with no batch-level skip to fix it.
+        $b1 = $this->warden()->batch('upstream', 'continue')->add('u', 'JobU')->add('v', 'JobV')->dispatch();
+        $b2 = $this->warden()->batch('down')
+            ->dependsOnBatches([$b1])
+            ->add('work', 'JobWork')
+            ->dispatch();
+
+        $this->complete($this->member($b1, 'JobV'), JobState::Succeeded);
+        $this->complete($this->member($b1, 'JobU'), JobState::Failed);
+        $this->assertSame(BatchState::Partial, $b1->refresh()->state);
+        $this->assertSame(BatchState::Partial, $b2->refresh()->state, 'doomed strictly');
+        $this->assertSame(JobState::Canceled, $this->member($b2, 'JobWork')->state);
+
+        $this->app->make(OperatorActions::class)->skip($this->member($b1, 'JobU'), 'skip u', 'op-1');
+
+        $this->assertSame(BatchState::Succeeded, $b1->refresh()->state, 'reopened and settled succeeded in one step');
+        $this->assertSame(BatchState::Running, $b2->refresh()->state, 'the dependent batch reopened');
+        $this->assertSame(JobState::Pending, $this->member($b2, 'JobWork')->state, 'revived');
+
+        $this->admit();
+        $this->assertSame(JobState::Queued, $this->member($b2, 'JobWork')->state, 'a succeeded upstream admits it');
+    }
+
     public function test_revival_waits_until_every_doomed_upstream_reopens(): void
     {
         $b1a = $this->warden()->batch('up-a', 'continue')->add('ua', 'JobUa')->dispatch();

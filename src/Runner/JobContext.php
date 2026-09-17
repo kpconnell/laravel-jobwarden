@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace JobWarden\Runner;
 
 use Closure;
+use JobWarden\States\JobState;
 use JobWarden\Support\SqlTime;
 use Illuminate\Support\Facades\DB;
 use Symfony\Component\Uid\Uuid;
@@ -38,8 +39,9 @@ final class JobContext
 
     /**
      * How this job's batch stands RIGHT NOW: the transactional progress counters
-     * plus the members that ended non-success (failed/canceled/stopped, capped at
-     * MAX_REPORTED_FAILURES, newest last). Null for a standalone job.
+     * plus the members that ended non-success (failed/canceled/stopped, and
+     * skipped — an operator's verdict is listed with the error it overrode;
+     * capped at MAX_REPORTED_FAILURES, newest last). Null for a standalone job.
      *
      * This is what makes a finalizer — a member joined by a `dependsOnCompletion`
      * edge — useful: running after failure is only worth anything if the handler
@@ -70,7 +72,7 @@ final class JobContext
 
         $failures = $conn->table($prefix.'jobs')
             ->where('batch_id', $this->batchId)
-            ->whereIn('state', ['failed', 'canceled', 'stopped'])
+            ->whereIn('state', array_values(array_diff(JobState::terminalValues(), [JobState::Succeeded->value])))
             ->orderBy('finished_at')
             ->orderBy('id')
             ->limit(self::MAX_REPORTED_FAILURES)
@@ -102,6 +104,7 @@ final class JobContext
                 // `stopped` members roll into canceled_count (JobStateBuckets).
                 'failed' => (int) $batch->failed_count,
                 'canceled' => (int) $batch->canceled_count,
+                'skipped' => (int) $batch->skipped_count,
             ],
             'failures' => $failures,
         ];

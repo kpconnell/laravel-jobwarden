@@ -129,6 +129,7 @@ stateDiagram-v2
 | `failed` | Attempts exhausted or a non-retryable/​non-idempotent outcome. | yes |
 | `canceled` | Intent withdrawn before active execution. | yes |
 | `stopped` | Deliberately halted while running. | yes |
+| `skipped` | Operator verdict that the outcome does not matter to the graph: satisfies `on_success` edges like `succeeded`, never spoils a batch verdict. Keeps `last_error`. Never produced by the system. | yes |
 
 ```mermaid
 stateDiagram-v2
@@ -142,13 +143,22 @@ stateDiagram-v2
     running --> retrying: attempt failed/orphaned & idempotent & budget left
     running --> orphaned: current attempt orphaned
     running --> stopped: deliberate stop
+    running --> skipped: kill-and-skip (flag honored by supervisor/recovery)
     orphaned --> retrying: recover & idempotent
     orphaned --> failed: recover & not idempotent
     retrying --> queued: backoff elapsed
+    failed --> skipped: operator skip
+    stopped --> skipped: operator skip
+    canceled --> skipped: operator skip
+    orphaned --> skipped: operator skip
+    pending --> skipped: operator skip
+    queued --> skipped: operator skip
+    retrying --> skipped: operator skip
     succeeded --> [*]
     failed --> [*]
     canceled --> [*]
     stopped --> [*]
+    skipped --> [*]
 ```
 
 ### 3.4 The idempotency guard
@@ -176,6 +186,8 @@ Every transition is validated against an explicit table by the `StateMachine` se
 | `orphaned → failed` (job) | reaper/recovery | `idempotent = false` OR budget exhausted |
 | `* → canceled` | operator | job not yet `running` |
 | `running → stopped` | operator | confirmed termination of the live attempt |
+| `failed / stopped / canceled / orphaned / pending / queued / retrying → skipped` | operator | pre-run states: job not yet `running` |
+| `running → skipped` | supervisor / reaper | the operator's `cancel_mode = skip` flag, honored when the live attempt is confirmed terminated (never an operator directly) |
 
 ---
 
@@ -199,6 +211,7 @@ running_count   int default 0
 succeeded_count int default 0
 failed_count    int default 0
 canceled_count  int default 0
+skipped_count   int default 0
 created_by      varchar null
 created_at, started_at, finished_at, updated_at
 ```
@@ -223,7 +236,7 @@ current_attempt_id uuid null fk -> job_attempts
 max_runtime_sec    int null           -- expected runtime ceiling for stuck detection
 backoff_strategy   varchar null       -- fixed|exponential|custom (+ base/cap in params)
 cancel_requested   boolean default false   -- desired-state flag for distributed cancel/stop
-cancel_mode        varchar null            -- cancel|stop
+cancel_mode        varchar null            -- cancel|stop|skip
 cancel_reason      varchar null
 cancel_requested_at timestamptz null
 last_error         json null
@@ -538,9 +551,11 @@ A lighter **in-process mode** (run the handler inside the worker loop) is availa
 
 ### 6.3 Distributed cancellation (no direct process access needed)
 Cancellation is **desired-state in the database**, so it works across hosts:
-1. Operator sets `jobs.cancel_requested = true`, `cancel_mode = cancel|stop`, with reason.
+1. Operator sets `jobs.cancel_requested = true`, `cancel_mode = cancel|stop|skip`, with reason.
 2. The owning supervisor observes the flag (on its heartbeat/poll loop, or via an optional Redis signal) and signals its child: `SIGTERM`, then `SIGKILL` after the grace window.
 3. If there is **no live owner** (the worker is dead), the reaper resolves it: the lease expires, the attempt is orphaned, and the cancellation desired-state is honored on recovery.
+
+The verbs are scoped to the states they name — **cancel** to work that has not started (`canceled` immediately), **stop** to active or parked work (`stopped`) — and refused elsewhere. The *mode* decides the landing state of a job halted while active: `cancel` and `stop` both record how the run ended, so a claim that won the race against a cancel lands `stopped`; `skip` is the operator's verdict on the graph, so the job lands `skipped` whether the supervisor reaped it, recovery found the flag on a lost attempt, or the child failed on its own first (**kill-and-skip**).
 
 Graceful jobs implement a shutdown hook (`onTerminate()`), giving them a window to checkpoint/clean up before forced kill.
 
@@ -591,7 +606,7 @@ A batch is a first-class object with its own lifecycle, params, progress, summar
 - **`threshold`** — tolerate up to `failure_threshold` failures before failing the batch.
 
 ### 8.3 Progress, completion, and artifacts
-Member transitions update the batch's denormalized counters in-transaction. When all members reach a terminal state, the batch coordinator runs **completion logic** (success/failure/partial determination + an optional batch-completion callback) and writes a batch `summary` and any batch-level artifacts. Cancellation propagates: canceling a batch sets `cancel_requested` on all non-terminal members — **including** members joined by `on_completion` edges, since cancelling the batch is an operator verdict to stop everything.
+Member transitions update the batch's denormalized counters in-transaction. When all members reach a terminal state, the batch coordinator runs **completion logic** (success/failure/partial determination + an optional batch-completion callback) and writes a batch `summary` and any batch-level artifacts. A `skipped` member is counted (`skipped_count`, `summary.skipped`) but never spoils the verdict: only failed and canceled/stopped members make a batch `partial`. Skipping a doomed member is the same undo as retrying it (§8.3 re-entry: reopen, revive its unreachable dependents) followed immediately by the completion check, since the member is settled rather than back in flight. Cancellation propagates: canceling a batch sets `cancel_requested` on all non-terminal members — **including** members joined by `on_completion` edges, since cancelling the batch is an operator verdict to stop everything.
 
 An **eager** policy (`fail_fast`, `threshold`) is the exception: its sweep spares any member joined by an `on_completion` edge, and everything downstream of one, so `finally` work runs in exactly the case it exists for. The batch verdict is still recorded immediately; the spared subtree runs on afterwards (admission and claiming are batch-state-agnostic), the same way a `running` member the sweep could only FLAG keeps running until its supervisor honors the flag. Inside the spared subtree the ordinary DAG rules resume — a finalizer that itself fails cancels its own `on_success` dependents — and its outcome lands in the counters like any other member's.
 
@@ -646,7 +661,8 @@ Logs are first-class: structured records with `ts`, `level`, `step`, `message`, 
 ### 10.1 Operator actions (durable, audited)
 Exposed via a service façade, Artisan commands, and the optional UI:
 - **Cancel** a job (pre-run) → `canceled`.
-- **Stop** a running job → `stopped` (graceful then forced).
+- **Stop** a running or parked job → `stopped` (graceful then forced).
+- **Skip** a job (anything but succeeded) → `skipped`: its dependents proceed as if it had succeeded, and the batch reopens/revives as for a retry, then completes — skipped members never spoil the verdict. Running → kill-and-skip via `cancel_mode = skip`.
 - **Retry** a failed job → mint a new attempt (warns and requires confirmation if `idempotent = false`).
 - **Restart** an orphaned job → explicit override, audited, even for non-idempotent jobs.
 - **Pause/resume** a schedule (`enabled` toggle); **re-prioritize** or **requeue** a job.

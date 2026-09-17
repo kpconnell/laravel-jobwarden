@@ -81,7 +81,7 @@ what a typeahead should call as the operator types. Results are capped
 ordered alphabetically; neither form is paginated.
 
 **Polling contract.** Dispatch returns the job id; poll `GET /jobs/{id}` until
-`state` is terminal (`succeeded` | `failed` | `canceled` | `stopped`). `result`
+`state` is terminal (`succeeded` | `failed` | `canceled` | `stopped` | `skipped`). `result`
 is written **atomically with the succeeded transition**, so `state = succeeded`
 guarantees the final `result` is present in the same read (null if the handler
 never stored one) — no re-read needed. `result` is success-only; failures carry
@@ -94,15 +94,19 @@ their story in `last_error`.
 | `POST /jobs` | Dispatch one ad-hoc job. Body: `job_class`, optional `params`, plus dispatch options like `lane`, `idempotent`, `max_attempts`, `priority`, `available_at`, `max_runtime_sec`, `tags` (a `{name: value}` map of strings, values ≤ 200 chars — 422 otherwise). Returns 201. |
 
 All take an optional `reason` (recorded in the audit trail) and return the fresh job.
-The actor is the authenticated user id, else `api`.
+The actor is the authenticated user id, else `api`. Each verb is scoped to the
+states it names and maps to one verdict; applied to a job in any other state it is
+refused (an uncaught `InvalidArgumentException`, currently a 500 — check `state`
+first).
 
-| Method & path | Effect |
-|---|---|
-| `POST /jobs/{id}/cancel` | Desired-state cancel (pre-run → canceled; running → flagged + signaled). |
-| `POST /jobs/{id}/stop` | Desired-state stop. |
-| `POST /jobs/{id}/retry` | Operator retry of a failed/parked job. |
-| `POST /jobs/{id}/restart` | Operator restart. |
-| `POST /batches/{id}/cancel` | Cancel a batch; propagates to non-terminal members. |
+| Method & path | Valid on | Effect |
+|---|---|---|
+| `POST /jobs/{id}/cancel` | `pending`, `queued`, `retrying` | Withdraw work that has not started → `canceled`. The flag is written first, so if a claim wins the race the supervisor halts the child and it lands `stopped`. |
+| `POST /jobs/{id}/stop` | `running`, `orphaned` | Halt active work → `stopped`. A running job is flagged and signaled by its supervisor; a parked orphan stops immediately. |
+| `POST /jobs/{id}/skip` | anything but `succeeded` | Rule the node's outcome irrelevant → `skipped`; its dependents proceed as if it had succeeded. Settled and pre-run jobs and parked orphans move at once; a running job is flagged with `cancel_mode = skip`, killed by its supervisor, and lands `skipped` (kill-and-skip). |
+| `POST /jobs/{id}/retry` | `failed` | Re-queue, minting a fresh attempt. |
+| `POST /jobs/{id}/restart` | `stopped`, `orphaned` | Re-queue, minting a fresh attempt. |
+| `POST /batches/{id}/cancel` | pending/running batch | Cancel a batch; propagates to non-terminal members. |
 
 ### Scheduling
 
@@ -130,8 +134,11 @@ curl -s -XPOST localhost/jobwarden/api/jobs \
   -H 'Content-Type: application/json' \
   -d '{"job_class":"App\\Jobs\\ImportCatalog","params":{"store":"north"},"idempotent":true,"max_attempts":3}'
 
-# retry a parked job
+# retry a failed job
 curl -s -XPOST 'localhost/jobwarden/api/jobs/<id>/retry' -d 'reason=transient blip cleared'
+
+# skip a failed DAG member so its dependents proceed
+curl -s -XPOST 'localhost/jobwarden/api/jobs/<id>/skip' -d 'reason=report step is optional tonight'
 
 # schedule a nightly, idempotent artisan command
 curl -s -XPOST localhost/jobwarden/api/schedules \

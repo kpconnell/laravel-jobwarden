@@ -95,6 +95,18 @@ final class ReconciliationTest extends TestCase
         $this->assertSame(JobState::Stopped, Job::find($job->id)->state);
     }
 
+    public function test_a_stranded_stopped_attempt_under_a_skip_flag_skips_the_job(): void
+    {
+        // Kill-and-skip whose supervisor died between the two transitions: the
+        // sweep lands the job per the flag's mode, exactly as the supervisor would have.
+        [$job] = $this->seedStranded(AttemptState::Stopped);
+        Job::where('id', $job->id)->update(['cancel_requested' => true, 'cancel_mode' => 'skip', 'cancel_reason' => 'kill and skip']);
+
+        $this->reaper()->tick('reaper-x');
+
+        $this->assertSame(JobState::Skipped, Job::find($job->id)->state);
+    }
+
     public function test_the_grace_window_defers_a_freshly_settled_job(): void
     {
         // A worker that just committed its attempt is racing to commit the job; the

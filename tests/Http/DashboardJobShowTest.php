@@ -55,18 +55,45 @@ final class DashboardJobShowTest extends TestCase
         $failed = Job::create(['job_class' => 'F', 'state' => JobState::Failed]);
         Livewire::test(JobShow::class, ['job' => $failed->id])
             ->assertSeeHtml('wire:click="retry"')
+            ->assertSeeHtml('wire:click="skip"')
             ->assertDontSeeHtml('wire:click="cancel"')
             ->assertDontSeeHtml('wire:click="restart"');
 
+        // One halt verb per state: cancel for work that has not started...
         $queued = Job::create(['job_class' => 'Q', 'state' => JobState::Queued]);
         Livewire::test(JobShow::class, ['job' => $queued->id])
             ->assertSeeHtml('wire:click="cancel"')
-            ->assertSeeHtml('wire:click="stop"')
+            ->assertSeeHtml('wire:click="skip"')
+            ->assertDontSeeHtml('wire:click="stop"')
             ->assertDontSeeHtml('wire:click="retry"');
+
+        // ...stop for work that is active, where skip reads as kill-and-skip.
+        $running = Job::create(['job_class' => 'R', 'state' => JobState::Running]);
+        Livewire::test(JobShow::class, ['job' => $running->id])
+            ->assertSeeHtml('wire:click="stop"')
+            ->assertSee('Stop &amp; skip', false)
+            ->assertDontSeeHtml('wire:click="cancel"');
 
         $orphaned = Job::create(['job_class' => 'O', 'state' => JobState::Orphaned]);
         Livewire::test(JobShow::class, ['job' => $orphaned->id])
-            ->assertSeeHtml('wire:click="restart"');
+            ->assertSeeHtml('wire:click="restart"')
+            ->assertSeeHtml('wire:click="stop"')
+            ->assertSeeHtml('wire:click="skip"');
+
+        $succeeded = Job::create(['job_class' => 'S', 'state' => JobState::Succeeded]);
+        Livewire::test(JobShow::class, ['job' => $succeeded->id])
+            ->assertDontSeeHtml('wire:click="skip"');
+    }
+
+    public function test_skip_action_skips_a_failed_job(): void
+    {
+        $job = Job::create(['job_class' => 'X', 'state' => JobState::Failed]);
+
+        Livewire::test(JobShow::class, ['job' => $job->id])
+            ->call('skip')
+            ->assertDispatched('jw-toast');
+
+        $this->assertSame(JobState::Skipped, $job->refresh()->state);
     }
 
     public function test_cancel_action_cancels_a_queued_job(): void

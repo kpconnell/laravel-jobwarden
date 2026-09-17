@@ -52,11 +52,6 @@ final class WaitAnalysis
     /** Worker states that still count as present (matches Livewire\Workers). */
     private const LIVE = ['starting', 'active', 'draining'];
 
-    private const JOB_TERMINAL = [
-        JobState::Succeeded->value, JobState::Failed->value,
-        JobState::Canceled->value, JobState::Stopped->value,
-    ];
-
     private const BATCH_TERMINAL = [
         BatchState::Succeeded->value, BatchState::Failed->value, BatchState::Partial->value,
         BatchState::Canceled->value, BatchState::Stopped->value,
@@ -132,11 +127,12 @@ final class WaitAnalysis
 
     /**
      * Unmet DAG edges. Same predicate as DepsSatisfiedGuard: an on_success edge
-     * needs the upstream SUCCEEDED, an on_completion edge merely needs it ended.
+     * needs the upstream SUCCEEDED (or skipped), an on_completion edge merely
+     * needs it ended.
      * Written as a carve-out from the strict rule so an unrecognized
      * edge_condition keeps reporting the strict (safe) answer.
      *
-     * Note `orphaned` is deliberately absent from JOB_TERMINAL — a parked orphan
+     * Note `orphaned` is not terminal (JobState::terminalValues) — a parked orphan
      * awaits an operator verdict, so it gates its dependents under EITHER
      * condition. That is the blocker operators misread most often, so the view
      * calls it out by name.
@@ -148,10 +144,10 @@ final class WaitAnalysis
         $rows = $this->connection()->table($this->tbl('job_dependencies').' as d')
             ->join($this->tbl('jobs').' as dep', 'dep.id', '=', 'd.depends_on_job_id')
             ->where('d.job_id', $job->getKey())
-            ->where('dep.state', '!=', JobState::Succeeded->value)
+            ->whereNotIn('dep.state', JobState::satisfyingValues())
             ->where(fn ($q) => $q
                 ->where('d.edge_condition', '!=', 'on_completion')
-                ->orWhereNotIn('dep.state', self::JOB_TERMINAL))
+                ->orWhereNotIn('dep.state', JobState::terminalValues()))
             ->orderBy('dep.created_at')
             ->limit(self::DEP_LIST_CAP + 1)
             ->get(['dep.id', 'dep.job_class', 'dep.name', 'dep.state', 'd.edge_condition']);

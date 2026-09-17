@@ -13,6 +13,12 @@
         'restart' => ['label' => 'Restart', 'class' => 'btn-purple', 'confirm' => null],
         'cancel' => ['label' => 'Cancel', 'class' => '', 'confirm' => 'Cancel this job?'],
         'stop' => ['label' => 'Stop', 'class' => 'btn-red', 'confirm' => 'Stop this job?'],
+        'skip' => [
+            'label' => $job->state === JobState::Running ? 'Stop & skip' : 'Skip',
+            'class' => 'btn-red',
+            'confirm' => ($job->state === JobState::Running ? 'Stop this job and skip it?' : 'Skip this job?')
+                .' Its dependents will proceed as if it had succeeded.',
+        ],
     ];
 @endphp
 <div class="view doc" wire:poll.{{ config('jobwarden.dashboard.poll', '10s') }}>
@@ -23,7 +29,7 @@
                 <div class="detail-title">
                     <span class="name">{{ class_basename($job->job_class) }}</span>
                     @include('jobwarden::partials.state-badge', ['state' => $job->state])
-                    @if ($job->cancel_requested && ! in_array($job->state, [JobState::Succeeded, JobState::Failed, JobState::Canceled, JobState::Stopped], true))
+                    @if ($job->cancel_requested && ! $job->state->isTerminal())
                         <span class="badge h-amber">{{ $job->cancel_mode ?? 'cancel' }} requested</span>
                     @endif
                 </div>
@@ -157,7 +163,7 @@
         @elseif ($tab === 'timeline')
             <div class="tl">
                 @forelse ($job->events as $e)
-                    @php($hue = match ($e->to_state) { 'succeeded' => 'green', 'failed' => 'red', 'running', 'queued', 'dispatched' => 'blue', 'retrying' => 'amber', 'orphaned' => 'purple', 'canceled', 'stopped' => 'gray', default => 'slate' })
+                    @php($hue = match ($e->to_state) { 'succeeded' => 'green', 'failed' => 'red', 'running', 'queued', 'dispatched' => 'blue', 'retrying' => 'amber', 'orphaned' => 'purple', 'canceled', 'stopped', 'skipped' => 'gray', default => 'slate' })
                     <div class="tl-item">
                         <div class="tl-rail"><span class="sdot h-{{ $hue }}"></span><span class="line"></span></div>
                         <div>

@@ -35,6 +35,7 @@ class Batch extends JobWardenModel
             'succeeded_count' => 'integer',
             'failed_count' => 'integer',
             'canceled_count' => 'integer',
+            'skipped_count' => 'integer',
             'created_at' => 'datetime',
             'started_at' => 'datetime',
             'finished_at' => 'datetime',

@@ -128,6 +128,22 @@ final class DashboardJobsTest extends TestCase
         $this->assertSame(JobState::Succeeded, $done->refresh()->state);
     }
 
+    public function test_bulk_skip_settles_failed_rows_and_flags_running_ones(): void
+    {
+        $failed = Job::create(['job_class' => 'F', 'state' => JobState::Failed]);
+        $running = Job::create(['job_class' => 'R', 'state' => JobState::Running]);
+        $done = Job::create(['job_class' => 'D', 'state' => JobState::Succeeded]);
+
+        Livewire::test(Jobs::class)
+            ->set('selected', [$failed->id, $running->id, $done->id])
+            ->call('bulk', 'skip');
+
+        $this->assertSame(JobState::Skipped, $failed->refresh()->state);
+        $this->assertSame(JobState::Running, $running->refresh()->state);
+        $this->assertSame('skip', $running->cancel_mode, 'kill-and-skip left for the supervisor');
+        $this->assertSame(JobState::Succeeded, $done->refresh()->state, 'skipped as wrong state');
+    }
+
     public function test_toggle_select_page_selects_and_deselects_every_visible_row(): void
     {
         $a = Job::create(['job_class' => 'A', 'state' => JobState::Queued]);

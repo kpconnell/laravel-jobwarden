@@ -34,7 +34,12 @@ use Illuminate\Support\Facades\Log;
  * The cascade also runs in reverse: when a doomed member re-enters the DAG
  * (operator retry/restart), a partial/failed batch reopens and the dependents
  * the system canceled as unreachable are revived to `pending` — back to
- * waiting on their dependencies.
+ * waiting on their dependencies. An operator SKIPPING a doomed member is the
+ * same undo — its dependents are reachable again, because a skipped upstream
+ * satisfies an on_success edge — followed by a completion check, since the
+ * skipped member is settled rather than back in flight. Skipped members never
+ * spoil the verdict: a batch whose only non-successes are skipped ends
+ * `succeeded`, with the count on the summary.
  *
  * Every unreachability rule below is scoped to `on_success` edges. A member
  * joined by an `on_completion` edge is reachable BECAUSE its upstream ended:
@@ -100,6 +105,7 @@ final class BatchCoordinator
         }
 
         $reentered = ! $event->to->isTerminal() && in_array($event->from, self::DOOMED, true);
+        $skippedDoomed = $event->to === JobState::Skipped && in_array($event->from, self::DOOMED, true);
         if (! $event->to->isTerminal() && ! $reentered) {
             return;
         }
@@ -109,15 +115,24 @@ final class BatchCoordinator
             return;
         }
 
-        if ($reentered) {
+        if ($reentered || $skippedDoomed) {
             // A doomed member re-entered the DAG (operator retry/restart, or a
-            // revival cascading below): reopen a completed batch and put the
-            // dependents its doom canceled back to waiting on it. Each revival
-            // cascades transitively via its own event.
+            // revival cascading below) — or was skipped, which undoes its doom
+            // just the same: reopen a completed batch and put the dependents
+            // its doom canceled back to waiting on it. Each revival cascades
+            // transitively via its own event.
             $this->reopenBatch($batch);
             if (self::acceptsRevival($batch->state)) {
                 $this->reviveUnreachableDependents($event->job->id, $batch);
             }
+
+            if ($reentered) {
+                return; // the member is in flight; its own terminal event completes the batch
+            }
+
+            // Skipped is terminal: with nothing revived (a fan-out, or dependents
+            // that were the operator's own cancels) the batch may be done now.
+            $this->maybeComplete($batch);
 
             return;
         }
@@ -316,6 +331,10 @@ final class BatchCoordinator
             return; // members still executing
         }
 
+        // skipped_count is deliberately not consulted: a skipped member is an
+        // operator's verdict that it does not matter, and a strict cross-batch
+        // edge on this batch should honor that verdict exactly as an intra-batch
+        // edge on the member does. The summary still carries the count.
         $clean = (int) $batch->failed_count === 0 && (int) $batch->canceled_count === 0;
         $this->transitionBatch($batch, $clean ? BatchState::Succeeded : BatchState::Partial, 'all members terminal');
     }
@@ -328,10 +347,9 @@ final class BatchCoordinator
      */
     private function cancelRemainingMembers(Batch $batch, string $reason, bool $sparingFinalizers = false): void
     {
-        $terminal = [JobState::Succeeded->value, JobState::Failed->value, JobState::Canceled->value, JobState::Stopped->value];
         $spared = $sparingFinalizers ? $this->finalizerClosure($batch) : [];
 
-        $members = Job::query()->where('batch_id', $batch->id)->whereNotIn('state', $terminal)->get();
+        $members = Job::query()->where('batch_id', $batch->id)->whereNotIn('state', JobState::terminalValues())->get();
         foreach ($members as $job) {
             if (isset($spared[(string) $job->id])) {
                 continue;
@@ -666,10 +684,9 @@ final class BatchCoordinator
         // longer stands, and honoring one now would kill a healthy member of
         // the reopened batch. Matched by the sweep's own reason so an
         // operator's cancel flag is never withdrawn.
-        $terminal = [JobState::Succeeded->value, JobState::Failed->value, JobState::Canceled->value, JobState::Stopped->value];
         $conn->table($this->tbl('jobs'))
             ->where('batch_id', $batch->id)
-            ->whereNotIn('state', $terminal)
+            ->whereNotIn('state', JobState::terminalValues())
             ->where('cancel_requested', true)
             ->where('cancel_reason', "batch member failed under {$batch->failure_policy}")
             ->update([
@@ -708,24 +725,64 @@ final class BatchCoordinator
      * would refill with the same unreopenable ids every tick — and a finalizer
      * blocked behind an orphan would hold its slot indefinitely.
      *
+     * The settled arms are the twin of that for a lost `failed → skipped`
+     * event (or a lost re-entry whose member finished before the sweep saw it
+     * in flight): a completed batch with NOTHING in flight whose recorded
+     * verdict the counters no longer support. Three shapes:
+     *   - `partial` with no failed or canceled member left — the verdict is
+     *     now `succeeded`;
+     *   - `partial` still holding a member the cascade canceled whose upstreams
+     *     are no longer doomed — the skip should have revived it, and revival
+     *     needs the batch running first (acceptsRevival);
+     *   - `failed` under a policy that no longer trips.
+     * Reopened here, the revive and completion passes below settle it in the
+     * same tick. Every predicate is exact, so a batch that legitimately ended
+     * `partial` after a skip (an operator-canceled member remains) is never
+     * selected, and never flaps.
+     *
      * @return string[]
      */
     private function reopenableBatchIds(int $limit): array
     {
-        return $this->connection()->table($this->tbl('batches'))
-            ->whereIn('state', [BatchState::Partial->value, BatchState::Failed->value])
-            ->whereRaw('pending_count + running_count > 0')
+        return $this->connection()->table($this->tbl('batches').' as b')
+            ->whereIn('b.state', [BatchState::Partial->value, BatchState::Failed->value])
+            ->where(function ($q): void {
+                $q->whereRaw('b.pending_count + b.running_count > 0')
+                    ->orWhere(function ($q): void {
+                        $q->where('b.state', BatchState::Partial->value)
+                            ->whereRaw('b.pending_count + b.running_count = 0')
+                            ->where('b.failed_count', 0)
+                            ->where('b.canceled_count', 0);
+                    })
+                    ->orWhere(function ($q): void {
+                        $q->where('b.state', BatchState::Partial->value)
+                            ->whereRaw('b.pending_count + b.running_count = 0')
+                            ->whereExists(function ($q): void {
+                                $q->selectRaw('1')
+                                    ->from($this->tbl('jobs').' as j')
+                                    ->whereColumn('j.batch_id', 'b.id')
+                                    ->where('j.state', JobState::Canceled->value)
+                                    ->whereIn('j.cancel_reason', self::CASCADE_REASONS);
+                                $this->whereNoDoomedUpstream($q, 'j');
+                            });
+                    })
+                    ->orWhere(function ($q): void {
+                        // Not-tripped is asserted by the whereNot below.
+                        $q->where('b.state', BatchState::Failed->value)
+                            ->whereRaw('b.pending_count + b.running_count = 0');
+                    });
+            })
             ->whereNot(function ($q): void {   // the SQL twin of shouldEagerFail()
                 $q->where(function ($q): void {
-                    $q->where('failure_policy', 'fail_fast')->where('failed_count', '>', 0);
+                    $q->where('b.failure_policy', 'fail_fast')->where('b.failed_count', '>', 0);
                 })->orWhere(function ($q): void {
-                    $q->where('failure_policy', 'threshold')
-                        ->whereRaw('failed_count > COALESCE(failure_threshold, 0)');
+                    $q->where('b.failure_policy', 'threshold')
+                        ->whereRaw('b.failed_count > COALESCE(b.failure_threshold, 0)');
                 });
             })
-            ->orderBy('id')
+            ->orderBy('b.id')
             ->limit($limit)
-            ->pluck('id')
+            ->pluck('b.id')
             ->map(static fn ($id): string => (string) $id)
             ->all();
     }
@@ -743,30 +800,17 @@ final class BatchCoordinator
         $doomed = array_map(static fn (JobState $s): string => $s->value, self::DOOMED);
         $doomedBatch = array_map(static fn (BatchState $s): string => $s->value, self::DOOMED_BATCH);
 
-        return $this->connection()->table($this->tbl('jobs').' as j')
+        $query = $this->connection()->table($this->tbl('jobs').' as j')
             ->join($this->tbl('batches').' as b', 'b.id', '=', 'j.batch_id')
             ->whereIn('b.state', [BatchState::Running->value, BatchState::Failed->value])
             ->where('j.state', JobState::Canceled->value)
-            ->where('j.cancel_reason', self::UNREACHABLE_REASON)
-            ->whereNotExists(function ($q) use ($doomed): void {
-                $q->selectRaw('1')
-                    ->from($this->tbl('job_dependencies').' as d')
-                    ->join($this->tbl('jobs').' as dep', 'dep.id', '=', 'd.depends_on_job_id')
-                    ->whereColumn('d.job_id', 'j.id')
-                    ->where('d.edge_condition', '!=', 'on_completion')
-                    ->whereIn('dep.state', $doomed);
-            })
-            // The batch-dep arm of hasDoomedDependency(): reviving a member
-            // whose cross-batch upstream is still doomed would only see the
-            // stranded batch-dep pass re-cancel it every tick — a flap.
-            ->whereNotExists(function ($q) use ($doomedBatch): void {
-                $q->selectRaw('1')
-                    ->from($this->tbl('job_batch_dependencies').' as bd')
-                    ->join($this->tbl('batches').' as ub', 'ub.id', '=', 'bd.depends_on_batch_id')
-                    ->whereColumn('bd.job_id', 'j.id')
-                    ->where('bd.edge_condition', '!=', 'on_completion')
-                    ->whereIn('ub.state', $doomedBatch);
-            })
+            ->where('j.cancel_reason', self::UNREACHABLE_REASON);
+        // Both arms of hasDoomedDependency(): reviving a member whose
+        // cross-batch upstream is still doomed would only see the stranded
+        // batch-dep pass re-cancel it every tick — a flap.
+        $this->whereNoDoomedUpstream($query, 'j');
+
+        return $query
             ->orderBy('j.id')
             ->limit($limit)
             ->pluck('j.id')
@@ -793,28 +837,15 @@ final class BatchCoordinator
         $doomed = array_map(static fn (JobState $s): string => $s->value, self::DOOMED);
         $doomedBatch = array_map(static fn (BatchState $s): string => $s->value, self::DOOMED_BATCH);
 
-        return $this->connection()->table($this->tbl('jobs').' as j')
+        $query = $this->connection()->table($this->tbl('jobs').' as j')
             ->join($this->tbl('job_batch_dependencies').' as bd', function ($join): void {
                 $join->on('bd.job_id', '=', 'j.id')->where('bd.edge_condition', '!=', 'on_completion');
             })
             ->where('j.state', JobState::Canceled->value)
-            ->whereIn('j.cancel_reason', self::CASCADE_REASONS)
-            ->whereNotExists(function ($q) use ($doomed): void {
-                $q->selectRaw('1')
-                    ->from($this->tbl('job_dependencies').' as d')
-                    ->join($this->tbl('jobs').' as dep', 'dep.id', '=', 'd.depends_on_job_id')
-                    ->whereColumn('d.job_id', 'j.id')
-                    ->where('d.edge_condition', '!=', 'on_completion')
-                    ->whereIn('dep.state', $doomed);
-            })
-            ->whereNotExists(function ($q) use ($doomedBatch): void {
-                $q->selectRaw('1')
-                    ->from($this->tbl('job_batch_dependencies').' as bd2')
-                    ->join($this->tbl('batches').' as ub', 'ub.id', '=', 'bd2.depends_on_batch_id')
-                    ->whereColumn('bd2.job_id', 'j.id')
-                    ->where('bd2.edge_condition', '!=', 'on_completion')
-                    ->whereIn('ub.state', $doomedBatch);
-            })
+            ->whereIn('j.cancel_reason', self::CASCADE_REASONS);
+        $this->whereNoDoomedUpstream($query, 'j');
+
+        $query
             ->where(function ($q): void {
                 $q->whereNull('j.batch_id')
                     ->orWhereExists(function ($q): void {
@@ -837,12 +868,43 @@ final class BatchCoordinator
                             });
                     });
             })
-            ->distinct() // a job may hold several batch edges
+            ->distinct(); // a job may hold several batch edges
+
+        return $query
             ->orderBy('j.id')
             ->limit($limit)
             ->pluck('j.id')
             ->map(static fn ($id): string => (string) $id)
             ->all();
+    }
+
+    /**
+     * The SQL twin of hasDoomedDependency(): no `on_success` upstream — job or
+     * batch — of `$alias` is still doomed. Shared by every revive-side window
+     * so the three sites cannot drift.
+     */
+    private function whereNoDoomedUpstream(\Illuminate\Database\Query\Builder $query, string $alias): void
+    {
+        $doomed = array_map(static fn (JobState $s): string => $s->value, self::DOOMED);
+        $doomedBatch = array_map(static fn (BatchState $s): string => $s->value, self::DOOMED_BATCH);
+
+        $query
+            ->whereNotExists(function ($q) use ($doomed, $alias): void {
+                $q->selectRaw('1')
+                    ->from($this->tbl('job_dependencies').' as nd')
+                    ->join($this->tbl('jobs').' as ndep', 'ndep.id', '=', 'nd.depends_on_job_id')
+                    ->whereColumn('nd.job_id', $alias.'.id')
+                    ->where('nd.edge_condition', '!=', 'on_completion')
+                    ->whereIn('ndep.state', $doomed);
+            })
+            ->whereNotExists(function ($q) use ($doomedBatch, $alias): void {
+                $q->selectRaw('1')
+                    ->from($this->tbl('job_batch_dependencies').' as nbd')
+                    ->join($this->tbl('batches').' as nub', 'nub.id', '=', 'nbd.depends_on_batch_id')
+                    ->whereColumn('nbd.job_id', $alias.'.id')
+                    ->where('nbd.edge_condition', '!=', 'on_completion')
+                    ->whereIn('nub.state', $doomedBatch);
+            });
     }
 
     /**
@@ -994,6 +1056,7 @@ final class BatchCoordinator
             'succeeded' => (int) $batch->succeeded_count,
             'failed' => (int) $batch->failed_count,
             'canceled' => (int) $batch->canceled_count,
+            'skipped' => (int) $batch->skipped_count,
             'failure_policy' => $batch->failure_policy,
         ];
     }

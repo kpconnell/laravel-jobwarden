@@ -247,11 +247,37 @@ final class StateMachineTest extends TestCase
         $this->assertSame(1, $batch->succeeded_count);
         $this->assertSame(1, $batch->failed_count);
         $this->assertSame(0, $batch->canceled_count);
+        $this->assertSame(0, $batch->skipped_count);
 
         // The partition invariant: buckets always sum to total_jobs.
-        $sum = $batch->pending_count + $batch->running_count + $batch->succeeded_count
-            + $batch->failed_count + $batch->canceled_count;
-        $this->assertSame($batch->total_jobs, $sum);
+        $sum = fn (Batch $b): int => $b->pending_count + $b->running_count + $b->succeeded_count
+            + $b->failed_count + $b->canceled_count + $b->skipped_count;
+        $this->assertSame($batch->total_jobs, $sum($batch));
+
+        // An operator skip moves the failure into the sixth bucket, invariant intact.
+        $this->sm->applyJobTransition($j2, JobState::Skipped, TransitionContext::for(ActorType::Operator, 'op-1', 'not needed'));
+        $batch = Batch::find($batch->id);
+        $this->assertSame(0, $batch->failed_count);
+        $this->assertSame(1, $batch->skipped_count);
+        $this->assertSame($batch->total_jobs, $sum($batch));
+    }
+
+    public function test_a_running_job_is_skipped_by_its_process_owner_never_by_the_operator_directly(): void
+    {
+        // Skip on a running job is desired-state (cancel_mode = 'skip'); the
+        // supervisor/recovery lands it. The table encodes that division.
+        [$job] = $this->runningAttempt();
+
+        try {
+            $this->sm->applyJobTransition($job, JobState::Skipped, TransitionContext::for(ActorType::Operator, 'op-1'));
+            $this->fail('operator must not land running → skipped');
+        } catch (IllegalTransitionException $e) {
+            $this->assertStringContainsString('not permitted', $e->getMessage());
+        }
+
+        $this->sm->applyJobTransition($job, JobState::Skipped, TransitionContext::for(ActorType::Supervisor, null, 'skipped by operator'));
+        $this->assertSame(JobState::Skipped, Job::find($job->id)->state);
+        $this->assertNotNull(Job::find($job->id)->finished_at, 'skipped is terminal');
     }
 
     /** @return array{0: Job, 1: JobAttempt} */

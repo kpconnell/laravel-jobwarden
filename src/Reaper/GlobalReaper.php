@@ -118,7 +118,7 @@ final class GlobalReaper
                 $job, JobState::Succeeded, TransitionContext::for(ActorType::System, $reaperId, $reason)),
             AttemptState::Failed => $this->recovery->afterAttemptFailure($job, ActorType::System, $reason),
             AttemptState::Stopped, AttemptState::Canceled => $this->stateMachine->applyJobTransition(
-                $job, JobState::Stopped, TransitionContext::for(ActorType::System, $reaperId, $reason)),
+                $job, JobState::haltedState((string) $job->cancel_mode), TransitionContext::for(ActorType::System, $reaperId, $reason)),
             AttemptState::Orphaned => $this->reconcileOrphan($job, $reaperId, $reason),
             default => null, // in-flight — guarded against above
         };

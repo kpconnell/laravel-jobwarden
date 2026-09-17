@@ -92,7 +92,7 @@ final class Jobs extends Component
      */
     public function bulk(string $action, OperatorActions $ops): void
     {
-        abort_unless(in_array($action, ['retry', 'restart', 'cancel', 'stop'], true), 400);
+        abort_unless(in_array($action, ['retry', 'restart', 'cancel', 'stop', 'skip'], true), 400);
 
         $applied = $skipped = $failed = 0;
         foreach (Job::query()->whereIn('id', $this->selected)->get() as $job) {

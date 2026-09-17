@@ -297,16 +297,14 @@ paths:
     post:
       operationId: cancelJob
       tags: [Jobs]
-      summary: Cancel a job
+      summary: Cancel a job that has not started
       description: >-
-        Desired-state cancel (spec §6.3): pre-run states (pending, queued,
-        retrying) transition to `canceled` immediately; a `running` job is
-        flagged and the owning supervisor observes the flag and stops the
-        child. An already-orphaned job transitions straight to `stopped`. The
-        flag is set durably first, so even if the immediate transition races a
-        claim, the request is still honored once the race resolves. Always
-        returns 200 with the job's current state — cancel does not error on
-        an unexpected state.
+        Withdraw work that has not started (spec §6.3): valid on `pending`,
+        `queued`, `retrying`, which transition to `canceled` immediately. The
+        desired-state flag is written first, so if a claim wins the race the
+        owning supervisor still halts the child — that job lands `stopped`,
+        because it was running when halted. Refused on any other state
+        (use `stop` for active work).
       parameters:
         - $ref: "#/components/parameters/JobId"
       requestBody:
@@ -322,17 +320,20 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InvalidStateTransition"
 
   /jobs/{jobId}/stop:
     post:
       operationId: stopJob
       tags: [Jobs]
-      summary: Stop a job
+      summary: Stop active work
       description: >-
-        Desired-state stop — identical mechanics to cancel, but the resulting
-        terminal state for an already-orphaned job is `stopped` either way
-        (cancel and stop converge for pre-run/orphaned jobs; they differ only
-        in the flag recorded for a still-running job's supervisor to act on).
+        Halt work that is active or parked: valid on `running` (flagged with
+        `cancel_mode = stop`; the owning supervisor signals the child, SIGTERM
+        then SIGKILL after the grace window, and the job lands `stopped`) and
+        `orphaned` (no live owner — `stopped` immediately). Refused on any
+        other state (use `cancel` for work that has not started).
       parameters:
         - $ref: "#/components/parameters/JobId"
       requestBody:
@@ -348,6 +349,44 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InvalidStateTransition"
+
+  /jobs/{jobId}/skip:
+    post:
+      operationId: skipJob
+      tags: [Jobs]
+      summary: Skip a job (its dependents proceed as if it had succeeded)
+      description: >-
+        The operator's verdict that this node's outcome does not matter to the
+        graph: a `skipped` upstream satisfies an `on_success` dependency edge
+        exactly like a `succeeded` one, and skipped members never spoil a
+        batch's verdict. Valid on every state but `succeeded`. A settled job
+        (`failed`, `stopped`, `canceled`) moves to `skipped` at once, keeping
+        its `last_error`; pre-run states and a parked `orphaned` job likewise.
+        A `running` job is kill-and-skip: it is flagged with
+        `cancel_mode = skip`, its supervisor signals the child, and the job
+        lands `skipped` when the child is reaped — or when recovery finds the
+        flag on a lost attempt, or when the child fails on its own first. It is
+        never retried. Returns 200 with the job's current state, which for a
+        running job is still `running` with the flag set.
+      parameters:
+        - $ref: "#/components/parameters/JobId"
+      requestBody:
+        $ref: "#/components/requestBodies/ActionReason"
+      responses:
+        "200":
+          description: The job's fresh state after the action.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Job"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InvalidStateTransition"
 
   /jobs/{jobId}/retry:
     post:
@@ -880,8 +919,9 @@ components:
     InvalidStateTransition:
       description: >-
         The job is not in a state this action allows (e.g. retrying a job
-        that isn't `failed`, or restarting one that isn't `orphaned`/
-        `stopped`). Raised as an uncaught `InvalidArgumentException` — there
+        that isn't `failed`, restarting one that isn't `orphaned`/`stopped`,
+        canceling one that is already running, or stopping one that has not
+        started). Raised as an uncaught `InvalidArgumentException` — there
         is no dedicated 409 handling, so this currently surfaces as a generic
         500. Check `state` before calling, or treat any non-200 response as
         "the action did not apply."
@@ -894,11 +934,14 @@ components:
     # ---- enums -----------------------------------------------------------
     JobState:
       type: string
-      enum: [pending, queued, running, retrying, orphaned, succeeded, failed, canceled, stopped]
+      enum: [pending, queued, running, retrying, orphaned, succeeded, failed, canceled, stopped, skipped]
       description: >-
-        Terminal states: succeeded, failed, canceled, stopped. `orphaned` is a
-        parked, indeterminate state awaiting an operator (restart) — never
-        auto-resolved for a non-idempotent job.
+        Terminal states: succeeded, failed, canceled, stopped, skipped.
+        `orphaned` is a parked, indeterminate state awaiting an operator
+        (restart) — never auto-resolved for a non-idempotent job. `skipped`
+        is an operator's verdict that the job's outcome does not matter to the
+        graph: it satisfies `on_success` dependency edges like `succeeded` and
+        never spoils a batch verdict, while the job keeps its `last_error`.
     BatchState:
       type: string
       enum: [pending, running, succeeded, failed, partial, canceled, stopped]
@@ -916,7 +959,11 @@ components:
       description: The actor that caused a job_events transition.
     CancelMode:
       type: [string, "null"]
-      enum: [cancel, stop, null]
+      enum: [cancel, stop, skip, null]
+      description: >-
+        The desired-state halt an operator requested. `skip` is the one mode
+        whose value picks the landing state — a running job halted under it
+        lands `skipped` rather than `stopped` (kill-and-skip).
     BackoffStrategy:
       type: [string, "null"]
       enum: [fixed, exponential, custom, null]
@@ -1012,7 +1059,7 @@ components:
           $ref: "#/components/schemas/BackoffStrategy"
         cancel_requested:
           type: boolean
-          description: Desired-state flag set by cancel/stop.
+          description: Desired-state flag set by cancel/stop/skip.
         cancel_mode:
           $ref: "#/components/schemas/CancelMode"
         cancel_reason:
@@ -1330,6 +1377,10 @@ components:
           type: integer
         canceled_count:
           type: integer
+          description: Includes `stopped` members.
+        skipped_count:
+          type: integer
+          description: Members an operator skipped. Not counted against the verdict.
         created_by:
           type: [string, "null"]
         created_at:

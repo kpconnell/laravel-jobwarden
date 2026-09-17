@@ -9,6 +9,8 @@ use JobWarden\Events\JobStateChanged;
 use JobWarden\JobWarden;
 use JobWarden\Models\Batch;
 use JobWarden\Models\Job;
+use JobWarden\Operations\OperatorActions;
+use JobWarden\Recovery\Admitter;
 use JobWarden\Reaper\GlobalReaper;
 use JobWarden\StateMachine\StateMachine;
 use JobWarden\StateMachine\TransitionContext;
@@ -177,6 +179,73 @@ final class BatchReconcileTest extends TestCase
 
         $this->assertSame(BatchState::Running, $batch->refresh()->state, 'reopened despite an empty pending bucket');
         $this->assertSame(JobState::Pending, $this->member($batch, 'JobB')->state, 'dependent revived');
+    }
+
+    public function test_reconcile_settles_a_partial_batch_whose_skip_event_was_lost(): void
+    {
+        // A lost `failed → skipped` on a fan-out leaves `partial` with nothing in
+        // flight and nothing failed or canceled — a verdict the counters no
+        // longer support. One pass reopens it and settles it succeeded.
+        $batch = $this->jobwarden()->batch('fanout')
+            ->add('a', 'JobA')->add('b', 'JobB')->dispatch();
+
+        $this->complete($this->member($batch, 'JobA'), JobState::Succeeded);
+        $this->complete($this->member($batch, 'JobB'), JobState::Failed);
+        $this->assertSame(BatchState::Partial, $batch->refresh()->state);
+
+        $this->loseBatchEvents();
+        $this->app->make(OperatorActions::class)->skip($this->member($batch, 'JobB'), 'skip b', 'op-1');
+        $this->assertSame(BatchState::Partial, $batch->refresh()->state, 'the event was lost');
+
+        $this->coordinator()->reconcile();
+
+        $batch->refresh();
+        $this->assertSame(BatchState::Succeeded, $batch->state);
+        $this->assertSame('succeeded', $batch->summary['outcome']);
+        $this->assertSame(1, $batch->summary['skipped']);
+    }
+
+    public function test_reconcile_revives_dependents_after_a_lost_skip_event(): void
+    {
+        $batch = $this->jobwarden()->batch('chain')
+            ->add('a', 'JobA')
+            ->add('b', 'JobB', dependsOn: ['a'])->dispatch();
+
+        $this->complete($this->member($batch, 'JobA'), JobState::Failed);
+        $this->assertSame(JobState::Canceled, $this->member($batch, 'JobB')->state);
+        $this->assertSame(BatchState::Partial, $batch->refresh()->state);
+
+        $this->loseBatchEvents();
+        $this->app->make(OperatorActions::class)->skip($this->member($batch, 'JobA'), 'skip a', 'op-1');
+
+        $this->coordinator()->reconcile();
+
+        // The batch reopened and b is back to waiting; a skipped upstream then
+        // admits it.
+        $this->assertSame(BatchState::Running, $batch->refresh()->state);
+        $this->assertSame(JobState::Pending, $this->member($batch, 'JobB')->state);
+        $this->app->make(Admitter::class)->admit();
+        $this->assertSame(JobState::Queued, $this->member($batch, 'JobB')->state);
+    }
+
+    public function test_reconcile_leaves_a_legitimately_partial_batch_alone_after_a_skip(): void
+    {
+        // A skip alongside an operator cancel ends partial for good; the settled
+        // arm of the reopen window must not select it (it would flap every tick).
+        $batch = $this->jobwarden()->batch('fanout')
+            ->add('a', 'JobA')->add('b', 'JobB')->dispatch();
+
+        $this->app->make(OperatorActions::class)->cancel($this->member($batch, 'JobA'), 'operator cancel', 'op-1');
+        $this->complete($this->member($batch, 'JobB'), JobState::Failed);
+        $this->app->make(OperatorActions::class)->skip($this->member($batch, 'JobB'), 'skip b', 'op-1');
+        $this->assertSame(BatchState::Partial, $batch->refresh()->state);
+        $finishedAt = $batch->finished_at;
+
+        $this->coordinator()->reconcile();
+
+        $batch->refresh();
+        $this->assertSame(BatchState::Partial, $batch->state);
+        $this->assertEquals($finishedAt, $batch->finished_at, 'not reopened and re-settled');
     }
 
     public function test_reconcile_keeps_a_batch_failed_while_its_failure_policy_still_trips(): void

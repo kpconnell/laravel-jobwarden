@@ -24,6 +24,7 @@ Route::post('jobs/{job}/cancel', [JobsController::class, 'cancel']);
 Route::post('jobs/{job}/stop', [JobsController::class, 'stop']);
 Route::post('jobs/{job}/retry', [JobsController::class, 'retry']);
 Route::post('jobs/{job}/restart', [JobsController::class, 'restart']);
+Route::post('jobs/{job}/skip', [JobsController::class, 'skip']);
 
 Route::get('batches', [BatchesController::class, 'index']);
 Route::get('batches/{batch}', [BatchesController::class, 'show']);
